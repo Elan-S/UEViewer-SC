@@ -3,6 +3,7 @@
 
 #include "UnObject.h"
 #include "UnrealMaterial/UnMaterial.h"
+#include "UnrealMesh/UnMesh2.h"
 #include "UnrealMesh/UnMesh4.h"		// for USkeleton
 
 #include "Mesh/SkeletalMesh.h"
@@ -328,7 +329,7 @@ static void ExportSkeletalMeshLod(const CSkeletalMesh &Mesh, const CSkelMeshLod 
 	guard(ExportSkeletalMeshLod);
 
 	// using 'static' here to avoid zero-filling unused fields
-	static VChunkHeader BoneHdr, InfHdr;
+	static VChunkHeader BoneHdr, InfHdr, NormHdr;
 
 	int i, j;
 	CVertexShare Share;
@@ -552,6 +553,72 @@ const UObject* GetPrimaryAnimObject(const CAnimSet* Anim)
 	unguard;
 }
 
+static void GetPsaSkeleton(const CAnimSet* Anim, TArray<int>& ParentIndices, TArray<CSkeletonBonePosition>& BonePositions)
+{
+	guard(GetPsaSkeleton);
+
+	const int NumBones = Anim->TrackBoneNames.Num();
+	ParentIndices.Empty(NumBones);
+	ParentIndices.AddZeroed(NumBones);
+	for (int i = 0; i < NumBones; i++)
+		ParentIndices[i] = (i > 0) ? 0 : -1;
+
+	if (Anim->BonePositions.Num())
+		CopyArray(BonePositions, Anim->BonePositions);
+	else
+		BonePositions.Empty();
+
+	const UMeshAnimation* MeshAnim = (Anim->OriginalAnim && Anim->OriginalAnim->IsA("MeshAnimation"))
+		? static_cast<const UMeshAnimation*>(Anim->OriginalAnim)
+		: NULL;
+	if (MeshAnim && MeshAnim->RefBones.Num() == NumBones)
+	{
+		for (int i = 0; i < NumBones; i++)
+			ParentIndices[i] = (i > 0) ? MeshAnim->RefBones[i].ParentIndex : -1;
+	}
+
+	for (const UObject* Obj : UObject::GObjObjects)
+	{
+		if (!Obj || !Obj->IsA("SkeletalMesh"))
+			continue;
+
+		const USkeletalMesh* MeshObj = static_cast<const USkeletalMesh*>(Obj);
+		if (!MeshObj->ConvertedMesh)
+			continue;
+		if (MeshObj->Animation != Anim->OriginalAnim && (!Anim->OriginalAnim || MeshObj->Package != Anim->OriginalAnim->Package))
+			continue;
+
+		const CSkeletalMesh* Mesh = MeshObj->ConvertedMesh;
+		if (Mesh->RefSkeleton.Num() != NumBones)
+			continue;
+
+		bool bMatchesSkeleton = true;
+		for (int i = 0; i < NumBones; i++)
+		{
+			if (stricmp(*Anim->TrackBoneNames[i], *Mesh->RefSkeleton[i].Name))
+			{
+				bMatchesSkeleton = false;
+				break;
+			}
+		}
+		if (!bMatchesSkeleton)
+			continue;
+
+		BonePositions.Empty(NumBones);
+		for (int i = 0; i < NumBones; i++)
+		{
+			ParentIndices[i] = (i > 0) ? Mesh->RefSkeleton[i].ParentIndex : -1;
+			CSkeletonBonePosition BonePosition;
+			BonePosition.Position    = Mesh->RefSkeleton[i].Position;
+			BonePosition.Orientation = Mesh->RefSkeleton[i].Orientation;
+			BonePositions.Add(BonePosition);
+		}
+		break;
+	}
+
+	unguard;
+}
+
 static void DoExportPsa(const CAnimSet* Anim, const UObject* OriginalAnim)
 {
 	guard(DoExportPsa);
@@ -569,6 +636,9 @@ static void DoExportPsa(const CAnimSet* Anim, const UObject* OriginalAnim)
 
 	int numBones = Anim->TrackBoneNames.Num();
 	int numAnims = Anim->Sequences.Num();
+	TArray<int> ParentIndices;
+	TArray<CSkeletonBonePosition> BonePositions;
+	GetPsaSkeleton(Anim, ParentIndices, BonePositions);
 
 	BoneHdr.DataCount = numBones;
 	BoneHdr.DataSize  = sizeof(FNamedBoneBinary);
@@ -580,16 +650,12 @@ static void DoExportPsa(const CAnimSet* Anim, const UObject* OriginalAnim)
 		CopyBoneName(B.Name, sizeof(B.Name), *Anim->TrackBoneNames[i]);
 		B.Flags       = 0;						// reserved
 		B.NumChildren = 0;						// unknown here
-		B.ParentIndex = (i > 0) ? 0 : -1;		// unknown for UAnimSet
+		B.ParentIndex = ParentIndices.IsValidIndex(i) ? ParentIndices[i] : ((i > 0) ? 0 : -1);
 		B.BonePos.Length = 1.0f;
-		if (Anim->BonePositions.IsValidIndex(i))
+		if (BonePositions.IsValidIndex(i))
 		{
-			// The AnimSet has bone transform information, store it in psa file (UE4+)
-			FQuat Q1;
-			CQuat Q2 = CVT(Q1);
-			Q1 = CVT(Q2);
-			B.BonePos.Position = CVT(Anim->BonePositions[i].Position);
-			B.BonePos.Orientation = CVT(Anim->BonePositions[i].Orientation);
+			B.BonePos.Position = CVT(BonePositions[i].Position);
+			B.BonePos.Orientation = CVT(BonePositions[i].Orientation);
 		}
 		Ar << B;
 	}
@@ -642,8 +708,16 @@ static void DoExportPsa(const CAnimSet* Anim, const UObject* OriginalAnim)
 				CVec3 BP;
 				CQuat BO;
 
-				BP.Set(0, 0, 0);			// GetBonePosition() will not alter BP and BO when animation tracks are not exists
-				BO.Set(0, 0, 0, 1);
+				if (BonePositions.IsValidIndex(b))
+				{
+					BP = BonePositions[b].Position;
+					BO = BonePositions[b].Orientation;
+				}
+				else
+				{
+					BP.Set(0, 0, 0);			// GetBonePosition() will not alter BP and BO when animation tracks are not exists
+					BO.Set(0, 0, 0, 1);
+				}
 				S.Tracks[b]->GetBonePosition(t, S.NumFrames, false, BP, BO);
 
 				K.Position    = (FVector&) BP;
@@ -848,7 +922,7 @@ static void ExportStaticMeshLod(const CStaticMeshLod &Lod, FArchive &Ar)
 	guard(ExportStaticMeshLod);
 
 	// using 'static' here to avoid zero-filling unused fields
-	static VChunkHeader BoneHdr, InfHdr;
+	static VChunkHeader BoneHdr, InfHdr, NormHdr;
 
 	CVertexShare Share;
 
@@ -881,6 +955,20 @@ static void ExportStaticMeshLod(const CStaticMeshLod &Lod, FArchive &Ar)
 	InfHdr.DataCount = 0;		// dummy
 	InfHdr.DataSize  = sizeof(VRawBoneInfluence);
 	SAVE_CHUNK(InfHdr, "RAWWEIGHTS");
+
+	NormHdr.DataCount = Share.Normals.Num();
+	NormHdr.DataSize  = sizeof(FVector);
+	SAVE_CHUNK(NormHdr, "VTXNORMS");
+	for (int i = 0; i < Share.Normals.Num(); i++)
+	{
+		CVec3 Normal;
+		Unpack(Normal, Share.Normals[i]);
+		FVector N;
+		N.X = Normal[0];
+		N.Y = Normal[1];
+		N.Z = Normal[2];
+		Ar << N;
+	}
 
 	ExportVertexColors(Ar, Lod.VertexColors, Lod.NumVerts);
 	ExportExtraUV(Ar, Lod.ExtraUV, Lod.NumVerts, Lod.NumTexCoords);

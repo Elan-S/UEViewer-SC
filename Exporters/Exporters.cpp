@@ -154,6 +154,13 @@ static bool OnObjectLoad(UObject* Obj)
 	assert(Obj);
 	const char* Class = Obj->GetClassName();
 
+	if (Obj->Package && Obj->Package->Game == GAME_SplinterCell && strncmp(Class, "AnimNotify_", 11) == 0)
+	{
+		// Splinter Cell packages use Ubisoft-specific notify payloads.
+		// They are not exported assets, so don't let them block mesh/animation export.
+		return false;
+	}
+
 	if (strncmp(Class, "Texture", 7) == 0)
 	{
 		// For UE3/UE4, the same texture may be reused many times from different materials.

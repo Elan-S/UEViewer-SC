@@ -224,6 +224,14 @@ static void RegisterClasses(int game)
 		UnregisterClass("MaterialExpression", true);
 		SuppressUnknownClass("UMaterial*");
 	}
+#if R6VEGAS
+	if (game == GAME_R6Vegas2)
+	{
+		// R6V2 static meshes still have Ubisoft-specific payloads. Keep package
+		// traversal usable while static mesh support is being decoded.
+		UnregisterClass("StaticMesh", true);
+	}
+#endif
 	if (!GSettings.Startup.UseMorphTarget) UnregisterClass("MorphTarget", false);
 	if (!GSettings.Startup.UseLightmapTexture) UnregisterClass("LightMapTexture2D", true);
 	if (!GSettings.Startup.UseScaleForm) UnregisterClass("SwfMovie", true);
@@ -242,7 +250,11 @@ static void RegisterClasses(int game)
 
 static void CallExportSkeletalMesh(const CSkeletalMesh* Mesh)
 {
-	assert(Mesh);
+	if (!Mesh)
+	{
+		appPrintf("ERROR: skeletal mesh has no converted mesh data\n");
+		return;
+	}
 	switch (GSettings.Export.SkeletalMeshFormat)
 	{
 	case EExportMeshFormat::psk:

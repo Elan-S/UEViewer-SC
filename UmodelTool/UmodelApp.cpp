@@ -418,12 +418,18 @@ bool CUmodelApp::CreateVisualizer(UObject *Obj, bool test)
 static void TakeScreenshot(const char *ObjectName, bool CatchAlpha)
 {
 	char filename[256];
-	appSprintf(ARRAY_ARG(filename), SCREENSHOTS_DIR "/%s.tga", ObjectName);
+	const char* ShotDir = getenv("UMODEL_SCREENSHOT_DIR");
+	if (!ShotDir || !ShotDir[0])
+		ShotDir = SCREENSHOTS_DIR;
+	const char* ShotName = getenv("UMODEL_SCREENSHOT_NAME");
+	if (!ShotName || !ShotName[0])
+		ShotName = ObjectName;
+	appSprintf(ARRAY_ARG(filename), "%s/%s.tga", ShotDir, ShotName);
 	int retry = 1;
 	while (appFileExists(filename))
 	{
 		// if file exists, append an index
-		appSprintf(ARRAY_ARG(filename), SCREENSHOTS_DIR "/%s_%02d.tga", ObjectName, ++retry);
+		appSprintf(ARRAY_ARG(filename), "%s/%s_%02d.tga", ShotDir, ShotName, ++retry);
 	}
 	appPrintf("Writing screenshot %s\n", filename);
 	appMakeDirectoryForFile(filename);
@@ -520,12 +526,45 @@ void CUmodelApp::BeforeSwap()
 {
 	guard(CUmodelApp::BeforeSwap);
 
+	static bool AutoInitialized = false;
+	static bool AutoKeysSent = false;
+	static bool AutoShotRequested = false;
+	static int AutoFrameCount = 0;
+	if (!AutoInitialized)
+	{
+		AutoInitialized = true;
+		AutoFrameCount = 0;
+	}
+	const char* AutoShot = getenv("UMODEL_AUTO_SCREENSHOT");
+	if (AutoShot && AutoShot[0])
+	{
+		if (!AutoKeysSent)
+		{
+			AutoKeysSent = true;
+			const int AnimAdvance = getenv("UMODEL_AUTO_ANIM_ADVANCE") ? atoi(getenv("UMODEL_AUTO_ANIM_ADVANCE")) : 1;
+			const int FrameSteps = getenv("UMODEL_AUTO_FRAME_STEPS") ? atoi(getenv("UMODEL_AUTO_FRAME_STEPS")) : 40;
+			for (int i = 0; i < AnimAdvance; i++)
+				Viewer->ProcessKey(']');
+			for (int i = 0; i < FrameSteps; i++)
+				Viewer->ProcessKey('.');
+		}
+		const int ShotDelay = getenv("UMODEL_AUTO_SCREENSHOT_DELAY") ? atoi(getenv("UMODEL_AUTO_SCREENSHOT_DELAY")) : 8;
+		if (!AutoShotRequested && AutoFrameCount++ >= ShotDelay)
+		{
+			AutoShotRequested = true;
+			DoScreenshot = 1;
+		}
+	}
+
 	if (DoScreenshot)
 	{
 		// take regular screenshot
 		UObject *Obj = UObject::GObjObjects[ObjIndex];
 		TakeScreenshot(Obj->Name, false);
 		DoScreenshot = 0;
+		const char* AutoQuit = getenv("UMODEL_AUTO_QUIT");
+		if (AutoQuit && AutoQuit[0])
+			RequestingQuit = true;
 	}
 
 	if (Viewer->JumpAfterFrame)

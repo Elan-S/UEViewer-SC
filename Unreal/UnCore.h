@@ -427,6 +427,7 @@ enum EGame
 		GAME_TaoYuan,
 		GAME_Tribes4,
 		GAME_Dishonored,
+		GAME_FirstAssault,
 		GAME_Hawken,
 		GAME_Fable,
 		GAME_DmC,
@@ -645,6 +646,12 @@ public:
 	virtual int GetStopper() const
 	{
 		return ArStopper;
+	}
+
+	// Sparse virtual archives may not contain every serialized object body.
+	virtual bool IsRangeAvailable(int Pos, int Size)
+	{
+		return true;
 	}
 
 	bool IsStopper()

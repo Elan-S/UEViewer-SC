@@ -8,7 +8,9 @@ void FPackageFileSummary::Serialize2(FArchive &Ar)
 	guard(FPackageFileSummary::Serialize2);
 
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArLicenseeVer >= 83)
+	const bool isPandoraTomorrowOnline = ((Ar.ArVer == 171 || Ar.ArVer == 172) && Ar.ArLicenseeVer == 0);
+	const bool isDoubleAgentOnline = (Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0);
+	if (Ar.Game == GAME_SplinterCell && Ar.ArLicenseeVer >= 83 && !isPandoraTomorrowOnline)
 	{
 		int32 unk8;
 		Ar << unk8;
@@ -40,7 +42,7 @@ void FPackageFileSummary::Serialize2(FArchive &Ar)
 	}
 #endif // LEAD
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell)
+	if (Ar.Game == GAME_SplinterCell && !isPandoraTomorrowOnline && !isDoubleAgentOnline)
 	{
 		int32 tmp1;
 		TArray<byte> tmp2;

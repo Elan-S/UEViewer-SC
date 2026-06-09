@@ -1219,6 +1219,15 @@ public:
 	virtual void PostLoad();
 };
 
+#if LEAD
+class ULeadMesh : public USkeletalMesh
+{
+	DECLARE_CLASS(ULeadMesh, USkeletalMesh);
+public:
+	virtual void Serialize(FArchive &Ar);
+};
+#endif // LEAD
+
 
 #if RUNE
 
@@ -1252,6 +1261,7 @@ struct AnalogTrack
 
 #if SPLINTER_CELL
 	void SerializeSCell(FArchive &Ar);
+	void SerializePandora(FArchive &Ar);
 #endif
 #if SWRC
 	void SerializeSWRC(FArchive &Ar);
@@ -1264,7 +1274,12 @@ struct AnalogTrack
 	{
 		guard(AnalogTrack<<);
 #if SPLINTER_CELL
-		if (Ar.Game == GAME_SplinterCell && Ar.ArLicenseeVer >= 13)	// compressed Quat and Time tracks
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 172 && Ar.ArLicenseeVer == 0)
+		{
+			A.SerializePandora(Ar);
+			return Ar;
+		}
+		if (Ar.Game == GAME_SplinterCell && (Ar.ArLicenseeVer >= 13 || (Ar.ArVer == 172 && Ar.ArLicenseeVer == 0)))	// compressed Quat and Time tracks
 		{
 			A.SerializeSCell(Ar);
 			return Ar;
@@ -1391,6 +1406,9 @@ public:
 
 #if SPLINTER_CELL
 	void SerializeSCell(FArchive &Ar);
+	void SerializePandora(FArchive &Ar);
+	void SerializeSCCT(FArchive &Ar);
+	void SerializeSC4(FArchive &Ar);
 #endif
 #if UNREAL1
 	void Upgrade();
@@ -1414,6 +1432,26 @@ public:
 		if (Ar.Game >= GAME_UE2)
 			Ar << Version;					// no such field in UE1
 		Ar << RefBones;
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer == 124)
+		{
+			SerializeSCCT(Ar);
+			ConvertAnims();
+			return;
+		}
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0)
+		{
+			SerializeSC4(Ar);
+			ConvertAnims();
+			return;
+		}
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 172 && Ar.ArLicenseeVer == 0)
+		{
+			SerializePandora(Ar);
+			ConvertAnims();
+			return;
+		}
+#endif
 #if SWRC
 		if (Ar.Game == GAME_RepCommando)
 		{
@@ -1794,6 +1832,7 @@ public:
 #define REGISTER_MESH_CLASSES_U2	\
 	REGISTER_CLASS(UVertMesh)		\
 	REGISTER_CLASS(USkeletalMesh)	\
+	REGISTER_CLASS(ULeadMesh)		\
 	REGISTER_CLASS(UMeshAnimation)	\
 	REGISTER_CLASS(UStaticMesh)		\
 	REGISTER_CLASS(FStaticMeshMaterial)

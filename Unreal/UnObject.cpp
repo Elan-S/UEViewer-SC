@@ -3,6 +3,9 @@
 #include "UE4Version.h"
 #include "UnObject.h"
 #include "UnrealPackage/UnPackage.h"
+#if UNREAL3
+#include "UnrealMesh/UnMesh3.h"
+#endif
 
 #include "GameDatabase.h"		// for GetGameTag()
 
@@ -183,7 +186,17 @@ void UObject::EndLoad()
 			appResetProfiler();
 #endif
 			GLoadingObj = Obj;
-			Obj->Serialize(*Package);
+			int ObjectStart = Package->Tell();
+			int ObjectSize = Package->GetStopper() - ObjectStart;
+			if (Package->IsRangeAvailable(ObjectStart, ObjectSize))
+			{
+				Obj->Serialize(*Package);
+			}
+			else
+			{
+				appPrintf("Skipping unavailable sparse export %s %s\n", Obj->GetClassName(), Obj->Name);
+				Package->Seek(Package->GetStopper());
+			}
 			GLoadingObj = NULL;
 #if PROFILE_LOADING
 			appPrintProfiler();
@@ -857,6 +870,10 @@ void UObject::Serialize(FArchive &Ar)
 
 #if UNREAL3
 
+#	if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell)
+		goto no_net_index;
+#	endif
 #	if WHEELMAN || MKVSDC
 	if ( ((Ar.Game == GAME_Wheelman || Ar.Game == GAME_TNA) && Ar.ArVer >= 385) ||
 		  (Ar.Game == GAME_MK && Ar.ArVer >= 446) )
@@ -980,7 +997,35 @@ void CTypeInfo::SerializeUnrealProps(FArchive& Ar, void* ObjectData) const
 		FPropertyTag Tag;
 		int PropTagPos = Ar.Tell();
 
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArLicenseeVer == 0)
+		{
+			if (Ar.Tell() >= Ar.GetStopper())
+				break;
+			int NameIndex, ExtraIndex;
+			Ar << AR_INDEX(NameIndex) << AR_INDEX(ExtraIndex);
+			if ((NameIndex == 0 && ExtraIndex == 0) ||
+				NameIndex < 0 || !UObject::GLoadingObj || !UObject::GLoadingObj->Package ||
+				unsigned(NameIndex) >= UObject::GLoadingObj->Package->Summary.NameCount)
+			{
+				if (!(NameIndex == 0 && ExtraIndex == 0))
+				{
+					if (UObject::GLoadingObj && UObject::GLoadingObj->IsA("Unreal3Material"))
+						Ar.Seek(Ar.GetStopper());
+					else
+						Ar.Seek(PropTagPos);
+				}
+				break;
+			}
+			Ar.Seek(PropTagPos);
+		}
+#endif
 		Ar << Tag;
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArLicenseeVer == 0 && getenv("SC4_DEBUG_MATERIAL"))
+		{
+			appPrintf("SC4 property %s: pos=%08X data=%08X name=%s type=%d struct=%s size=%d index=%d\n",
+				Name, PropTagPos, Ar.Tell(), *Tag.Name, Tag.Type, *Tag.StrucName, Tag.DataSize, Tag.ArrayIndex);
+		}
 		if (!Tag.IsValid())						// end marker
 			break;
 
@@ -1028,6 +1073,31 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 	{
 		if (!Prop)
 			appPrintf("%s: unknown %s %s\n", DbgTypeName, Name, *Tag.Name); // notify about the unknown property
+#if ARMYOF2
+		if (Ar.Game == GAME_ArmyOf2 && !strcmp(Name, "UAnimSequence") && !strcmp(*Tag.Name, "AO2CompressionInfo"))
+		{
+			int SavePos = Ar.Tell();
+			static_cast<UAnimSequence*>(ObjectData)->SerializeAO2CompressionInfo(Ar, Tag.DataSize);
+			Ar.Seek(SavePos);
+			if (getenv("AO2_ANIM_DEBUG"))
+			{
+				int DumpSize = min(Tag.DataSize, 0x100);
+				appPrintf("AO2CompressionInfo at %X size=%d struct=%s\n", SavePos, Tag.DataSize, *Tag.StrucName);
+				for (int Pos = 0; Pos < DumpSize; Pos += 16)
+				{
+					byte Data[16];
+					int LineSize = min(16, DumpSize - Pos);
+					Ar.Seek(SavePos + Pos);
+					Ar.Serialize(Data, LineSize);
+					appPrintf("  %04X:", Pos);
+					for (int i = 0; i < LineSize; i++)
+						appPrintf(" %02X", Data[i]);
+					appPrintf("\n");
+				}
+			}
+			Ar.Seek(SavePos);
+		}
+#endif // ARMYOF2
 #if DEBUG_PROPS
 		appPrintf("  (skipping %s)\n", *Tag.Name);
 #endif
@@ -1142,7 +1212,10 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 		break;
 
 	case NAME_ClassProperty:
-		appError("Class property is not implemented");
+		// Some UE2 licensees serialize ClassProperty tags for fields that are not
+		// useful for texture export. Treat it like an unknown property and skip the
+		// payload instead of aborting package load.
+		Ar.Seek(StopPos);
 		break;
 
 	case NAME_ArrayProperty:
@@ -1301,9 +1374,18 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 			}
 			else
 			{
-				//!! implement this (use FindStructType()->SerializeUnrealProps())
-				appNotify("WARNING: Unknown structure type: %s", *Tag.StrucName);
-				Ar.Seek(StopPos);
+				const CTypeInfo *StructType = FindStructType(Prop->TypeName);
+				if (StructType)
+				{
+					StructType->SerializeUnrealProps(Ar, value);
+					if (Ar.Tell() > StopPos)
+						StopPos = Ar.Tell();
+				}
+				else
+				{
+					appNotify("WARNING: Unknown structure type: %s", *Tag.StrucName);
+					Ar.Seek(StopPos);
+				}
 			}
 		}
 		break;
@@ -1381,13 +1463,27 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 	int Pos = Ar.Tell();
 	if (Pos != StopPos)
 	{
-#if DEBUG_PROPS
-		appPrintf("Serialized size mismatch: Pos=%X, Stop=%X\n", Pos, StopPos);
-		// show property dump
-		Ar.Seek(PropTagPos);
-		DUMP_ARC_BYTES(Ar, StopPos - PropTagPos, "Property bytes");
+		bool bHandledSizeMismatch = false;
+#if R6VEGAS
+		if (Ar.Game == GAME_R6Vegas2 && Pos < StopPos &&
+			(!stricmp(Name, "FVectorParameterValue") || !strnicmp(Name, "UMaterial", 9)))
+		{
+			// R6 Vegas 2 materials append game-specific data to color/vector payloads.
+			// Texture export does not need it, and skipping keeps whole-package exports usable.
+			Ar.Seek(StopPos);
+			bHandledSizeMismatch = true;
+		}
 #endif
-		appError("%s\'%s\'.%s: Property read error: %d unread bytes", Name, UObject::GLoadingObj->Name, *Tag.Name, StopPos - Pos);
+		if (!bHandledSizeMismatch)
+		{
+#if DEBUG_PROPS
+			appPrintf("Serialized size mismatch: Pos=%X, Stop=%X\n", Pos, StopPos);
+			// show property dump
+			Ar.Seek(PropTagPos);
+			DUMP_ARC_BYTES(Ar, StopPos - PropTagPos, "Property bytes");
+#endif
+			appError("%s\'%s\'.%s: Property read error: %d unread bytes", Name, UObject::GLoadingObj->Name, *Tag.Name, StopPos - Pos);
+		}
 	}
 
 	unguardf("(%s.%s, Type=%d, Size=%d, TagPos=%X)", Name, *Tag.Name, Tag.Type, Tag.DataSize, PropTagPos);

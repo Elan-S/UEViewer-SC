@@ -4,6 +4,7 @@
 
 #include "UnCore.h"
 #include "UnObject.h"
+#include "UnrealPackage/UnPackage.h"
 #include "UnMesh3.h"
 #include "UnMeshTypes.h"
 #include "UnMathTools.h"			// for FRotator to FCoords
@@ -31,6 +32,212 @@
 #define DBG_STAT(...)
 #endif
 
+static bool UseUE3ActorStaticMeshMaterials(int Game)
+{
+	return Game >= GAME_GoWJ && Game < GAME_UE4_BASE;
+}
+
+static bool IsStaticMeshComponentClass(const char* ClassName)
+{
+	return !stricmp(ClassName, "StaticMeshComponent")
+		|| !stricmp(ClassName, "InstancedStaticMeshComponent")
+		|| !stricmp(ClassName, "FracturedStaticMeshComponent");
+}
+
+static void LoadStaticMeshComponentExports(UnPackage* Package)
+{
+	static bool LoadingComponents = false;
+	static TArray<UnPackage*> ScannedPackages;
+
+	if (!Package || LoadingComponents)
+		return;
+	if (ScannedPackages.FindItem(Package) >= 0)
+		return;
+
+	LoadingComponents = true;
+	for (int i = 0; i < Package->Summary.ExportCount; i++)
+	{
+		const FObjectExport& Exp = Package->GetExport(i);
+		if (IsStaticMeshComponentClass(Package->GetClassNameFor(Exp)))
+			Package->CreateExport(i);
+	}
+	ScannedPackages.Add(Package);
+	LoadingComponents = false;
+}
+
+struct FStaticMeshMaterialVote
+{
+	UMaterialInterface* Material;
+	int Count;
+
+	FStaticMeshMaterialVote()
+	:	Material(NULL)
+	,	Count(0)
+	{}
+
+	FStaticMeshMaterialVote(UMaterialInterface* InMaterial)
+	:	Material(InMaterial)
+	,	Count(1)
+	{}
+};
+
+static void AddStaticMeshMaterialVote(TArray<TArray<FStaticMeshMaterialVote> >& Votes, int Slot, UMaterialInterface* Material)
+{
+	if (!Material || Slot < 0)
+		return;
+
+	if (Slot >= Votes.Num())
+		Votes.AddDefaulted(Slot + 1 - Votes.Num());
+
+	TArray<FStaticMeshMaterialVote>& SlotVotes = Votes[Slot];
+	for (int i = 0; i < SlotVotes.Num(); i++)
+	{
+		if (SlotVotes[i].Material == Material)
+		{
+			SlotVotes[i].Count++;
+			return;
+		}
+	}
+
+	new (SlotVotes) FStaticMeshMaterialVote(Material);
+}
+
+static void AddStaticMeshMaterialVotes(TArray<TArray<FStaticMeshMaterialVote> >& Votes, const TArray<UMaterialInterface*>& Materials)
+{
+	for (int i = 0; i < Materials.Num(); i++)
+		AddStaticMeshMaterialVote(Votes, i, Materials[i]);
+}
+
+static void FindActorStaticMeshMaterials(UStaticMesh3* Mesh, TArray<UMaterialInterface*>& OutMaterials)
+{
+	TArray<TArray<FStaticMeshMaterialVote> > Votes;
+
+	LoadStaticMeshComponentExports(Mesh->Package);
+
+	for (int i = 0; i < UObject::GObjObjects.Num(); i++)
+	{
+		UObject* Obj = UObject::GObjObjects[i];
+		if (!Obj || Obj->Package != Mesh->Package || !Obj->IsA("UStaticMeshComponent3"))
+			continue;
+
+		UStaticMeshComponent3* Comp = static_cast<UStaticMeshComponent3*>(Obj);
+		if (Comp->StaticMesh != Mesh)
+			continue;
+
+		AddStaticMeshMaterialVotes(Votes, Comp->Materials);
+		AddStaticMeshMaterialVotes(Votes, Comp->OverrideMaterials);
+		AddStaticMeshMaterialVotes(Votes, Comp->MaterialOverrides);
+		AddStaticMeshMaterialVotes(Votes, Comp->ReplacementMaterials);
+	}
+
+	OutMaterials.Empty(Votes.Num());
+	OutMaterials.AddZeroed(Votes.Num());
+	for (int Slot = 0; Slot < Votes.Num(); Slot++)
+	{
+		int BestCount = 0;
+		for (int i = 0; i < Votes[Slot].Num(); i++)
+		{
+			const FStaticMeshMaterialVote& Vote = Votes[Slot][i];
+			if (Vote.Count > BestCount)
+			{
+				OutMaterials[Slot] = Vote.Material;
+				BestCount = Vote.Count;
+			}
+		}
+	}
+}
+
+static bool ReadUE3ComponentFName(FArchive& Ar, FName& Name)
+{
+	int Stopper = Ar.GetStopper();
+	if (Stopper && Ar.Tell() + 8 > Stopper)
+		return false;
+
+	UnPackage* Package = Ar.CastTo<UnPackage>();
+	if (!Package)
+	{
+		Ar << Name;
+		return true;
+	}
+
+	int Pos = Ar.Tell();
+	int NameIndex;
+	int ExtraIndex;
+	Ar << NameIndex << ExtraIndex;
+	if (unsigned(NameIndex) >= Package->Summary.NameCount)
+	{
+		Ar.Seek(Pos);
+		return false;
+	}
+
+	Name.Str = ExtraIndex
+		? appStrdupPool(va("%s_%d", Package->GetName(NameIndex), ExtraIndex - 1))
+		: Package->GetName(NameIndex);
+#if !USE_COMPACT_PACKAGE_STRUCTS
+	Name.Index = NameIndex;
+	Name.ExtraIndex = ExtraIndex;
+#endif
+	return true;
+}
+
+static bool IsStaticMeshComponentMaterialField(const FName& Name)
+{
+	return Name == "Materials"
+		|| Name == "OverrideMaterials"
+		|| Name == "MaterialOverrides"
+		|| Name == "ReplacementMaterials";
+}
+
+static bool IsStaticMeshComponentUsefulField(const FName& Name)
+{
+	return Name == "StaticMesh" || IsStaticMeshComponentMaterialField(Name);
+}
+
+static bool IsStaticMeshMaterialClass(const char* ClassName)
+{
+	return !stricmp(ClassName, "Material")
+		|| !stricmp(ClassName, "MaterialInstance")
+		|| !stricmp(ClassName, "MaterialInstanceConstant")
+		|| !stricmp(ClassName, "MaterialInstanceTimeVarying");
+}
+
+static UObject* CreateStaticMeshComponentMaterialRef(UnPackage* Package, int Ref)
+{
+	if (!Package)
+		return NULL;
+
+	if (Ref > 0 && Ref <= Package->Summary.ExportCount)
+	{
+		const FObjectExport& Exp = Package->GetExport(Ref - 1);
+		if (IsStaticMeshMaterialClass(Package->GetClassNameFor(Exp)))
+			return Package->CreateExport(Ref - 1);
+	}
+	else if (Ref < 0 && -Ref <= Package->Summary.ImportCount)
+	{
+		const FObjectImport& Imp = Package->GetImport(-Ref - 1);
+		if (IsStaticMeshMaterialClass(Imp.ClassName))
+			return Package->CreateImport(-Ref - 1);
+	}
+
+	return NULL;
+}
+
+static void CollectStaticMeshComponentMaterialRefs(FArchive& Ar, UnPackage* Package, int StartPos, int EndPos, TArray<UMaterialInterface*>& Materials)
+{
+	int SavePos = Ar.Tell();
+	for (int Pos = StartPos; Pos + 4 <= EndPos; Pos += 4)
+	{
+		if (Ar.GetStopper() && Pos + 4 > Ar.GetStopper())
+			break;
+		Ar.Seek(Pos);
+		int Ref;
+		Ar << Ref;
+		UObject* Obj = CreateStaticMeshComponentMaterialRef(Package, Ref);
+		if (Obj && Obj->IsA("UMaterialInterface") && Materials.FindItem(static_cast<UMaterialInterface*>(Obj)) < 0)
+			Materials.Add(static_cast<UMaterialInterface*>(Obj));
+	}
+	Ar.Seek(SavePos);
+}
 
 //!! RENAME to CopyNormals/ConvertNormals/PutNormals/RepackNormals etc
 void UnpackNormals(const FPackedNormal SrcNormal[3], CMeshVertex &V)
@@ -1423,6 +1630,20 @@ struct FStaticLODModel3
 	{
 		guard(FStaticLODModel3<<);
 
+#if FIRSTASSAULT
+		if (Ar.Game == GAME_FirstAssault && getenv("SWFA_SKEL_DEBUG"))
+		{
+			const int SavedPos = Ar.Tell();
+			uint8 Preview[32];
+			Ar.Serialize(Preview, sizeof(Preview));
+			Ar.Seek(SavedPos);
+			appPrintf("SWFA FStaticLODModel start pos=%X:", SavedPos);
+			for (int i = 0; i < ARRAY_COUNT(Preview); i++)
+				appPrintf(" %02X", Preview[i]);
+			appPrintf("\n");
+		}
+#endif
+
 #if FURY
 		if (Ar.Game == GAME_Fury && Ar.ArLicenseeVer >= 8)
 		{
@@ -1447,7 +1668,21 @@ struct FStaticLODModel3
 		}
 #endif // MKVSDC
 
-		Ar << Lod.Sections << Lod.IndexBuffer;
+		Ar << Lod.Sections;
+#if FIRSTASSAULT
+		if (Ar.Game == GAME_FirstAssault && getenv("SWFA_SKEL_DEBUG"))
+		{
+			const int SavedPos = Ar.Tell();
+			uint8 Preview[32];
+			Ar.Serialize(Preview, sizeof(Preview));
+			Ar.Seek(SavedPos);
+			appPrintf("SWFA before IndexBuffer sections=%d pos=%X:", Lod.Sections.Num(), SavedPos);
+			for (int i = 0; i < ARRAY_COUNT(Preview); i++)
+				appPrintf(" %02X", Preview[i]);
+			appPrintf("\n");
+		}
+#endif
+		Ar << Lod.IndexBuffer;
 
 	part1:
 #if DEBUG_SKELMESH
@@ -2090,6 +2325,34 @@ after_skeleton:
 		Ar << unk108 << unk10C;
 	}
 #endif
+#if FIRSTASSAULT
+	if (Ar.Game == GAME_FirstAssault)
+	{
+		const int BlockStart = Ar.Tell();
+		int BlockSize;
+		char Magic[4];
+		Ar << BlockSize;
+		Ar.Serialize(Magic, sizeof(Magic));
+		const bool HasEmbeddedStream =
+			Magic[0] == 'E' && Magic[1] == 'S' && Magic[2] == '0' && Magic[3] == '3' &&
+			BlockSize >= 0 && BlockSize < Ar.GetStopper() - BlockStart;
+		Ar.Seek(BlockStart);
+
+		if (getenv("SWFA_SKEL_DEBUG"))
+		{
+			const int SavedPos = Ar.Tell();
+			uint8 Preview[32];
+			Ar.Serialize(Preview, sizeof(Preview));
+			Ar.Seek(SavedPos);
+			appPrintf("SWFA SkeletalMesh %s before LODModels pos=%X es03=%d size=%d:", Name, SavedPos, HasEmbeddedStream, BlockSize);
+			for (int i = 0; i < ARRAY_COUNT(Preview); i++)
+				appPrintf(" %02X", Preview[i]);
+			appPrintf("\n");
+		}
+		if (HasEmbeddedStream)
+			Ar.Seek(BlockStart + BlockSize + 8);
+	}
+#endif
 	Ar << LODModels;
 #if 0
 	//!! also: NameIndexMap (ArVer >= 296), PerPolyKDOPs (ArVer >= 435)
@@ -2465,6 +2728,115 @@ UStaticMesh3::~UStaticMesh3()
 	delete ConvertedMesh;
 }
 
+void UStaticMeshComponent3::Serialize(FArchive& Ar)
+{
+	guard(UStaticMeshComponent3::Serialize);
+
+	if (Ar.ArVer >= 322 && Ar.Game != GAME_GoWJ)
+		Ar << NetIndex;
+
+	while (true)
+	{
+		if (Ar.GetStopper() && Ar.Tell() >= Ar.GetStopper())
+			break;
+
+		FName PropName;
+		if (!ReadUE3ComponentFName(Ar, PropName))
+			break;
+		if (!stricmp(PropName, "None"))
+			break;
+
+		FName PropType;
+		int DataSize;
+		int ArrayIndex;
+		if (!ReadUE3ComponentFName(Ar, PropType))
+			break;
+		Ar << DataSize << ArrayIndex;
+
+		const FName& FieldName = IsStaticMeshComponentUsefulField(PropName) ? PropName : PropType;
+
+		if (PropType == "StructProperty")
+		{
+			FName StrucName;
+			if (!ReadUE3ComponentFName(Ar, StrucName))
+				break;
+		}
+		else if (PropType == "BoolProperty")
+		{
+			if (Ar.ArVer < 673)
+			{
+				int BoolValue;
+				Ar << BoolValue;
+			}
+			else
+			{
+				byte BoolValue;
+				Ar << BoolValue;
+			}
+		}
+		else if (PropType == "ByteProperty" && Ar.ArVer >= 633)
+		{
+			FName EnumName;
+			if (!ReadUE3ComponentFName(Ar, EnumName))
+				break;
+		}
+
+		int StopPos = Ar.Tell() + DataSize;
+		if ((Ar.GetStopper() && StopPos > Ar.GetStopper()) || StopPos < Ar.Tell())
+		{
+			if (IsStaticMeshComponentUsefulField(FieldName) && Ar.GetStopper())
+			{
+				StopPos = Ar.GetStopper();
+			}
+			else
+			{
+				if (Ar.GetStopper())
+					Ar.Seek(Ar.GetStopper());
+				break;
+			}
+		}
+
+		if (FieldName == "StaticMesh" && DataSize == 4)
+		{
+			Ar << StaticMesh;
+		}
+		else if (FieldName == "StaticMesh" && DataSize > 12)
+		{
+			int SavePos = Ar.Tell();
+			Ar.Seek(SavePos + 8);
+			UObject* MeshObj = NULL;
+			Ar << MeshObj;
+			if (MeshObj && MeshObj->IsA("UStaticMesh3"))
+			{
+				StaticMesh = static_cast<UStaticMesh3*>(MeshObj);
+				int BlockEnd = SavePos + DataSize;
+				if (Ar.GetStopper() && BlockEnd > Ar.GetStopper())
+					BlockEnd = Ar.GetStopper();
+				CollectStaticMeshComponentMaterialRefs(Ar, Package, SavePos, BlockEnd, Materials);
+			}
+			Ar.Seek(SavePos);
+		}
+		else if (PropType == "ArrayProperty" && DataSize >= 4 && IsStaticMeshComponentMaterialField(FieldName))
+		{
+			if (FieldName == "Materials")
+				Ar << Materials;
+			else if (FieldName == "OverrideMaterials")
+				Ar << OverrideMaterials;
+			else if (FieldName == "MaterialOverrides")
+				Ar << MaterialOverrides;
+			else if (FieldName == "ReplacementMaterials")
+				Ar << ReplacementMaterials;
+		}
+
+		Ar.Seek(StopPos);
+	}
+
+	if (Ar.GetStopper() && Ar.Tell() < Ar.GetStopper())
+		Ar.Seek(Ar.GetStopper());
+
+	unguard;
+}
+
 #if MOH2010
 
 struct FMOHStaticMeshSectionUnk
@@ -2654,6 +3026,20 @@ struct FStaticMeshSection3
 		unguard;
 	}
 };
+
+static UMaterialInterface* GetActorStaticMeshMaterial(const TArray<UMaterialInterface*>& Materials, const FStaticMeshSection3& Section, int SectionIndex)
+{
+	if (Materials.Num() == 0)
+		return NULL;
+
+	if (Materials.IsValidIndex(Section.Index) && Materials[Section.Index])
+		return Materials[Section.Index];
+
+	if (Materials.IsValidIndex(SectionIndex) && Materials[SectionIndex])
+		return Materials[SectionIndex];
+
+	return NULL;
+}
 
 
 struct FStaticMeshVertexStream3
@@ -3948,6 +4334,10 @@ void UStaticMesh3::ConvertMesh()
 	int ArVer  = GetArVer();
 	int ArGame = GetGame();
 
+	TArray<UMaterialInterface*> ActorMaterials;
+	if (UseUE3ActorStaticMeshMaterials(ArGame))
+		FindActorStaticMeshMaterials(this, ActorMaterials);
+
 	// convert bounds
 	Mesh->BoundingSphere.R = Bounds.SphereRadius / 2;			//?? UE3 meshes has radius 2 times larger than mesh itself
 	VectorSubtract(CVT(Bounds.Origin), CVT(Bounds.BoxExtent), CVT(Mesh->BoundingBox.Min));
@@ -3988,7 +4378,8 @@ void UStaticMesh3::ConvertMesh()
 		{
 			CMeshSection &Dst = Lod->Sections[i];
 			const FStaticMeshSection3 &Src = SrcLod.Sections[i];
-			Dst.Material   = Src.Mat;
+			UMaterialInterface* ActorMat = GetActorStaticMeshMaterial(ActorMaterials, Src, i);
+			Dst.Material   = ActorMat ? ActorMat : Src.Mat;
 			Dst.FirstIndex = Src.FirstIndex;
 			Dst.NumFaces   = Src.NumFaces;
 		}

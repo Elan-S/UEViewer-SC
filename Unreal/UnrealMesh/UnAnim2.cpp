@@ -1,11 +1,16 @@
 #include "Core.h"
 #include "UnCore.h"
 #include "UnObject.h"
+#include "UnrealPackage/UnPackage.h"
 #include "UnMesh2.h"
 #include "UnMeshTypes.h"
 
 #include "Mesh/SkeletalMesh.h"
 #include "TypeConvert.h"
+
+#if SPLINTER_CELL
+static bool IsSCCTFaceSequenceName(const char *Name);
+#endif
 
 
 /*-----------------------------------------------------------------------------
@@ -48,6 +53,7 @@ void UMeshAnimation::ConvertAnims()
 		S.Name      = Src.Name;
 		S.NumFrames = Src.NumFrames;
 		S.Rate      = Src.Rate;
+		S.bAdditive = IsSCCTFaceSequenceName(*Src.Name);
 
 		// S.Tracks
 		S.Tracks.Empty(numBones);
@@ -76,6 +82,27 @@ void UMeshAnimation::ConvertAnims()
 
 
 #if SPLINTER_CELL
+
+static bool IsSCCTFaceSequenceName(const char *Name)
+{
+	return Name && Name[0] == 'F' && Name[1] == 'a' && Name[2] == 'c';
+}
+
+static FVector GetSCCTRootMotionScale()
+{
+	FVector Scale;
+	Scale.Set(0.64f, 0.64f, 0.64f);
+	const char *Env = getenv("SCCT_ROOT_MOTION_SCALE");
+	if (Env && Env[0])
+	{
+		float X, Y, Z;
+		if (sscanf(Env, "%f,%f,%f", &X, &Y, &Z) == 3)
+			Scale.Set(X, Y, Z);
+		else if (sscanf(Env, "%f", &X) == 1)
+			Scale.Set(X, X, X);
+	}
+	return Scale;
+}
 
 // quaternion with 4 16-bit fixed point fields
 struct FQuatComp
@@ -154,6 +181,27 @@ struct FVectorComp
 
 SIMPLE_TYPE(FVectorComp, int16)
 
+struct FVectorCompPandora
+{
+	int16			X, Y, Z;
+
+	inline operator FVector() const
+	{
+		FVector r;
+		r.X = X / 32.0f;
+		r.Y = Y / 32.0f;
+		r.Z = Z / 32.0f;
+		return r;
+	}
+
+	friend FArchive& operator<<(FArchive &Ar, FVectorCompPandora &V)
+	{
+		return Ar << V.X << V.Y << V.Z;
+	}
+};
+
+SIMPLE_TYPE(FVectorCompPandora, int16)
+
 
 #define SCELL_TRACK(Name,Quat,Pos,Time)						\
 struct Name													\
@@ -181,6 +229,76 @@ SCELL_TRACK(Quat16Track,     FQuatComp2, FVector,     uint16)	// all types are "
 SCELL_TRACK(FixPosTrack,     FQuatComp2, FVectorComp, uint16)	// "small" KeyPos
 SCELL_TRACK(FixTimeTrack,    FQuatComp2, FVector,     uint8)    // "small" KeyTime
 SCELL_TRACK(FixPosTimeTrack, FQuatComp2, FVectorComp, uint8)    // "small" KeyPos and KeyTime
+SCELL_TRACK(SCCTQuatTrack,     FQuatComp, FVector,     uint16)	// Chaos Theory keeps full int16 XYZW quats
+SCELL_TRACK(SCCTFixPosTrack,   FQuatComp, FVectorComp, uint16)
+SCELL_TRACK(SCCTFixTimeTrack,  FQuatComp, FVector,     uint8)
+SCELL_TRACK(SCCTFixPosTimeTrack, FQuatComp, FVectorComp, uint8)
+
+struct FSC4AnimTrack
+{
+	unsigned					Flags;
+	TArray<FQuatComp>			KeyQuat;
+	TArray<FVectorCompPandora>	KeyPos;
+	TArray<uint16>				KeyTime;
+
+	void Decompress(AnalogTrack &D)
+	{
+		D.Flags = Flags;
+		CopyArray(D.KeyQuat, KeyQuat);
+		CopyArray(D.KeyPos, KeyPos);
+		CopyArray(D.KeyTime, KeyTime);
+	}
+
+	friend FArchive& operator<<(FArchive &Ar, FSC4AnimTrack &A)
+	{
+		return Ar << A.Flags << A.KeyQuat << A.KeyPos << A.KeyTime;
+	}
+};
+
+struct FSC4MotionChunk
+{
+	FVector						RootSpeed3D;
+	float						TrackTime;
+	int							StartBone;
+	float						UnknownTime;
+	TArray<int>					BoneIndices;
+	TArray<FSC4AnimTrack>		AnimTracks;
+	FSC4AnimTrack				RootTrack;
+
+	friend FArchive& operator<<(FArchive &Ar, FSC4MotionChunk &M)
+	{
+		return Ar << M.RootSpeed3D << M.TrackTime << M.StartBone << M.UnknownTime
+			<< M.BoneIndices << M.AnimTracks << M.RootTrack;
+	}
+};
+
+struct FSC4AnimNotify
+{
+	float						Time;
+	FName						Function;
+	int							NotifyObjIndex;
+
+	friend FArchive& operator<<(FArchive &Ar, FSC4AnimNotify &N)
+	{
+		return Ar << N.Time << N.Function << AR_INDEX(N.NotifyObjIndex);
+	}
+};
+
+struct FSC4AnimSeq
+{
+	float						f28;
+	FName						Name;
+	TArray<FName>				Groups;
+	int							StartFrame;
+	int							NumFrames;
+	TArray<FSC4AnimNotify>		Notifys;
+	float						Rate;
+
+	friend FArchive& operator<<(FArchive &Ar, FSC4AnimSeq &A)
+	{
+		return Ar << A.f28 << A.Name << A.Groups << A.StartFrame << A.NumFrames << A.Notifys << A.Rate;
+	}
+};
 
 
 void AnalogTrack::SerializeSCell(FArchive &Ar)
@@ -191,6 +309,48 @@ void AnalogTrack::SerializeSCell(FArchive &Ar)
 	// copy with conversion
 	CopyArray(KeyQuat, KeyQuat2);
 	CopyArray(KeyTime, KeyTime2);
+}
+
+void AnalogTrack::SerializePandora(FArchive &Ar)
+{
+	TArray<FQuatComp> KeyQuat2;
+	TArray<FVectorCompPandora> KeyPos2;
+	TArray<uint16> KeyTime2;
+	Ar << Flags << KeyQuat2 << KeyPos2 << KeyTime2;
+	CopyArray(KeyQuat, KeyQuat2);
+	CopyArray(KeyPos, KeyPos2);
+	CopyArray(KeyTime, KeyTime2);
+}
+
+static bool IsPandoraAnimSeqHeader(FArchive &Ar, const UnPackage *Package, int Pos, int ExpectedFrames)
+{
+	guard(IsPandoraAnimSeqHeader);
+	Ar.Seek(Pos + 4);
+	int NameIndex, NameExtra, GroupCount;
+	Ar << AR_INDEX(NameIndex) << AR_INDEX(NameExtra) << AR_INDEX(GroupCount);
+	if (NameIndex <= 0 || unsigned(NameIndex) >= Package->Summary.NameCount)
+		return false;
+	if (GroupCount < 0 || GroupCount > 4)
+		return false;
+	for (int GroupIndex = 0; GroupIndex < GroupCount; GroupIndex++)
+	{
+		int GroupNameIndex, GroupNameExtra;
+		Ar << AR_INDEX(GroupNameIndex) << AR_INDEX(GroupNameExtra);
+		if (GroupNameIndex < 0 || unsigned(GroupNameIndex) >= Package->Summary.NameCount)
+			return false;
+	}
+	int StartFrame, NumFrames, NotifyCount;
+	Ar << StartFrame << NumFrames << AR_INDEX(NotifyCount);
+	if (StartFrame < 0 || StartFrame >= 1000)
+		return false;
+	if (NumFrames <= 0 || NumFrames >= 1000)
+		return false;
+	if (ExpectedFrames > 0 && abs(NumFrames - ExpectedFrames) > 1)
+		return false;
+	if (NotifyCount < 0 || NotifyCount >= 100)
+		return false;
+	return true;
+	unguard;
 }
 
 
@@ -306,6 +466,1080 @@ void UMeshAnimation::SerializeSCell(FArchive &Ar)
 		}
 	}
 //	if (OldCompression) appNotify("OldCompression=%d", OldCompression, CompressType);
+
+	unguard;
+}
+
+void UMeshAnimation::SerializePandora(FArchive &Ar)
+{
+	guard(UMeshAnimation::SerializePandora);
+
+	Ar << Moves;
+
+	int MoveCount = Moves.Num();
+	int SeqCount;
+	Ar << AR_INDEX(SeqCount);
+	AnimSeqs.Empty(MoveCount);
+	AnimSeqs.AddZeroed(MoveCount);
+	for (int i = 0; i < MoveCount; i++)
+	{
+		FMeshAnimSeq &Seq = AnimSeqs[i];
+		int ExpectedFrames = max(1, appRound(Moves[i].TrackTime));
+		int CurrentSeq = Ar.Tell();
+		if (!IsPandoraAnimSeqHeader(Ar, Package, CurrentSeq, ExpectedFrames))
+		{
+			int FoundSeq = 0;
+			for (int Pos = CurrentSeq + 1; Pos < Ar.GetStopper() - 16; Pos++)
+			{
+				if (IsPandoraAnimSeqHeader(Ar, Package, Pos, ExpectedFrames))
+				{
+					FoundSeq = Pos;
+					break;
+				}
+			}
+			if (!FoundSeq)
+				break;
+			CurrentSeq = FoundSeq;
+		}
+		Ar.Seek(CurrentSeq);
+
+		float f28;
+		int NameIndex, NameExtra, GroupCount;
+		Ar << f28 << AR_INDEX(NameIndex) << AR_INDEX(NameExtra) << AR_INDEX(GroupCount);
+		Seq.Name = Package->GetName(NameIndex);
+		Seq.Groups.Empty(GroupCount);
+		for (int GroupIndex = 0; GroupIndex < GroupCount; GroupIndex++)
+		{
+			int GroupNameIndex, GroupNameExtra;
+			Ar << AR_INDEX(GroupNameIndex) << AR_INDEX(GroupNameExtra);
+			FName* GroupName = new (Seq.Groups) FName;
+			*GroupName = Package->GetName(GroupNameIndex);
+		}
+		Ar << Seq.StartFrame << Seq.NumFrames;
+		int NotifyCount;
+		Ar << AR_INDEX(NotifyCount);
+
+		Seq.f28 = f28;
+		Seq.Notifys.Empty();
+		Seq.Rate = 30.0f;
+
+		// Pandora Tomorrow notifies use Ubisoft-specific compact payloads. Scan to the
+		// next sequence header, preserving names/timing while safely ignoring notifies.
+		int NextSeq = 0;
+		for (int Pos = Ar.Tell(); Pos < Ar.GetStopper() - 16; Pos++)
+		{
+			int NextExpectedFrames = (i + 1 < MoveCount) ? max(1, appRound(Moves[i + 1].TrackTime)) : 0;
+			if (IsPandoraAnimSeqHeader(Ar, Package, Pos, NextExpectedFrames))
+			{
+				NextSeq = Pos;
+				break;
+			}
+		}
+
+		if (NextSeq)
+		{
+			// Rate is the float immediately before the next sequence's f28.
+			Ar.Seek(NextSeq - 4);
+			Ar << Seq.Rate;
+			Ar.Seek(NextSeq);
+		}
+		else
+		{
+			Seq.Rate = 30.0f;
+			DROP_REMAINING_DATA(Ar);
+		}
+	}
+
+	DROP_REMAINING_DATA(Ar);
+
+	unguard;
+}
+
+void UMeshAnimation::SerializeSC4(FArchive &Ar)
+{
+	guard(UMeshAnimation::SerializeSC4);
+
+	TArray<FSC4MotionChunk> SrcMoves;
+	Ar << SrcMoves;
+
+	Moves.Empty(SrcMoves.Num());
+	Moves.AddZeroed(SrcMoves.Num());
+	for (int MoveIndex = 0; MoveIndex < SrcMoves.Num(); MoveIndex++)
+	{
+		FSC4MotionChunk &Src = SrcMoves[MoveIndex];
+		MotionChunk &Dst = Moves[MoveIndex];
+		Dst.RootSpeed3D = Src.RootSpeed3D;
+		Dst.TrackTime = Src.TrackTime;
+		Dst.StartBone = Src.StartBone;
+		Dst.Flags = 0;
+		CopyArray(Dst.BoneIndices, Src.BoneIndices);
+
+		Dst.AnimTracks.Empty(Src.AnimTracks.Num());
+		Dst.AnimTracks.AddZeroed(Src.AnimTracks.Num());
+		for (int TrackIndex = 0; TrackIndex < Src.AnimTracks.Num(); TrackIndex++)
+			Src.AnimTracks[TrackIndex].Decompress(Dst.AnimTracks[TrackIndex]);
+		Src.RootTrack.Decompress(Dst.RootTrack);
+	}
+
+	TArray<FSC4AnimSeq> SrcSeqs;
+	Ar << SrcSeqs;
+	AnimSeqs.Empty(SrcSeqs.Num());
+	AnimSeqs.AddZeroed(SrcSeqs.Num());
+	for (int SeqIndex = 0; SeqIndex < SrcSeqs.Num(); SeqIndex++)
+	{
+		const FSC4AnimSeq &Src = SrcSeqs[SeqIndex];
+		FMeshAnimSeq &Dst = AnimSeqs[SeqIndex];
+		Dst.f28 = Src.f28;
+		Dst.Name = Src.Name;
+		CopyArray(Dst.Groups, Src.Groups);
+		Dst.StartFrame = Src.StartFrame;
+		Dst.NumFrames = Src.NumFrames;
+		Dst.Rate = Src.Rate;
+	}
+
+	if (getenv("SC4_DEBUG_ANIM"))
+		appPrintf("SC4 MeshAnimation %s: moves=%d sequences=%d end=%08X stopper=%08X\n",
+			Name, Moves.Num(), AnimSeqs.Num(), Ar.Tell(), Ar.GetStopper());
+
+	unguard;
+}
+
+void UMeshAnimation::SerializeSCCT(FArchive &Ar)
+{
+	guard(UMeshAnimation::SerializeSCCT);
+
+	struct FSCCTSeqInfo
+	{
+		int Pos;
+		int End;
+		int NameIndex;
+		int StartFrame;
+		int NumFrames;
+		int NotifyCount;
+		float Rate;
+		int ExtraSize;
+	};
+	auto IsSCCTSequenceName = [](const char *S) -> bool
+	{
+		if (!S || !S[0])
+			return false;
+		int Len = 0;
+		bool HasLetter = false;
+		bool HasLower = false;
+		bool HasDigit = false;
+		for (const char *C = S; *C; C++, Len++)
+		{
+			if (Len >= 64)
+				return false;
+			char Ch = *C;
+			if (Ch >= 'a' && Ch <= 'z')
+			{
+				HasLetter = true;
+				HasLower = true;
+				continue;
+			}
+			if (Ch >= 'A' && Ch <= 'Z')
+			{
+				HasLetter = true;
+				continue;
+			}
+			if (Ch >= '0' && Ch <= '9')
+			{
+				HasDigit = true;
+				continue;
+			}
+			if (Ch == '_')
+				continue;
+			return false;
+		}
+		return Len >= 3 && HasLetter && (HasLower || HasDigit);
+	};
+	auto ReadSCCTNameIndex = [&](int &NameIndex) -> bool
+	{
+		Ar << AR_INDEX(NameIndex);
+		return NameIndex >= 0 && unsigned(NameIndex) < Package->Summary.NameCount;
+	};
+	auto TryReadSCCTSeq = [&](int Pos, int ExpectedFrames, FSCCTSeqInfo &Seq) -> bool
+	{
+		if (!Package || Pos < 0 || Pos >= Ar.GetStopper() - 16)
+			return false;
+		int SavePos = Ar.Tell();
+		Ar.Seek(Pos);
+
+		int NameIndex;
+		if (!ReadSCCTNameIndex(NameIndex) || NameIndex <= 0)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		if (!IsSCCTSequenceName(Package->GetName(NameIndex)))
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+
+		int GroupCount;
+		Ar << AR_INDEX(GroupCount);
+		if (GroupCount < 0 || GroupCount > 4)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		for (int GroupIndex = 0; GroupIndex < GroupCount; GroupIndex++)
+		{
+			int GroupNameIndex;
+			if (!ReadSCCTNameIndex(GroupNameIndex))
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+		}
+
+		int StartFrame, NumFrames;
+		Ar << StartFrame << NumFrames;
+		if (StartFrame < 0 || StartFrame > 100000 || NumFrames <= 0 || NumFrames > 10000)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		if (ExpectedFrames > 1 && abs(NumFrames - ExpectedFrames) > 1)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+
+		int NotifyCount;
+		Ar << AR_INDEX(NotifyCount);
+		if (NotifyCount < 0 || NotifyCount > 512)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		float Rate = 15.0f;
+		int ExtraSize = -1;
+		bool bGoodNotifies = true;
+		for (int NotifyIndex = 0; NotifyIndex < NotifyCount; NotifyIndex++)
+		{
+			if (Ar.Tell() + 4 > Ar.GetStopper())
+			{
+				bGoodNotifies = false;
+				break;
+			}
+			float NotifyTime;
+			Ar << NotifyTime;
+			if (NotifyTime < -0.001f || NotifyTime > NumFrames + 0.001f)
+			{
+				bGoodNotifies = false;
+				break;
+			}
+			int FunctionNameIndex;
+			if (!ReadSCCTNameIndex(FunctionNameIndex))
+			{
+				bGoodNotifies = false;
+				break;
+			}
+			int FunctionNameExtra;
+			Ar << AR_INDEX(FunctionNameExtra);
+			if (FunctionNameExtra < 0 || FunctionNameExtra > 10000)
+			{
+				bGoodNotifies = false;
+				break;
+			}
+			int NotifyObjectNameIndex;
+			if (!ReadSCCTNameIndex(NotifyObjectNameIndex))
+			{
+				bGoodNotifies = false;
+				break;
+			}
+		}
+		if (!bGoodNotifies || Ar.Tell() + 4 > Ar.GetStopper())
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		float SerializedRate;
+		Ar << SerializedRate;
+		if (SerializedRate >= 1.0f && SerializedRate <= 120.0f)
+			Rate = SerializedRate;
+		else
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		if (Ar.Tell() + 4 <= Ar.GetStopper())
+			Ar << ExtraSize;
+
+		Seq.Pos = Pos;
+		Seq.End = Ar.Tell();
+		Seq.NameIndex = NameIndex;
+		Seq.StartFrame = StartFrame;
+		Seq.NumFrames = NumFrames;
+		Seq.NotifyCount = NotifyCount;
+		Seq.Rate = Rate;
+		Seq.ExtraSize = ExtraSize;
+		Ar.Seek(SavePos);
+		return true;
+	};
+	auto DecodeSCCTQuat32 = [](unsigned Packed) -> FQuat
+	{
+		FQuat Q;
+		Q.Set(0, 0, 0, 1);
+		int Selector = (Packed >> 30) & 3;
+		static const int SelectorMap[4] = { 0, 1, 2, 3 };
+		static const int FieldOrder[4][3] =
+		{
+			{ 2, 1, 0 },
+			{ 2, 1, 0 },
+			{ 2, 1, 0 },
+			{ 2, 1, 0 }
+		};
+		int Missing = SelectorMap[Selector];
+		unsigned Data = Packed & 0x3FFFFFFF;
+		static const float Shift = 0.70710678118f;
+		static const float Scale = 1.41421356237f;
+		float Raw[3];
+		Raw[0] = ((Data & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
+		Raw[1] = (((Data >> 10) & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
+		Raw[2] = (((Data >> 20) & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
+		float C[4] = { 0, 0, 0, 0 };
+		int Slot = 0;
+		for (int i = 0; i < 4; i++)
+		{
+			if (i == Missing) continue;
+			C[i] = Raw[FieldOrder[Missing][Slot++]];
+		}
+		float MissingSq = 1.0f - (C[0] * C[0] + C[1] * C[1] + C[2] * C[2] + C[3] * C[3]);
+		C[Missing] = (MissingSq > 0) ? sqrt(MissingSq) : 0;
+		Q.Set(C[0], C[1], C[2], C[3]);
+		float LenSq = Q.X * Q.X + Q.Y * Q.Y + Q.Z * Q.Z + Q.W * Q.W;
+		if (LenSq > 0.000001f)
+		{
+			float Scale = 1.0f / sqrt(LenSq);
+			Q.X *= Scale;
+			Q.Y *= Scale;
+			Q.Z *= Scale;
+			Q.W *= Scale;
+		}
+		return Q;
+	};
+	auto DecodeSCCTVector = [](const int16 *Packed, float Scale, bool MirrorY) -> FVector
+	{
+		FVector V;
+		V.X = Packed[0] * Scale;
+		V.Y = (MirrorY ? -Packed[1] : Packed[1]) * Scale;
+		V.Z = Packed[2] * Scale;
+		return V;
+	};
+	auto SerializeSCCTRawTrack = [&](AnalogTrack &Track, int NumFrames, int CompressType, bool KeepPositionKeys, bool KeepConstantPositionKeys, bool MirrorPositionY, float PosScale) -> bool
+	{
+		uint16 NumKeys, RotSize, PosSize;
+		Ar << NumKeys << RotSize << PosSize;
+		if (NumKeys < 1 || NumKeys > 10000 ||
+			(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
+			(PosSize != 6 && PosSize != NumKeys * 6))
+			return false;
+		int RotStride = (RotSize == 6 || RotSize == NumKeys * 6) ? 6 : 4;
+		int RotKeys = RotSize / RotStride;
+		int PosKeys = PosSize / 6;
+		Track.Flags = 0;
+		Track.KeyQuat.Empty(RotKeys);
+		Track.KeyPos.Empty(PosKeys);
+		Track.KeyTime.Empty(NumKeys);
+		for (int i = 0; i < NumKeys; i++)
+		{
+			byte Time;
+			Ar << Time;
+			Track.KeyTime.Add((float)Time);
+		}
+		for (int i = 0; i < RotKeys; i++)
+		{
+			if (RotStride == 6)
+			{
+				if (CompressType == 0)
+				{
+					FQuatFixed48NoW PackedQuat;
+					Ar << PackedQuat;
+					Track.KeyQuat.Add(PackedQuat);
+				}
+				else
+				{
+					FQuatComp2 PackedQuat;
+					Ar << PackedQuat;
+					Track.KeyQuat.Add(PackedQuat);
+				}
+			}
+			else
+			{
+				unsigned PackedQuat;
+				Ar << PackedQuat;
+				Track.KeyQuat.Add(DecodeSCCTQuat32(PackedQuat));
+			}
+		}
+		for (int i = 1; i < Track.KeyQuat.Num(); i++)
+		{
+			const FQuat &Prev = Track.KeyQuat[i - 1];
+			FQuat &Cur = Track.KeyQuat[i];
+			float Dot = Prev.X * Cur.X + Prev.Y * Cur.Y + Prev.Z * Cur.Z + Prev.W * Cur.W;
+			if (Dot < 0.0f)
+			{
+				Cur.X = -Cur.X;
+				Cur.Y = -Cur.Y;
+				Cur.Z = -Cur.Z;
+				Cur.W = -Cur.W;
+			}
+		}
+		for (int i = 0; i < PosKeys; i++)
+		{
+			int16 PackedPos[3];
+			Ar << PackedPos[0] << PackedPos[1] << PackedPos[2];
+			if (KeepPositionKeys && (KeepConstantPositionKeys || PosKeys > 1))
+				Track.KeyPos.Add(DecodeSCCTVector(PackedPos, PosScale, MirrorPositionY));
+		}
+		int UsedKeys = max(Track.KeyQuat.Num(), Track.KeyPos.Num());
+		if (UsedKeys > 0 && Track.KeyTime.Num() > UsedKeys)
+			Track.KeyTime.RemoveAt(UsedKeys, Track.KeyTime.Num() - UsedKeys);
+		return true;
+	};
+	int SeqCount = 0;
+	auto IsPlausibleSCCTCompressionStart = [&](int Pos, int *OutMode) -> bool
+	{
+		if (OutMode)
+			*OutMode = 0;
+		if (Pos < 0 || Pos + 10 >= Ar.GetStopper())
+			return false;
+		auto CheckCompressedArrayCounts = [&](int CompressType) -> bool
+		{
+			if (CompressType < 1 || CompressType > 4)
+				return false;
+			for (int i = 1; i <= 4; i++)
+			{
+				int Count;
+				Ar << AR_INDEX(Count);
+				if (Count < 0 || Count > 10000)
+					return false;
+				if (i < CompressType)
+				{
+					if (Count != 0)
+						return false;
+				}
+				else if (i == CompressType)
+				{
+					if (Count != SeqCount)
+						return false;
+					return true;
+				}
+				else
+				{
+					return true;
+				}
+			}
+			return false;
+		};
+		int SavePos = Ar.Tell();
+		int CompressTypeOnly;
+		Ar.Seek(Pos);
+		Ar << CompressTypeOnly;
+		if (CheckCompressedArrayCounts(CompressTypeOnly))
+		{
+			if (OutMode)
+				*OutMode = 1;
+			Ar.Seek(SavePos);
+			return true;
+		}
+
+		int OldCompression, T0Count, CompressType;
+		Ar.Seek(Pos);
+		Ar << OldCompression << AR_INDEX(T0Count) << CompressType;
+		if (OldCompression == 0 && T0Count == 0 && CheckCompressedArrayCounts(CompressType))
+		{
+			if (OutMode)
+				*OutMode = 2;
+			Ar.Seek(SavePos);
+			return true;
+		}
+		Ar.Seek(SavePos);
+		return false;
+	};
+
+	int SeqArrayStart = Ar.Tell();
+	Ar << AR_INDEX(SeqCount);
+	if (SeqCount < 0 || SeqCount > 10000)
+		appError("Invalid SCCT sequence count: %d", SeqCount);
+
+	TArray<FSCCTSeqInfo> SeqInfos;
+	int PayloadStart = Ar.Tell();
+
+	TArray<FSCCTSeqInfo> SeqCandidates;
+	TArray<FSCCTSeqInfo> AllSeqCandidates;
+	int SeqPos = PayloadStart;
+	for (int SeqIndex = 0; SeqIndex < SeqCount; SeqIndex++)
+	{
+		FSCCTSeqInfo Info;
+		if (!TryReadSCCTSeq(SeqPos, 0, Info))
+			break;
+		new (AllSeqCandidates) FSCCTSeqInfo(Info);
+		if (SeqIndex + 1 >= SeqCount)
+			break;
+		int NextSeqPos = 0;
+		for (int Pos = Info.End; Pos < Ar.GetStopper() - 16; Pos++)
+		{
+			FSCCTSeqInfo NextInfo;
+			if (TryReadSCCTSeq(Pos, 0, NextInfo))
+			{
+				NextSeqPos = Pos;
+				break;
+			}
+		}
+		if (!NextSeqPos)
+			break;
+		SeqPos = NextSeqPos;
+	}
+	if (AllSeqCandidates.Num() < SeqCount)
+	{
+		AllSeqCandidates.Empty();
+		int SeqScanStart = max(PayloadStart, Ar.GetStopper() - 0x10000);
+		for (int Pos = SeqScanStart; Pos < Ar.GetStopper() - 16; Pos++)
+		{
+			FSCCTSeqInfo Info;
+			if (TryReadSCCTSeq(Pos, 0, Info))
+			{
+				new (AllSeqCandidates) FSCCTSeqInfo(Info);
+			}
+		}
+		if (AllSeqCandidates.Num() < SeqCount && SeqScanStart > PayloadStart)
+		{
+			AllSeqCandidates.Empty();
+			for (int Pos = PayloadStart; Pos < Ar.GetStopper() - 16; Pos++)
+			{
+				FSCCTSeqInfo Info;
+				if (TryReadSCCTSeq(Pos, 0, Info))
+				{
+					new (AllSeqCandidates) FSCCTSeqInfo(Info);
+				}
+			}
+		}
+	}
+	TArray<FSCCTSeqInfo> FilteredSeqCandidates;
+	auto HasCorruptSCCTSeqTail = [](const FSCCTSeqInfo &Info) -> bool
+	{
+		// Ubisoft notifies may carry variable-size payloads. If the fixed-size
+		// notify skip lands in the middle of that payload, the following bytes can
+		// resemble a sequence header; the bogus tail value is the tell.
+		return Info.NotifyCount > 0 && Info.ExtraSize > 0x04000000;
+	};
+	int BadNotifyChainEnd = 0;
+	for (int i = 0; i < AllSeqCandidates.Num(); i++)
+	{
+		const FSCCTSeqInfo &Info = AllSeqCandidates[i];
+		if (BadNotifyChainEnd)
+		{
+			if (Info.Pos == BadNotifyChainEnd)
+			{
+				BadNotifyChainEnd = Info.End;
+				continue;
+			}
+			if (Info.Pos > BadNotifyChainEnd)
+			{
+				BadNotifyChainEnd = 0;
+			}
+		}
+		if (FilteredSeqCandidates.Num())
+		{
+			const FSCCTSeqInfo &Prev = FilteredSeqCandidates[FilteredSeqCandidates.Num() - 1];
+			if (Info.Pos > Prev.Pos && Info.Pos < Prev.End)
+			{
+				continue;
+			}
+		}
+		new (FilteredSeqCandidates) FSCCTSeqInfo(Info);
+		if (HasCorruptSCCTSeqTail(Info))
+			BadNotifyChainEnd = Info.End;
+	}
+	AllSeqCandidates.Empty(FilteredSeqCandidates.Num());
+	for (int i = 0; i < FilteredSeqCandidates.Num(); i++)
+		new (AllSeqCandidates) FSCCTSeqInfo(FilteredSeqCandidates[i]);
+	int FirstSeqCandidate = (AllSeqCandidates.Num() > SeqCount) ? AllSeqCandidates.Num() - SeqCount : 0;
+	for (int i = FirstSeqCandidate; i < AllSeqCandidates.Num(); i++)
+		new (SeqCandidates) FSCCTSeqInfo(AllSeqCandidates[i]);
+	if (getenv("SCCT_DEBUG_SEQMAP"))
+	{
+		appPrintf("SCCT candidates all=%d used=%d first=%d seqCount=%d\n", AllSeqCandidates.Num(), SeqCandidates.Num(), FirstSeqCandidate, SeqCount);
+		for (int i = 0; i < SeqCandidates.Num(); i++)
+		{
+			appPrintf("SCCT candidate %d: pos=%X end=%X name=%s frames=%d notify=%d rate=%g extra=%d\n",
+				i, SeqCandidates[i].Pos, SeqCandidates[i].End, Package->GetName(SeqCandidates[i].NameIndex), SeqCandidates[i].NumFrames,
+				SeqCandidates[i].NotifyCount, SeqCandidates[i].Rate, SeqCandidates[i].ExtraSize);
+		}
+	}
+
+	Moves.Empty(SeqCount);
+	TArray<int> MoveRawKeyCounts;
+	MoveRawKeyCounts.Empty(SeqCount);
+	TArray<int> MoveRawFrameSpans;
+	MoveRawFrameSpans.Empty(SeqCount);
+	int TotalTracks = 0;
+	int MotionSearchPos = PayloadStart;
+	int MotionDataEnd = SeqCandidates.Num() ? SeqCandidates[0].Pos : Ar.GetStopper();
+	int MaxRawMoves = SeqCount + min(64, SeqCount / 8 + 16);
+	auto IsPlausibleInlineSCCTTracks = [&](int Pos, int SeqIndex, int *OutCompressType, bool AllowEmpty) -> bool
+	{
+		if (OutCompressType)
+			*OutCompressType = 0;
+		int SavePos = Ar.Tell();
+		Ar.Seek(Pos);
+		int CompressType, BoneIndexCount;
+		Ar << CompressType << AR_INDEX(BoneIndexCount);
+		if (CompressType < 1 || CompressType > 4 || BoneIndexCount < 0 || BoneIndexCount > 256)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		if (BoneIndexCount == 0)
+		{
+			if (OutCompressType)
+				*OutCompressType = CompressType;
+			Ar.Seek(SavePos);
+			return AllowEmpty;
+		}
+		for (int TrackIndex = 0; TrackIndex < BoneIndexCount; TrackIndex++)
+		{
+			uint16 NumKeys, RotSize, PosSize;
+			Ar << NumKeys << RotSize << PosSize;
+			if (NumKeys == 0 && RotSize == 0 && PosSize == 0)
+				continue;
+			if (NumKeys < 1 || NumKeys > 10000 ||
+				(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
+				(PosSize != 6 && PosSize != NumKeys * 6))
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			Ar.Seek(Ar.Tell() + NumKeys + RotSize + PosSize);
+			if (Ar.Tell() > Ar.GetStopper())
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+		}
+		if (OutCompressType)
+			*OutCompressType = CompressType;
+		Ar.Seek(SavePos);
+		return true;
+	};
+	auto IsPlausibleBareSCCTTracks = [&](int Pos, int *OutTrackCount) -> bool
+	{
+		if (OutTrackCount)
+			*OutTrackCount = 0;
+		if (Pos < 0 || Pos + 8 >= Ar.GetStopper())
+			return false;
+		int SavePos = Ar.Tell();
+		Ar.Seek(Pos);
+		int TrackCount;
+		Ar << AR_INDEX(TrackCount);
+		if (TrackCount < 1 || TrackCount > 256)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		bool HasRealTrack = false;
+		for (int TrackIndex = 0; TrackIndex < TrackCount; TrackIndex++)
+		{
+			uint16 NumKeys, RotSize, PosSize;
+			Ar << NumKeys << RotSize << PosSize;
+			if (NumKeys == 0 && RotSize == 0 && PosSize == 0)
+				continue;
+			HasRealTrack = true;
+			if (NumKeys < 1 || NumKeys > 10000 ||
+				(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
+				(PosSize != 6 && PosSize != NumKeys * 6))
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			Ar.Seek(Ar.Tell() + NumKeys + RotSize + PosSize);
+			if (Ar.Tell() > Ar.GetStopper())
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+		}
+		if (!HasRealTrack && TrackCount == 1 && Ar.Tell() + 8 < Ar.GetStopper())
+		{
+			int EmptyEnd = Ar.Tell();
+			for (int PadBytes = 0; PadBytes <= 4 && EmptyEnd + PadBytes + 8 < Ar.GetStopper(); PadBytes++)
+			{
+				bool bZeroPadding = true;
+				for (int PadIndex = 0; PadIndex < PadBytes; PadIndex++)
+				{
+					byte PadByte;
+					Ar.Seek(EmptyEnd + PadIndex);
+					Ar << PadByte;
+					if (PadByte != 0)
+					{
+						bZeroPadding = false;
+						break;
+					}
+				}
+				if (!bZeroPadding)
+					break;
+				Ar.Seek(EmptyEnd + PadBytes);
+				int NextTrackCount;
+				Ar << AR_INDEX(NextTrackCount);
+				if (NextTrackCount > 1 && NextTrackCount <= 256)
+				{
+					uint16 NextNumKeys, NextRotSize, NextPosSize;
+					Ar << NextNumKeys << NextRotSize << NextPosSize;
+					if (NextNumKeys >= 1 && NextNumKeys <= 10000 &&
+						(NextRotSize == 4 || NextRotSize == NextNumKeys * 4 || NextRotSize == 6 || NextRotSize == NextNumKeys * 6) &&
+						(NextPosSize == 6 || NextPosSize == NextNumKeys * 6))
+					{
+						Ar.Seek(SavePos);
+						return false;
+					}
+				}
+			}
+			Ar.Seek(EmptyEnd);
+		}
+		if (OutTrackCount)
+			*OutTrackCount = TrackCount;
+		Ar.Seek(SavePos);
+		return true;
+	};
+	auto PeekSCCTTrackMaxKeys = [&](int Pos) -> int
+	{
+		int SavePos = Ar.Tell();
+		Ar.Seek(Pos);
+		int CompressType, TrackCount;
+		Ar << CompressType;
+		Ar << AR_INDEX(TrackCount);
+		if (CompressType < 1 || CompressType > 4 || TrackCount < 1 || TrackCount > 256)
+		{
+			Ar.Seek(SavePos);
+			return 0;
+		}
+		int MaxKeys = 1;
+		for (int TrackIndex = 0; TrackIndex < TrackCount; TrackIndex++)
+		{
+			uint16 NumKeys, RotSize, PosSize;
+			Ar << NumKeys << RotSize << PosSize;
+			if (NumKeys == 0 && RotSize == 0 && PosSize == 0)
+				continue;
+			if (NumKeys < 1 || NumKeys > 10000 ||
+				(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
+				(PosSize != 6 && PosSize != NumKeys * 6))
+			{
+				Ar.Seek(SavePos);
+				return 0;
+			}
+			MaxKeys = max(MaxKeys, (int)NumKeys);
+			Ar.Seek(Ar.Tell() + NumKeys + RotSize + PosSize);
+			if (Ar.Tell() > Ar.GetStopper())
+			{
+				Ar.Seek(SavePos);
+				return 0;
+			}
+		}
+		Ar.Seek(SavePos);
+		return MaxKeys;
+	};
+	for (int SeqIndex = 0; SeqIndex < MaxRawMoves && MotionSearchPos < MotionDataEnd - 8; SeqIndex++)
+	{
+		int RangeEnd = MotionDataEnd;
+		int TrackPos = 0;
+		int CompressType = 0;
+		int TrackCount = 0;
+		int RangeStart = MotionSearchPos;
+		if (IsPlausibleInlineSCCTTracks(RangeStart, SeqIndex, &CompressType, true))
+		{
+			TrackPos = RangeStart;
+		}
+		else if (IsPlausibleBareSCCTTracks(RangeStart, &TrackCount))
+		{
+			TrackPos = RangeStart;
+			CompressType = 0;
+		}
+		for (int Pos = RangeStart; !TrackPos && Pos < RangeEnd - 8; Pos++)
+		{
+			if (IsPlausibleInlineSCCTTracks(Pos, SeqIndex, &CompressType, false))
+			{
+				TrackPos = Pos;
+				break;
+			}
+			if (IsPlausibleBareSCCTTracks(Pos, &TrackCount))
+			{
+				TrackPos = Pos;
+				CompressType = 0;
+				break;
+			}
+		}
+		if (TrackPos)
+		{
+			int SavePos = Ar.Tell();
+			Ar.Seek(TrackPos);
+			if (CompressType)
+			{
+				int StoredCompressType;
+				Ar << StoredCompressType;
+			}
+			Ar << AR_INDEX(TrackCount);
+			Ar.Seek(SavePos);
+		}
+		if (getenv("SCCT_DEBUG_SEQMAP"))
+			appPrintf("SCCT raw move %d: pos=%X trackCount=%d compress=%d\n", SeqIndex, TrackPos, TrackCount, CompressType);
+		MotionChunk *Dst = new (Moves) MotionChunk;
+		Dst->RootSpeed3D.Set(0, 0, 0);
+		Dst->TrackTime = 1.0f;
+		Dst->StartBone = 0;
+		Dst->Flags = 0;
+		int NumOutTracks = max(RefBones.Num(), TrackCount);
+		Dst->BoneIndices.Empty(NumOutTracks);
+		Dst->BoneIndices.AddZeroed(NumOutTracks);
+		Dst->AnimTracks.Empty(NumOutTracks);
+		Dst->AnimTracks.AddZeroed(NumOutTracks);
+		for (int BoneIndex = 0; BoneIndex < NumOutTracks; BoneIndex++)
+			Dst->BoneIndices[BoneIndex] = BoneIndex;
+
+		if (!TrackPos)
+		{
+			if (SeqIndex >= SeqCount)
+			{
+				Moves.RemoveAt(Moves.Num() - 1);
+				break;
+			}
+			appPrintf("SCCT MeshAnimation %s: no compressed tracks for sequence %d/%d\n", Name, SeqIndex, SeqCount);
+			MoveRawKeyCounts.Add(1);
+			MoveRawFrameSpans.Add(1);
+			continue;
+		}
+
+		Ar.Seek(TrackPos);
+		if (CompressType)
+			Ar << CompressType;
+		Ar << AR_INDEX(TrackCount);
+
+		int MaxTrackKeys = 1;
+		int MaxTrackFrameSpan = 1;
+		for (int TrackIndex = 0; TrackIndex < TrackCount; TrackIndex++)
+		{
+			int SavePos = Ar.Tell();
+			uint16 NumKeys, RotSize, PosSize;
+			Ar << NumKeys << RotSize << PosSize;
+			if (NumKeys == 0 && RotSize == 0 && PosSize == 0)
+				continue;
+			if (getenv("SCCT_DEBUG_TRACKS") && TrackIndex < 8)
+			{
+				appPrintf("SCCT track seq=%d track=%d pos=%X keys=%d rotSize=%d posSize=%d compress=%d\n",
+					SeqIndex, TrackIndex, SavePos, NumKeys, RotSize, PosSize, CompressType);
+			}
+			Ar.Seek(SavePos);
+			if (NumKeys > MaxTrackKeys)
+				MaxTrackKeys = NumKeys;
+
+			AnalogTrack TempTrack;
+			float PosScale = 1.0f / 64.0f;
+			bool KeepPositionKeys = (TrackIndex == 0);
+			bool MirrorPositionY = (TrackIndex == 0);
+			if (!SerializeSCCTRawTrack(TempTrack, MaxTrackKeys, CompressType, KeepPositionKeys, true, MirrorPositionY, PosScale))
+				appError("Bad SCCT track %d/%d in sequence %d", TrackIndex, TrackCount, SeqIndex);
+			for (int KeyIndex = 0; KeyIndex < TempTrack.KeyTime.Num(); KeyIndex++)
+				MaxTrackFrameSpan = max(MaxTrackFrameSpan, appRound(TempTrack.KeyTime[KeyIndex]) + 1);
+			if (Dst->AnimTracks.IsValidIndex(TrackIndex))
+			{
+				AnalogTrack &DstTrack = Dst->AnimTracks[TrackIndex];
+				DstTrack.Flags = TempTrack.Flags;
+				CopyArray(DstTrack.KeyQuat, TempTrack.KeyQuat);
+				CopyArray(DstTrack.KeyPos, TempTrack.KeyPos);
+				CopyArray(DstTrack.KeyTime, TempTrack.KeyTime);
+				if (getenv("SCCT_DEBUG_TRACKS") && TrackIndex < 8)
+				{
+					appPrintf("  kept q=%d p=%d t=%d\n", DstTrack.KeyQuat.Num(), DstTrack.KeyPos.Num(), DstTrack.KeyTime.Num());
+				}
+			}
+			TotalTracks++;
+		}
+		Dst->TrackTime = MaxTrackKeys;
+		MoveRawKeyCounts.Add(MaxTrackKeys);
+		MoveRawFrameSpans.Add(MaxTrackFrameSpan);
+		if (getenv("SCCT_DEBUG_SEQMAP"))
+			appPrintf("SCCT raw move %d: end=%X keys=%d span=%d\n", SeqIndex, Ar.Tell(), MaxTrackKeys, MaxTrackFrameSpan);
+		MotionSearchPos = Ar.Tell();
+	}
+
+	auto CopySCCTAnalogTrack = [](AnalogTrack &Dst, const AnalogTrack &Src)
+	{
+		Dst.Flags = Src.Flags;
+		CopyArray(Dst.KeyPos, Src.KeyPos);
+		CopyArray(Dst.KeyQuat, Src.KeyQuat);
+		CopyArray(Dst.KeyTime, Src.KeyTime);
+	};
+	auto CopySCCTMotionChunk = [&](MotionChunk &Dst, const MotionChunk &Src)
+	{
+		Dst.RootSpeed3D = Src.RootSpeed3D;
+		Dst.TrackTime = Src.TrackTime;
+		Dst.StartBone = Src.StartBone;
+		Dst.Flags = Src.Flags;
+		CopyArray(Dst.BoneIndices, Src.BoneIndices);
+		Dst.AnimTracks.Empty(Src.AnimTracks.Num());
+		Dst.AnimTracks.AddZeroed(Src.AnimTracks.Num());
+		for (int TrackIndex = 0; TrackIndex < Src.AnimTracks.Num(); TrackIndex++)
+			CopySCCTAnalogTrack(Dst.AnimTracks[TrackIndex], Src.AnimTracks[TrackIndex]);
+		CopySCCTAnalogTrack(Dst.RootTrack, Src.RootTrack);
+	};
+	TArray<MotionChunk> PairedMoves;
+	int MoveIndex = 0;
+	auto SCCTFramesMatch = [](int Frames, int Span) -> bool
+	{
+		if (Frames == Span)
+			return true;
+		// Single-key constant tracks are used for 2-frame pose clips.
+		if (Frames == 2 && Span == 1)
+			return true;
+		if (Frames > 2 && abs(Frames - Span) <= 1)
+			return true;
+		return false;
+	};
+	auto SCCTFrameCost = [&](int Frames, int Span) -> int
+	{
+		if (Span <= 0)
+			return 1000;
+		if (SCCTFramesMatch(Frames, Span))
+			return 0;
+		int Diff = abs(Frames - Span);
+		int SevereMismatch = Diff > max(4, Frames / 2);
+		return (SevereMismatch ? 100 : 20) + Diff;
+	};
+	auto SCCTWindowCost = [&](int CandidateStart, int MoveStart, int Count) -> int
+	{
+		int Cost = 0;
+		for (int i = 0; i < Count; i++)
+		{
+			int CandidatePos = CandidateStart + i;
+			int MovePos = MoveStart + i;
+			if (!SeqCandidates.IsValidIndex(CandidatePos) || !MoveRawFrameSpans.IsValidIndex(MovePos))
+				return Cost + 1000 * (Count - i);
+			Cost += SCCTFrameCost(SeqCandidates[CandidatePos].NumFrames, MoveRawFrameSpans[MovePos]);
+		}
+		return Cost;
+	};
+	if (!SeqCandidates.Num() && Moves.Num())
+	{
+		for (int RawMoveIndex = 0; RawMoveIndex < Moves.Num(); RawMoveIndex++)
+		{
+			FSCCTSeqInfo *Info = new (SeqInfos) FSCCTSeqInfo;
+			memset(Info, 0, sizeof(FSCCTSeqInfo));
+			Info->NameIndex = -1;
+			Info->NumFrames = MoveRawFrameSpans.IsValidIndex(RawMoveIndex) ? max(1, MoveRawFrameSpans[RawMoveIndex]) : 1;
+			Info->Rate = 15.0f;
+			MotionChunk *PairedMove = new (PairedMoves) MotionChunk;
+			CopySCCTMotionChunk(*PairedMove, Moves[RawMoveIndex]);
+		}
+	}
+	for (int CandidateIndex = 0; SeqCandidates.Num() && CandidateIndex < SeqCandidates.Num() && MoveIndex < Moves.Num(); CandidateIndex++)
+	{
+		const FSCCTSeqInfo &Info = SeqCandidates[CandidateIndex];
+		int RawSpan = MoveRawFrameSpans.IsValidIndex(MoveIndex) ? MoveRawFrameSpans[MoveIndex] : -1;
+		if (CandidateIndex + 1 < SeqCandidates.Num())
+		{
+			const FSCCTSeqInfo &NextInfo = SeqCandidates[CandidateIndex + 1];
+			bool CurrentExact = SCCTFramesMatch(Info.NumFrames, RawSpan);
+			int LookaheadCount = min(8, min(SeqCandidates.Num() - CandidateIndex - 1, MoveRawFrameSpans.Num() - MoveIndex));
+			int KeepCost = SCCTFrameCost(Info.NumFrames, RawSpan) + SCCTWindowCost(CandidateIndex + 1, MoveIndex + 1, LookaheadCount);
+			int SkipCost = SCCTWindowCost(CandidateIndex + 1, MoveIndex, LookaheadCount);
+			int SkipPenalty = (Info.ExtraSize == 0 || Info.NumFrames <= 2) ? 4 : 18;
+			if (!CurrentExact && SCCTFramesMatch(NextInfo.NumFrames, RawSpan) && SkipCost + SkipPenalty + 20 < KeepCost)
+			{
+				if (getenv("SCCT_DEBUG_SEQMAP"))
+					appPrintf("SCCT skip unpaired candidate %d (%s frames=%d pos=%X), raw move %d span=%d matches next %s (keepCost=%d skipCost=%d penalty=%d)\n",
+						CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos, MoveIndex, RawSpan,
+						Package->GetName(NextInfo.NameIndex), KeepCost, SkipCost, SkipPenalty);
+				continue;
+			}
+		}
+		if (MoveIndex + 1 < Moves.Num())
+		{
+			bool CurrentExact = SCCTFramesMatch(Info.NumFrames, RawSpan);
+			int NextRawSpan = MoveRawFrameSpans[MoveIndex + 1];
+			int LookaheadCount = min(8, min(SeqCandidates.Num() - CandidateIndex - 1, MoveRawFrameSpans.Num() - MoveIndex - 2));
+			int KeepCost = SCCTFrameCost(Info.NumFrames, RawSpan) + SCCTWindowCost(CandidateIndex + 1, MoveIndex + 1, LookaheadCount);
+			int SkipCost = SCCTFrameCost(Info.NumFrames, NextRawSpan) + SCCTWindowCost(CandidateIndex + 1, MoveIndex + 2, LookaheadCount);
+			int SkipPenalty = (RawSpan <= 1) ? 4 : 18;
+			if (!CurrentExact && SCCTFramesMatch(Info.NumFrames, NextRawSpan) && SkipCost + SkipPenalty + 20 < KeepCost)
+			{
+				if (getenv("SCCT_DEBUG_SEQMAP"))
+					appPrintf("SCCT skip raw move %d span=%d before candidate %d (%s frames=%d pos=%X), next raw span=%d (keepCost=%d skipCost=%d penalty=%d)\n",
+						MoveIndex, RawSpan, CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos,
+						NextRawSpan, KeepCost, SkipCost, SkipPenalty);
+				MoveIndex++;
+				CandidateIndex--;
+				continue;
+			}
+		}
+		if (getenv("SCCT_DEBUG_SEQMAP"))
+		{
+			appPrintf("SCCT pair candidate %d (%s frames=%d pos=%X) -> raw move %d keys=%d span=%d\n",
+				CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos, MoveIndex,
+				MoveRawKeyCounts.IsValidIndex(MoveIndex) ? MoveRawKeyCounts[MoveIndex] : -1,
+				MoveRawFrameSpans.IsValidIndex(MoveIndex) ? MoveRawFrameSpans[MoveIndex] : -1);
+		}
+		new (SeqInfos) FSCCTSeqInfo(Info);
+		MotionChunk *PairedMove = new (PairedMoves) MotionChunk;
+		CopySCCTMotionChunk(*PairedMove, Moves[MoveIndex]);
+		MoveIndex++;
+	}
+	Moves.Empty(PairedMoves.Num());
+	Moves.AddZeroed(PairedMoves.Num());
+	for (int MoveCopyIndex = 0; MoveCopyIndex < PairedMoves.Num(); MoveCopyIndex++)
+		CopySCCTMotionChunk(Moves[MoveCopyIndex], PairedMoves[MoveCopyIndex]);
+
+	for (int i = 0; i < Moves.Num(); i++)
+	{
+		if (!Moves[i].AnimTracks.Num())
+			continue;
+		AnalogTrack &RootTrack = Moves[i].AnimTracks[0];
+		if (!RootTrack.KeyPos.Num())
+			continue;
+		FVector RootBase = RootTrack.KeyPos[0];
+		FVector RootMotionScale = GetSCCTRootMotionScale();
+		for (int KeyIndex = 0; KeyIndex < RootTrack.KeyPos.Num(); KeyIndex++)
+		{
+			RootTrack.KeyPos[KeyIndex].X = (RootTrack.KeyPos[KeyIndex].X - RootBase.X) * RootMotionScale.X;
+			RootTrack.KeyPos[KeyIndex].Y = -(RootTrack.KeyPos[KeyIndex].Y - RootBase.Y) * RootMotionScale.Y;
+			RootTrack.KeyPos[KeyIndex].Z *= RootMotionScale.Z;
+		}
+		if (getenv("SCCT_DEBUG_ROOT") && SeqInfos.IsValidIndex(i))
+		{
+			appPrintf("SCCT root %d %s keys=%d times=%d\n", i, Package->GetName(SeqInfos[i].NameIndex), RootTrack.KeyPos.Num(), RootTrack.KeyTime.Num());
+			for (int KeyIndex = 0; KeyIndex < RootTrack.KeyPos.Num(); KeyIndex++)
+			{
+				float Time = RootTrack.KeyTime.IsValidIndex(KeyIndex) ? RootTrack.KeyTime[KeyIndex] : (float)KeyIndex;
+				const FVector &Pos = RootTrack.KeyPos[KeyIndex];
+				appPrintf("  key %d t=%g pos=(%g,%g,%g)\n", KeyIndex, Time, Pos.X, Pos.Y, Pos.Z);
+			}
+		}
+	}
+
+	for (int i = 0; i < SeqInfos.Num() && i < Moves.Num(); i++)
+		Moves[i].TrackTime = max(1, SeqInfos[i].NumFrames);
+
+	AnimSeqs.Empty(SeqInfos.Num());
+	for (int i = 0; i < SeqInfos.Num(); i++)
+	{
+		const FSCCTSeqInfo &Info = SeqInfos[i];
+		FMeshAnimSeq *Seq = new (AnimSeqs) FMeshAnimSeq;
+		if (Info.NameIndex > 0 && unsigned(Info.NameIndex) < Package->Summary.NameCount)
+			Seq->Name = Package->GetName(Info.NameIndex);
+		else
+			Seq->Name = Name;
+		Seq->Groups.Empty();
+		Seq->StartFrame = Info.StartFrame;
+		Seq->NumFrames = Info.NumFrames;
+		Seq->Notifys.Empty();
+		Seq->Rate = Info.Rate;
+		Seq->f28 = 0;
+	}
+
+	appPrintf("SCCT MeshAnimation %s: standard-ish sequences=%d chunks=%d tracks=%d\n", Name, AnimSeqs.Num(), Moves.Num(), TotalTracks);
+	DROP_REMAINING_DATA(Ar);
 
 	unguard;
 }

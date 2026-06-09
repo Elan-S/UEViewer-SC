@@ -108,6 +108,7 @@
 #define TAO_YUAN		1
 #define TRIBES4			1		// Tribes: Ascend
 #define DISHONORED		1
+#define FIRSTASSAULT	1		// Star Wars: First Assault
 #define FABLE			1		// Fable: The Journey, Fable Anniversary
 #define DMC				1		// DmC: Devil May Cry
 #define HAWKEN			1

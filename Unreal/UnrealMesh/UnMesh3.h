@@ -139,6 +139,7 @@ struct FSkeletalMeshLODInfo
 		PROP_DROP(TriangleSorting)
 		PROP_DROP(TriangleSortSettings)
 		PROP_DROP(bHasBeenSimplified)
+		PROP_DROP(bDisableCompressions)
 #if FRONTLINES
 		PROP_DROP(bExcludeFromConsoles)
 		PROP_DROP(bCanRemoveForLowDetail)
@@ -471,6 +472,40 @@ struct FBulkKeyframeDataEntry
 	END_PROP_TABLE
 };
 
+struct FAnimNotifyEvent3
+{
+	DECLARE_STRUCT(FAnimNotifyEvent3);
+
+	float					Time;
+	UObject*				Notify;
+	FName					Comment;
+	FName					NotifyName;
+	float					Duration;
+	UObject*				LinkedSequence;
+	bool					PlayOnReverse;
+	bool					m_bAlwaysPlay;
+
+	FAnimNotifyEvent3()
+	:	Time(0)
+	,	Notify(NULL)
+	,	Duration(0)
+	,	LinkedSequence(NULL)
+	,	PlayOnReverse(false)
+	,	m_bAlwaysPlay(false)
+	{}
+
+	BEGIN_PROP_TABLE
+		PROP_FLOAT(Time)
+		PROP_OBJ(Notify)
+		PROP_NAME(Comment)
+		PROP_NAME(NotifyName)
+		PROP_FLOAT(Duration)
+		PROP_OBJ(LinkedSequence)
+		PROP_BOOL(PlayOnReverse)
+		PROP_BOOL(m_bAlwaysPlay)
+	END_PROP_TABLE
+};
+
 struct FBulkDataBlock
 {
 	DECLARE_STRUCT(FBulkDataBlock);
@@ -522,13 +557,29 @@ public:
 	float					RateScale;
 	bool					bNoLoopingInterpolation;
 	TArray<FRawAnimSequenceTrack> RawAnimData;
+	TArray<FAnimNotifyEvent3> Notifies;
 	AnimationCompressionFormat TranslationCompressionFormat;
 	AnimationCompressionFormat RotationCompressionFormat;
 	AnimationKeyFormat		KeyEncodingFormat;				// GoW2+
 	TArray<int32>			CompressedTrackOffsets;
 	TArray<uint8>			CompressedByteStream;
+	byte					AnimationCompressor;
+	TArray<int32>			AO2CompressionHeader;
+	TArray<int32>			AO2CompressedTrackInfo;
+	TArray<uint8>			AO2CompressionExtraData;
+	TArray<uint8>			AO2CompressedAnimData;
 	bool					bIsAdditive;
 	FName					AdditiveRefName;
+#if R6VEGAS
+	bool					m_bForce15FPS;
+	bool					m_bDuplicateKeyRemoval;
+	bool					m_bCompressedQuat;
+	bool					m_bCompressKeytimes;
+	bool					m_bIgnoreLastFrame;
+	bool					m_bIsAdditive;
+	float					m_fDuplicateTresholdMultiplier;
+	int						m_iOriginalNbFrames;
+#endif
 #if TUROK
 	TArray<FBulkKeyframeDataEntry> KeyFrameData;
 #endif
@@ -553,6 +604,17 @@ public:
 	,	TranslationCompressionFormat(ACF_None)
 	,	RotationCompressionFormat(ACF_None)
 	,	KeyEncodingFormat(AKF_ConstantKeyLerp)
+	,	AnimationCompressor(0)
+#if R6VEGAS
+	,	m_bForce15FPS(false)
+	,	m_bDuplicateKeyRemoval(false)
+	,	m_bCompressedQuat(false)
+	,	m_bCompressKeytimes(false)
+	,	m_bIgnoreLastFrame(false)
+	,	m_bIsAdditive(false)
+	,	m_fDuplicateTresholdMultiplier(1.0f)
+	,	m_iOriginalNbFrames(0)
+#endif
 	{}
 
 	BEGIN_PROP_TABLE
@@ -562,12 +624,24 @@ public:
 		PROP_FLOAT(RateScale)
 		PROP_BOOL(bNoLoopingInterpolation)
 		PROP_ARRAY(RawAnimData, "FRawAnimSequenceTrack")
+		PROP_ARRAY(Notifies, "FAnimNotifyEvent3")
 		PROP_ENUM2(TranslationCompressionFormat, AnimationCompressionFormat)
 		PROP_ENUM2(RotationCompressionFormat, AnimationCompressionFormat)
 		PROP_ENUM2(KeyEncodingFormat, AnimationKeyFormat)
 		PROP_ARRAY(CompressedTrackOffsets, PropType::Int)
+		PROP_BYTE(AnimationCompressor)
 		PROP_BOOL(bIsAdditive)
 		PROP_NAME(AdditiveRefName)
+#if R6VEGAS
+		PROP_BOOL(m_bForce15FPS)
+		PROP_BOOL(m_bDuplicateKeyRemoval)
+		PROP_BOOL(m_bCompressedQuat)
+		PROP_BOOL(m_bCompressKeytimes)
+		PROP_BOOL(m_bIgnoreLastFrame)
+		PROP_BOOL(m_bIsAdditive)
+		PROP_FLOAT(m_fDuplicateTresholdMultiplier)
+		PROP_INT(m_iOriginalNbFrames)
+#endif
 #if TUROK
 		PROP_ARRAY(KeyFrameData, "FBulkKeyframeDataEntry")
 #endif
@@ -583,7 +657,7 @@ public:
 		PROP_ARRAY(TrackOffsets, PropType::Int)
 #endif
 		// unsupported
-		PROP_DROP(Notifies)
+		PROP_DROP(AO2CompressionInfo)
 		PROP_DROP(CompressionScheme)
 		PROP_DROP(bDoNotOverrideCompression)
 		PROP_DROP(CompressCommandletVersion)
@@ -652,6 +726,16 @@ public:
 	END_PROP_TABLE
 
 	virtual void Serialize(FArchive &Ar);
+	void SerializeAO2CompressionInfo(FArchive &Ar, int DataSize);
+#if ARMYOF2
+	bool DecodeAO2Anims(CAnimSequence *Dst, UAnimSet *Owner) const;
+#endif
+#if R6VEGAS
+	bool DecodeR6V2Anims(CAnimSequence *Dst, UAnimSet *Owner) const;
+#endif
+#if FIRSTASSAULT
+	bool DecodeSWFAAnims(CAnimSequence *Dst, UAnimSet *Owner) const;
+#endif
 
 #if BATMAN
 	void DecodeBatman2Anims(CAnimSequence *Dst, UAnimSet *Owner) const;
@@ -732,6 +816,12 @@ public:
 	}
 
 	virtual void GetMetadata(FArchive& Ar) const;
+};
+
+class UAO2AnimSetCharacter : public UAnimSet
+{
+	DECLARE_CLASS(UAO2AnimSetCharacter, UAnimSet);
+public:
 };
 
 
@@ -822,6 +912,31 @@ protected:
 	void ConvertMesh();
 };
 
+class UStaticMeshComponent3 : public UObject
+{
+	DECLARE_CLASS(UStaticMeshComponent3, UObject);
+public:
+	UStaticMesh3					*StaticMesh;
+	TArray<UMaterialInterface*>		Materials;
+	TArray<UMaterialInterface*>		OverrideMaterials;
+	TArray<UMaterialInterface*>		MaterialOverrides;
+	TArray<UMaterialInterface*>		ReplacementMaterials;
+
+	UStaticMeshComponent3()
+	:	StaticMesh(NULL)
+	{}
+
+	BEGIN_PROP_TABLE
+		PROP_OBJ(StaticMesh)
+		PROP_ARRAY(Materials, PropType::UObject)
+		PROP_ARRAY(OverrideMaterials, PropType::UObject)
+		PROP_ARRAY(MaterialOverrides, PropType::UObject)
+		PROP_ARRAY(ReplacementMaterials, PropType::UObject)
+	END_PROP_TABLE
+
+	virtual void Serialize(FArchive& Ar);
+};
+
 
 #define REGISTER_MESH_CLASSES_TUROK \
 	REGISTER_CLASS(FBulkKeyframeDataEntry) \
@@ -845,10 +960,18 @@ protected:
 	REGISTER_CLASS(UMorphTarget) \
 	REGISTER_CLASS(UMorphTargetSet) \
 	REGISTER_CLASS(FRawAnimSequenceTrack) \
+	REGISTER_CLASS(FAnimNotifyEvent3) \
 	REGISTER_CLASS(UAnimSequence)	\
 	REGISTER_CLASS(UAnimSet)		\
+	REGISTER_CLASS_ALIAS(UAO2AnimSetCharacter, UAO2AnimSetCharacter) \
 	REGISTER_CLASS_ALIAS(UAnimSet, UTdAnimSet) \
 	REGISTER_CLASS_ALIAS(USkeletalMesh3, USkeletalMesh) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, UStaticMeshComponent) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, StaticMeshComponent) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, UInstancedStaticMeshComponent) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, InstancedStaticMeshComponent) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, UFracturedStaticMeshComponent) \
+	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, FracturedStaticMeshComponent) \
 	REGISTER_CLASS_ALIAS(UStaticMesh3, UStaticMesh) \
 	REGISTER_CLASS_ALIAS(UStaticMesh3, UFracturedStaticMesh)
 

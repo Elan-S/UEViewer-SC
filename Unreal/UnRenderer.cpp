@@ -2,6 +2,7 @@
 
 #include "UnCore.h"
 #include "UnObject.h"
+#include "UnrealPackage/UnPackage.h"
 #include "UnrealMaterial/UnMaterial.h"
 
 #include "UnrealMaterial/UnMaterial2.h"
@@ -1573,6 +1574,12 @@ void UShader::GetParams(CMaterialParams &Params) const
 		Params.Opacity          = Params2.Diffuse;
 		Params.OpacityFromAlpha = true;
 	}
+	if (!Params.Diffuse && SelfIllumination)
+	{
+		CMaterialParams Params2;
+		SelfIllumination->GetParams(Params2);
+		Params.Diffuse = Params2.Diffuse;
+	}
 
 	unguardf("%s", Name);
 }
@@ -1726,10 +1733,169 @@ void UUnreal3Material::SetupGL()
 	unguard;
 }
 
+#if SPLINTER_CELL
+
+static bool IsSCDAOnlinePackage(const UnPackage* Package)
+{
+	return Package && Package->Game == GAME_SplinterCell && Package->ArVer >= 173 && Package->ArLicenseeVer == 0;
+}
+
+static void SCDA_NormalizeMaterialToken(const char* Src, char* Dst, int DstSize)
+{
+	char Temp[256];
+	appStrncpylwr(Temp, Src, ARRAY_COUNT(Temp));
+
+	static const char* Suffixes[] =
+	{
+		"_basic_mod", "_transpbasic_mod", "_emissive_mod", "_transpemissive_mod",
+		"_evolved_mod", "_basic", "_material", "_mat", "_mod", "_mm", "_emm"
+	};
+	for (int i = 0; i < ARRAY_COUNT(Suffixes); i++)
+	{
+		int Len = strlen(Temp);
+		int SufLen = strlen(Suffixes[i]);
+		if (Len > SufLen && !strcmp(Temp + Len - SufLen, Suffixes[i]))
+		{
+			Temp[Len - SufLen] = 0;
+			break;
+		}
+	}
+
+	char* Out = Dst;
+	char* OutEnd = Dst + DstSize - 1;
+	for (const char* S = Temp; *S && Out < OutEnd; S++)
+	{
+		char C = *S;
+		if (C == '_' || C == '-' || C == ' ' || C == '\t')
+			continue;
+		if (C == 's')
+			continue;	// tolerate singular/plural artist naming mismatches
+		*Out++ = C;
+	}
+	*Out = 0;
+}
+
+enum ESCDAOnlineTextureRole
+{
+	SCDA_TEX_Diffuse,
+	SCDA_TEX_Normal,
+	SCDA_TEX_Specular
+};
+
+static bool SCDA_TextureNameMatchesRole(const char* Name, ESCDAOnlineTextureRole Role)
+{
+	char Lower[256];
+	appStrncpylwr(Lower, Name, ARRAY_COUNT(Lower));
+	int Len = strlen(Lower);
+
+#define HAS_SUFFIX(s) (Len > (int)strlen(s) && !strcmp(Lower + Len - strlen(s), s))
+	switch (Role)
+	{
+	case SCDA_TEX_Diffuse:
+		return HAS_SUFFIX("_d") || HAS_SUFFIX("_ds") || HAS_SUFFIX("_diff") || HAS_SUFFIX("_diffuse");
+	case SCDA_TEX_Normal:
+		return HAS_SUFFIX("_n") || HAS_SUFFIX("_nm") || HAS_SUFFIX("_normal");
+	case SCDA_TEX_Specular:
+		return HAS_SUFFIX("_s") || HAS_SUFFIX("_sp") || HAS_SUFFIX("_spec") || HAS_SUFFIX("_specular") || HAS_SUFFIX("_m");
+	default:
+		return false;
+	}
+#undef HAS_SUFFIX
+}
+
+static void SCDA_NormalizeTextureToken(const char* Src, char* Dst, int DstSize)
+{
+	char Temp[256];
+	appStrncpylwr(Temp, Src, ARRAY_COUNT(Temp));
+
+	static const char* Suffixes[] =
+	{
+		"_diffuse", "_normal", "_specular", "_diff", "_spec", "_ds", "_nm", "_sp", "_d", "_n", "_s", "_m"
+	};
+	for (int i = 0; i < ARRAY_COUNT(Suffixes); i++)
+	{
+		int Len = strlen(Temp);
+		int SufLen = strlen(Suffixes[i]);
+		if (Len > SufLen && !strcmp(Temp + Len - SufLen, Suffixes[i]))
+		{
+			Temp[Len - SufLen] = 0;
+			break;
+		}
+	}
+
+	SCDA_NormalizeMaterialToken(Temp, Dst, DstSize);
+}
+
+static int SCDA_CommonPrefixLen(const char* A, const char* B)
+{
+	int Count = 0;
+	while (*A && *B && *A++ == *B++)
+		Count++;
+	return Count;
+}
+
+static UTexture* SCDA_FindSiblingTexture(const UUnreal3Material* Mat, ESCDAOnlineTextureRole Role)
+{
+	if (!IsSCDAOnlinePackage(Mat->Package))
+		return NULL;
+
+	char MatKey[256];
+	SCDA_NormalizeMaterialToken(Mat->Name, ARRAY_ARG(MatKey));
+	if (strlen(MatKey) < 5)
+		return NULL;
+
+	int BestIndex = INDEX_NONE;
+	int BestScore = 0;
+	for (int i = 0; i < Mat->Package->Summary.ExportCount; i++)
+	{
+		const FObjectExport& Exp = Mat->Package->GetExport(i);
+		const char* ClassName = Mat->Package->GetClassNameFor(Exp);
+		if (stricmp(ClassName, "Texture"))
+			continue;
+		if (!SCDA_TextureNameMatchesRole(Exp.ObjectName, Role))
+			continue;
+
+		char TexKey[256];
+		SCDA_NormalizeTextureToken(Exp.ObjectName, ARRAY_ARG(TexKey));
+		if (strlen(TexKey) < 5)
+			continue;
+
+		int Prefix = SCDA_CommonPrefixLen(MatKey, TexKey);
+		bool Contains = (appStristr(MatKey, TexKey) || appStristr(TexKey, MatKey));
+		int Score = Prefix * 4 + (Contains ? 100 : 0);
+		if (Score > BestScore)
+		{
+			BestScore = Score;
+			BestIndex = i;
+		}
+	}
+
+	if (BestIndex == INDEX_NONE || BestScore < 24)
+		return NULL;
+
+	UObject* Obj = Mat->Package->CreateExport(BestIndex);
+	if (Obj && Obj->IsA("Texture"))
+		return static_cast<UTexture*>(Obj);
+	return NULL;
+}
+
+#endif // SPLINTER_CELL
+
 
 void UUnreal3Material::GetParams(CMaterialParams &Params) const
 {
 	guard(UUnreal3Material::GetParams);
+
+	// Splinter Cell: Double Agent's ModernMaterial classes use named
+	// TwoDInputTexture wrappers instead of the older numbered texture slots.
+	if (Texture.TwoDTexture || _MainMap.TwoDTexture || Mask.TwoDTexture)
+	{
+		Params.Diffuse = Texture.TwoDTexture;
+		Params.Normal  = _MainMap.TwoDTexture;
+		Params.Mask    = Mask.TwoDTexture;
+		Params.SpecularMaskChannel = TC_R;
+		return;
+	}
 
 	for (int i = 0; i < ARRAY_COUNT(Textures); i++)
 	{
@@ -1747,6 +1913,16 @@ void UUnreal3Material::GetParams(CMaterialParams &Params) const
 //			appPrintf("Tex: %s\n", Name);
 	}
 	Params.SpecularMaskChannel = TC_G;
+
+#if SPLINTER_CELL
+	if (IsSCDAOnlinePackage(Package) && !Params.Diffuse)
+	{
+		Params.Diffuse = SCDA_FindSiblingTexture(this, SCDA_TEX_Diffuse);
+		Params.Normal  = SCDA_FindSiblingTexture(this, SCDA_TEX_Normal);
+		Params.Mask    = SCDA_FindSiblingTexture(this, SCDA_TEX_Specular);
+		Params.SpecularMaskChannel = TC_G;
+	}
+#endif
 
 	unguard;
 }
@@ -2462,6 +2638,35 @@ void UMaterialInstanceConstant::GetParams(CMaterialParams &Params) const
 		OPACITY (strstr(Name, "alpha"), 100);
 //??		OPACITY (strstr(Name, "mask"), 100);
 //??		Params.OpacityFromAlpha = true;
+#if R6VEGAS
+		if (ArGame == GAME_R6Vegas2)
+		{
+			char TexName[256];
+			appStrncpylwr(TexName, Tex->Name, ARRAY_COUNT(TexName));
+			int TexNameLen = strlen(TexName);
+
+			DIFFUSE (!strcmp(Name, "d"), 120);
+			NORMAL  (!strcmp(Name, "n"), 120);
+			SPECULAR(!strcmp(Name, "s"), 120);
+			EMISSIVE(!strcmp(Name, "e"), 120);
+			OPACITY (!strcmp(Name, "o") || !strcmp(Name, "om") || !strcmp(Name, "ob"), 120);
+
+			// Some R6V2 instances have terse or missing parameter names. The texture
+			// object names still carry the channel role used by the game packages.
+			if (TexNameLen >= 2)
+			{
+				DIFFUSE (!strcmp(TexName + TexNameLen - 2, "_d"), 80);
+				NORMAL  (!strcmp(TexName + TexNameLen - 2, "_n"), 80);
+				SPECULAR(!strcmp(TexName + TexNameLen - 2, "_s"), 80);
+				EMISSIVE(!strcmp(TexName + TexNameLen - 2, "_e"), 80);
+				OPACITY (!strcmp(TexName + TexNameLen - 2, "_o"), 80);
+			}
+			if (TexNameLen >= 3)
+			{
+				OPACITY (!strcmp(TexName + TexNameLen - 3, "_om") || !strcmp(TexName + TexNameLen - 3, "_ob"), 80);
+			}
+		}
+#endif // R6VEGAS
 #if TRON
 		if (ArGame == GAME_Tron)
 		{

@@ -277,6 +277,9 @@ const GameInfo GListOfGames[] = {
 #	if DISHONORED
 		G("Dishonored", dis, GAME_Dishonored),
 #	endif
+#	if FIRSTASSAULT
+		G("Star Wars: First Assault", swfa, GAME_FirstAssault),
+#	endif
 #	if FABLE
 		G("Fable: The Journey", fable, GAME_Fable),
 		G("Fable Anniversary",  fable, GAME_Fable),
@@ -644,8 +647,15 @@ void FArchive::DetectGame()
 	if ((ArVer >= 131 && ArVer <= 134) && ArLicenseeVer == 29)
 		SET(GAME_Loco);
 #endif
+#if LEAD
+	if (ArVer == 100 && (ArLicenseeVer == 89 || ArLicenseeVer == 90))
+		SET(GAME_SplinterCellConv);
+#endif
 #if SPLINTER_CELL
 	if ( (ArVer == 100 && (ArLicenseeVer >= 9 && ArLicenseeVer <= 17)) ||		// Splinter Cell 1
+		 (ArVer == 100 && (ArLicenseeVer >= 22 && ArLicenseeVer <= 77)) ||		// Splinter Cell 3 texture packages
+		 (ArVer == 100 && (ArLicenseeVer >= 83 && ArLicenseeVer <= 127 && ArLicenseeVer != 89 && ArLicenseeVer != 90)) ||	// Splinter Cell 3/4
+		 ((ArVer >= 248 && ArVer <= 483) && (ArLicenseeVer >= 74 && ArLicenseeVer <= 120)) || // Splinter Cell 3 texture packages
 		 (ArVer == 102 && (ArLicenseeVer >= 29 && ArLicenseeVer <= 28)) )		// Splinter Cell 2
 		SET(GAME_SplinterCell);
 #endif
@@ -701,7 +711,7 @@ void FArchive::DetectGame()
 	if (ArVer == 446 && ArLicenseeVer == 25)	SET(GAME_MagnaCarta);
 #endif
 #if AVA
-	if (ArVer == 451 && (ArLicenseeVer >= 52 || ArLicenseeVer <= 53)) SET(GAME_AVA);
+	if (ArVer == 451 && (ArLicenseeVer >= 52 && ArLicenseeVer <= 53)) SET(GAME_AVA);
 #endif
 #if DOH
 	if (ArVer == 455 && ArLicenseeVer == 90)	SET(GAME_DOH);
@@ -783,6 +793,9 @@ void FArchive::DetectGame()
 #endif
 #if DISHONORED
 	if (ArVer == 801 && ArLicenseeVer == 30)	SET(GAME_Dishonored);
+#endif
+#if FIRSTASSAULT
+	if (ArVer == 852 && ArLicenseeVer == 8)	SET(GAME_FirstAssault);
 #endif
 #if TRIBES4
 	if (ArVer == 805 && ArLicenseeVer == 2)		SET(GAME_Tribes4);

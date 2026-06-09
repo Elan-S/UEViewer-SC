@@ -31,23 +31,89 @@ static CVec3 GetMaterialDebugColor(int Index)
 	return r;
 }
 
-static void ExportMaterial(UUnrealMaterial* Mat, FArchive& Ar, int index, bool bLast)
+static const char* GetGLTFTextureExtension()
+{
+	if (GExportPNG) return "png";
+	if (GExportDDS) return "dds";
+	return "tga";
+}
+
+static void AppendGLTFPath(char* Out, int OutSize, const char* Text)
+{
+	int Len = strlen(Out);
+	if (Len >= OutSize - 1) return;
+	appStrncpyz(Out + Len, Text, OutSize - Len);
+}
+
+static void MakeGLTFRelativePath(const char* FromDir, const char* ToFile, char* Out, int OutSize)
+{
+	char from[1024];
+	char to[1024];
+	appStrncpyz(from, FromDir, ARRAY_COUNT(from));
+	appStrncpyz(to, ToFile, ARRAY_COUNT(to));
+	for (char* s = from; *s; s++) if (*s == '\\') *s = '/';
+	for (char* s = to; *s; s++) if (*s == '\\') *s = '/';
+
+	int common = 0;
+	while (from[common] && to[common] && tolower(from[common]) == tolower(to[common]))
+		common++;
+	while (common > 0 && from[common - 1] != '/')
+		common--;
+
+	Out[0] = 0;
+	const char* FromRest = from + common;
+	if (*FromRest)
+		AppendGLTFPath(Out, OutSize, "../");
+	for (const char* s = FromRest; *s; s++)
+	{
+		if (*s == '/')
+			AppendGLTFPath(Out, OutSize, "../");
+	}
+	AppendGLTFPath(Out, OutSize, to + common);
+}
+
+static void ExportMaterial(UUnrealMaterial* Mat, const UObject* OriginalMesh, TArray<UUnrealMaterial*>& MaterialTextures, FArchive& Ar, int index, bool bLast)
 {
 	char dummyName[64];
 	appSprintf(ARRAY_ARG(dummyName), "dummy_material_%d", index);
+
+	int DiffuseTextureIndex = -1;
+#if RENDERING
+	if (Mat)
+	{
+		CMaterialParams Params;
+		Mat->GetParams(Params);
+		if (Params.Diffuse && Params.Diffuse->IsTexture())
+		{
+			DiffuseTextureIndex = MaterialTextures.AddUnique(Params.Diffuse);
+			ExportTexture(Params.Diffuse);
+		}
+	}
+#endif
 
 	CVec3 Color = GetMaterialDebugColor(index);
 	Ar.Printf(
 		"    {\n"
 		"      \"name\" : \"%s\",\n"
-		"      \"pbrMetallicRoughness\" : {\n"
+		"      \"pbrMetallicRoughness\" : {\n",
+		Mat ? Mat->Name : dummyName
+	);
+	if (DiffuseTextureIndex >= 0)
+	{
+		Ar.Printf(
+			"        \"baseColorTexture\" : { \"index\" : %d },\n",
+			DiffuseTextureIndex
+		);
+	}
+	Ar.Printf(
 		"        \"baseColorFactor\" : [ %g, %g, %g, 1.0 ],\n"
 		"        \"metallicFactor\" : 0.1,\n"
 		"        \"roughnessFactor\" : 0.5\n"
 		"      }\n"
 		"    }%s\n",
-		Mat ? Mat->Name : dummyName,
-		Color[0], Color[1], Color[2],
+		DiffuseTextureIndex >= 0 ? 1.0f : Color[0],
+		DiffuseTextureIndex >= 0 ? 1.0f : Color[1],
+		DiffuseTextureIndex >= 0 ? 1.0f : Color[2],
 		bLast ? "" : ","
 	);
 }
@@ -160,8 +226,10 @@ struct GLTFExportContext
 	const char* MeshName;
 	const CSkeletalMesh* SkelMesh;
 	const CStaticMesh* StatMesh;
+	const UObject* OriginalMesh;
 
 	TArray<BufferData> Data;
+	TArray<UUnrealMaterial*> MaterialTextures;
 
 	GLTFExportContext()
 	{
@@ -863,9 +931,41 @@ static void ExportMeshLod(GLTFExportContext& Context, const CBaseMeshLod& Lod, c
 	Ar.Printf("  \"materials\" : [\n");
 	for (int i = 0; i < Lod.Sections.Num(); i++)
 	{
-		ExportMaterial(Lod.Sections[i].Material, Ar, i, i == Lod.Sections.Num() - 1);
+		ExportMaterial(Lod.Sections[i].Material, Context.OriginalMesh, Context.MaterialTextures, Ar, i, i == Lod.Sections.Num() - 1);
 	}
 	Ar.Printf("  ],\n");
+
+	if (Context.MaterialTextures.Num())
+	{
+		Ar.Printf("  \"textures\" : [\n");
+		for (int i = 0; i < Context.MaterialTextures.Num(); i++)
+		{
+			Ar.Printf(
+				"    { \"source\" : %d }%s\n",
+				i,
+				i == Context.MaterialTextures.Num() - 1 ? "" : ","
+			);
+		}
+		Ar.Printf("  ],\n");
+
+		Ar.Printf("  \"images\" : [\n");
+		for (int i = 0; i < Context.MaterialTextures.Num(); i++)
+		{
+			UUnrealMaterial* Tex = Context.MaterialTextures[i];
+			char TextureFile[1024];
+			appStrncpyz(TextureFile, GetExportFileName(Tex, "%s.%s", Tex->Name, GetGLTFTextureExtension()), ARRAY_COUNT(TextureFile));
+			char MeshPath[1024];
+			appStrncpyz(MeshPath, GetExportPath(Context.OriginalMesh), ARRAY_COUNT(MeshPath));
+			char TextureUri[1024];
+			MakeGLTFRelativePath(MeshPath, TextureFile, TextureUri, ARRAY_COUNT(TextureUri));
+			Ar.Printf(
+				"    { \"uri\" : \"%s\" }%s\n",
+				TextureUri,
+				i == Context.MaterialTextures.Num() - 1 ? "" : ","
+			);
+		}
+		Ar.Printf("  ],\n");
+	}
 
 	// Meshes
 	Ar.Printf(
@@ -1018,6 +1118,7 @@ void ExportSkeletalMeshGLTF(const CSkeletalMesh* Mesh)
 			GLTFExportContext Context;
 			Context.MeshName = meshName;
 			Context.SkelMesh = Mesh;
+			Context.OriginalMesh = OriginalMesh;
 
 			FArchive* Ar2 = CreateExportArchive(OriginalMesh, EFileArchiveOptions::Default, "%s.bin", meshName);
 			assert(Ar2);
@@ -1059,6 +1160,7 @@ void ExportStaticMeshGLTF(const CStaticMesh* Mesh)
 			GLTFExportContext Context;
 			Context.MeshName = meshName;
 			Context.StatMesh = Mesh;
+			Context.OriginalMesh = OriginalMesh;
 
 			FArchive* Ar2 = CreateExportArchive(OriginalMesh, EFileArchiveOptions::Default, "%s.bin", meshName);
 			assert(Ar2);

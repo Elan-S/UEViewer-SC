@@ -296,6 +296,7 @@ enum ETextureFormat
 	TEXF_CxV8U8,
 	TEXF_DXT5N,			// Note: in Bioshock this value has name 3DC, but really DXT5N is used
 	TEXF_3DC,			// BC5 compression
+	TEXF_SC4_DXT5N,		// Splinter Cell: Double Agent normal maps
 };
 
 _ENUM(ETextureFormat)
@@ -316,6 +317,7 @@ _ENUM(ETextureFormat)
 	_E(TEXF_CxV8U8),
 	_E(TEXF_DXT5N),
 	_E(TEXF_3DC),
+	_E(TEXF_SC4_DXT5N),
 };
 
 enum ETexClampMode
@@ -387,6 +389,19 @@ public:
 			Ar << unk;
 		}
 #endif // UNDYING
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 171 && Ar.ArLicenseeVer == 0)
+		{
+			int unk;
+			Ar << unk;
+		}
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0 &&
+			Ar.GetStopper() - Ar.Tell() == sizeof(int))
+		{
+			int unk;
+			Ar << unk;
+		}
+#endif // SPLINTER_CELL
 		unguard;
 	}
 };
@@ -421,7 +436,19 @@ struct FMipmap
 			Ar << SkipArray;
 		}
 #endif // TRIBES3
-		Ar << M.DataArray << M.USize << M.VSize << M.UBits << M.VBits;
+		Ar << M.DataArray;
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123)
+		{
+			uint16 USize, VSize;
+			byte Unknown;
+			Ar << USize << VSize << Unknown << M.UBits << M.VBits;
+			M.USize = USize;
+			M.VSize = VSize;
+			return Ar;
+		}
+#endif // SPLINTER_CELL
+		Ar << M.USize << M.VSize << M.UBits << M.VBits;
 		return Ar;
 	}
 };
@@ -959,6 +986,17 @@ public:
 		PROP_ENUM2(TexCoordCount, ETexCoordCount)
 		PROP_BOOL(TexCoordProjected)
 	END_PROP_TABLE
+
+	virtual void Serialize(FArchive &Ar)
+	{
+		guard(UTexModifier::Serialize);
+		Super::Serialize(Ar);
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArLicenseeVer == 0)
+			DROP_REMAINING_DATA(Ar);
+#endif
+		unguard;
+	}
 };
 
 
@@ -1258,6 +1296,18 @@ enum U3BlendingMode
 	U3BM_MASKED
 };
 
+struct FTwoDInputTexture
+{
+	DECLARE_STRUCT(FTwoDInputTexture);
+	UTexture		*TwoDTexture;
+	byte			CoordinatesIndex;
+
+	BEGIN_PROP_TABLE
+		PROP_OBJ(TwoDTexture)
+		PROP_BYTE(CoordinatesIndex)
+	END_PROP_TABLE
+};
+
 class UUnreal3Material : public URenderedMaterial
 {
 	DECLARE_CLASS(UUnreal3Material, URenderedMaterial);
@@ -1277,12 +1327,28 @@ public:
 	bool			bDoubleSided;
 	bool			bHasEmissive;
 	bool			bForceNoZWrite;
+	FTwoDInputTexture _MainMap;
+	float			_MainMap_Softness;
+	FTwoDInputTexture Mask;
+	float			BrightnessCoeff;
+	float			PowerCoeff;
+	FTwoDInputTexture Texture;
+	FTwoDInputTexture Texture2Input;
+
+	virtual void Serialize(FArchive &Ar);
 
 	BEGIN_PROP_TABLE
 		PROP_ENUM2(BlendingMode, U3BlendingMode)
 		PROP_BOOL(bDoubleSided)
 		PROP_BOOL(bHasEmissive)
 		PROP_BOOL(bForceNoZWrite)
+		PROP_STRUC(_MainMap, FTwoDInputTexture)
+		PROP_FLOAT(_MainMap_Softness)
+		PROP_STRUC(Mask, FTwoDInputTexture)
+		PROP_FLOAT(BrightnessCoeff)
+		PROP_FLOAT(PowerCoeff)
+		PROP_STRUC(Texture, FTwoDInputTexture)
+		{ "Texture2", "FTwoDInputTexture", FIELD2OFS(ThisClass, Texture2Input), 1 },
 		PROP_OBJ(Texture0) PROP_OBJ(Texture1) PROP_OBJ(Texture2) PROP_OBJ(Texture3)
 		PROP_OBJ(Texture4) PROP_OBJ(Texture5) PROP_OBJ(Texture6) PROP_OBJ(Texture7)
 		PROP_OBJ(Texture8) PROP_OBJ(Texture9) PROP_OBJ(Texture10) PROP_OBJ(Texture11)
@@ -1317,6 +1383,8 @@ public:
 	UTexture		*HDRMask;
 	SpecSrc			SpecularSource;
 
+	virtual void Serialize(FArchive &Ar);
+
 	BEGIN_PROP_TABLE
 		PROP_OBJ(Base)
 		PROP_OBJ(Normal)
@@ -1344,6 +1412,7 @@ public:
 	REGISTER_CLASS(UShader)				\
 	REGISTER_CLASS(UCombiner)			\
 	REGISTER_CLASS(UTexture)			\
+	REGISTER_CLASS_ALIAS(UTexture, LeadTexture) \
 	REGISTER_CLASS(UCubemap)			\
 	REGISTER_CLASS(UFinalBlend)			\
 	REGISTER_CLASS(UTexEnvMap)			\
@@ -1357,7 +1426,18 @@ public:
 	REGISTER_CLASS(UFacingShader)
 
 #define REGISTER_MATERIAL_CLASSES_SCELL	\
+	REGISTER_CLASS(FTwoDInputTexture)	\
 	REGISTER_CLASS(UUnreal3Material)	\
+	REGISTER_CLASS_ALIAS(UUnreal3Material, UBasicModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, UTranspBasicModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, UEmissiveModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, UTranspEmissiveModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, UEvolvedModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, BasicModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, TranspBasicModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, EmissiveModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, TranspEmissiveModernMaterial) \
+	REGISTER_CLASS_ALIAS(UUnreal3Material, EvolvedModernMaterial) \
 	REGISTER_CLASS(USCX_basic_material)
 
 #define REGISTER_MATERIAL_ENUMS			\

@@ -250,6 +250,7 @@ public:
 	const char**			NameTable;
 	FObjectImport*			ImportTable;
 	FObjectExport*			ExportTable;
+	bool					PairFNameIndex;			// Pandora Tomorrow online package tables store FName as index + extra compact value
 #if UNREAL4
 	struct FPackageObjectIndex* ExportIndices_IOS;
 #endif
@@ -424,6 +425,10 @@ public:
 	virtual int GetFileSize() const
 	{
 		return Loader->GetFileSize();
+	}
+	virtual bool IsRangeAvailable(int Pos, int Size)
+	{
+		return Loader->IsRangeAvailable(Pos, Size);
 	}
 	virtual bool IsOpen() const
 	{

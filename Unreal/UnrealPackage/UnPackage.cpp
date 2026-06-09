@@ -146,6 +146,22 @@ tag_ok:
 	// store file version to archive (required for some structures, for UNREAL3 path)
 	Ar.ArVer         = FileVersion;
 	Ar.ArLicenseeVer = LicenseeVersion;
+
+#if SPLINTER_CELL
+	// Double Agent online packages use UE2-style package summaries and paired FNames,
+	// but their version numbers overlap early UE3. Identify the hybrid summary before
+	// game detection decides which package serializer to use.
+	if (LicenseeVersion == 0 && FileVersion >= 173 && FileVersion <= 275)
+	{
+		int HeaderPos = Ar.Tell();
+		int32 MaybePackageFlags, MaybeNameCount, MaybeNameOffset;
+		Ar << MaybePackageFlags << MaybeNameCount << MaybeNameOffset;
+		Ar.Seek(HeaderPos);
+		if (MaybeNameOffset == 0x40 && MaybeNameCount > 0 && MaybeNameCount < 0x1000000)
+			Ar.Game = GAME_SplinterCell;
+	}
+#endif
+
 	// detect game
 	Ar.DetectGame();
 	Ar.OverrideVersion();
@@ -227,7 +243,6 @@ void FObjectImport::Serialize(FArchive& Ar)
 		return;
 	}
 #endif
-
 	// this code is the same for all engine versions
 	Ar << ClassPackage << ClassName << PackageIndex << ObjectName;
 
@@ -258,6 +273,7 @@ void FObjectImport::Serialize(FArchive& Ar)
 
 UnPackage::UnPackage(const char *filename, const CGameFileInfo* fileInfo, bool silent)
 :	Loader(NULL)
+,	PairFNameIndex(false)
 #if UNREAL4
 ,	ExportIndices_IOS(NULL)
 #endif
@@ -324,6 +340,17 @@ UnPackage::UnPackage(const char *filename, const CGameFileInfo* fileInfo, bool s
 		CloseReader();
 		return;
 	}
+
+#if SPLINTER_CELL
+	if (Game == GAME_SplinterCell && ArLicenseeVer == 0 &&
+		(ArVer == 164 || (ArVer >= 171 && ArVer <= 275)))
+	{
+		// Splinter Cell: Pandora Tomorrow and Double Agent online packages keep the generic UE2 summary,
+		// but serialize FName references as compact NameIndex + compact extra value.
+		PairFNameIndex = true;
+		Game = GAME_SplinterCell;
+	}
+#endif
 
 #if PROFILE_PACKAGE_TABLES
 	appResetProfiler();
@@ -742,6 +769,16 @@ FArchive& UnPackage::operator<<(FName &N)
 	}
 #endif // BIOSHOCK
 
+	if (PairFNameIndex)
+	{
+		int ExtraIndex;
+		*this << AR_INDEX(N_Index) << AR_INDEX(ExtraIndex);
+		// Ubisoft's paired-FName packages use zero/zero as the serialized
+		// property terminator even when name table entry 0 is not "None".
+		N.Str = (N_Index == 0 && ExtraIndex == 0) ? "None" : GetName(N_Index);
+		return *this;
+	}
+
 #if UC2
 	if (Engine() == GAME_UE2X && ArVer >= 145)
 	{
@@ -753,6 +790,8 @@ FArchive& UnPackage::operator<<(FName &N)
 	if (Game == GAME_SplinterCellConv && ArVer >= 64)
 	{
 		*this << N_Index;
+		N_ExtraIndex = N_Index >> 16;
+		N_Index &= 0xFFFF;
 	}
 	else
 #endif // LEAD
@@ -823,13 +862,21 @@ FArchive& UnPackage::operator<<(UObject *&Obj)
 	{
 //		const FObjectImport &Imp = GetImport(-index-1);
 //		appPrintf("PKG: Import[%s,%d] OBJ=%s CLS=%s\n", GetObjectName(Imp.PackageIndex), index, *Imp.ObjectName, *Imp.ClassName);
-		Obj = CreateImport(-index-1);
+		int importIndex = -index - 1;
+		if (PairFNameIndex && unsigned(importIndex) >= Summary.ImportCount)
+			Obj = NULL;
+		else
+			Obj = CreateImport(importIndex);
 	}
 	else if (index > 0)
 	{
 //		const FObjectExport &Exp = GetExport(index-1);
 //		appPrintf("PKG: Export[%d] OBJ=%s CLS=%s\n", index, *Exp.ObjectName, GetClassNameFor(Exp));
-		Obj = CreateExport(index-1);
+		int exportIndex = index - 1;
+		if (PairFNameIndex && unsigned(exportIndex) >= Summary.ExportCount)
+			Obj = NULL;
+		else
+			Obj = CreateExport(exportIndex);
 	}
 	else // index == 0
 	{

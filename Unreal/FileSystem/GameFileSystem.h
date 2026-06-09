@@ -31,6 +31,11 @@ public:
 	virtual bool AttachReader(FArchive* reader, FString& error) = 0;
 	// Open a file from VFS.
 	virtual FArchive* CreateReader(int index) = 0;
+	// Optional sidecar/stream payload for a file inside VFS.
+	virtual bool LoadStreamBytes(int index, int offset, int size, byte* data)
+	{
+		return false;
+	}
 
 	// Reserve space for 'count' files
 	void Reserve(int count);

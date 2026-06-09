@@ -5,6 +5,9 @@
 #include "UnArchiveObb.h"
 #include "UnArchivePak.h"
 #include "IOStoreFileSystem.h"
+#if SPLINTER_CELL || LEAD
+#include "GameSpecific/UnUbisoft.h"
+#endif
 
 #include "Parallel.h"
 
@@ -54,7 +57,7 @@ static const char *PackageExtensions[] =
 	"uea", "uem",
 #endif
 #if LEAD
-	"ass", "umd",
+	"umd",
 #endif
 #if MASSEFF
 	"sfm",			// Mass Effect
@@ -104,6 +107,9 @@ static const char *KnownExtensions[] =
 #	endif
 #	if TRIBES4
 	"rtc",
+#	endif
+#	if SPLINTER_CELL
+	"lin",			// Splinter Cell Xbox seekless level stream
 #	endif
 #	if UNREAL4
 	"ubulk",		// separately stored UE4 bulk data
@@ -361,9 +367,15 @@ static void RegisterGameFile(const char* FullName, int64 FileSize = -1)
 
 	ext++;
 
+#if LEAD
+	if (!stricmp(ext, "ass"))
+		return;
+#endif
+
 	// Find if this file in an archive with VFS inside
 	FVirtualFileSystem* vfs = NULL;
 	FArchive* reader = NULL;
+	bool quietVfsFailure = false;
 
 #if SUPPORT_ANDROID
 	if (!stricmp(ext, "obb"))
@@ -391,6 +403,35 @@ static void RegisterGameFile(const char* FullName, int64 FileSize = -1)
 		// Processed with .pak file, so ignore these files
 	}
 #endif // UNREAL4
+#if LEAD
+	if (!stricmp(ext, "umd"))
+	{
+		reader = new FFileReader(FullName);
+		if (!reader) return;
+		vfs = CreateLeadUmdVFS(FullName);
+		quietVfsFailure = true;
+	}
+#endif
+#if SPLINTER_CELL
+	if (!stricmp(ext, "lin"))
+	{
+		if (getenv("SCDA_LIN_ENABLE_VFS"))
+		{
+			const char* ShortName = strrchr(FullName, '/');
+			const char* ShortName2 = strrchr(FullName, '\\');
+			if (!ShortName || (ShortName2 && ShortName2 > ShortName))
+				ShortName = ShortName2;
+			ShortName = ShortName ? ShortName + 1 : FullName;
+			if (!stricmp(ShortName, "common.lin"))
+			{
+				reader = new FFileReader(FullName);
+				if (!reader) return;
+				vfs = CreateScdaLinVFS(FullName);
+				quietVfsFailure = true;
+			}
+		}
+	}
+#endif
 
 	// Note: VFS pointer is not stored in any global list, and not released at program exit
 	if (vfs)
@@ -406,13 +447,14 @@ static void RegisterGameFile(const char* FullName, int64 FileSize = -1)
 			GIsUE4Pak = false;
 #endif
 			// something goes wrong
-			if (error.Len())
+			if (error.Len() && !quietVfsFailure)
 			{
 				appPrintf("%s\n", *error);
 			}
 			else
 			{
-				appPrintf("File %s has an unknown format\n", FullName);
+				if (!quietVfsFailure)
+					appPrintf("File %s has an unknown format\n", FullName);
 			}
 			delete vfs;
 			delete reader;

@@ -26,7 +26,26 @@ bool LoadWholePackage(UnPackage* Package, IProgressCallback* progress)
 	UObject::BeginLoad();
 	for (int idx = 0; idx < Package->Summary.ExportCount; idx++)
 	{
-		if (!IsKnownClass(Package->GetClassNameFor(Package->GetExport(idx))))
+		const char* ClassName = Package->GetClassNameFor(Package->GetExport(idx));
+		if (Package->Game == GAME_SplinterCell && !strnicmp(ClassName, "AnimNotify", 10))
+			continue;
+		if (Package->Game == GAME_SplinterCell && Package->ArVer >= 173 && Package->ArLicenseeVer == 0)
+		{
+			if (!stricmp(ClassName, "Shader") || !stricmp(ClassName, "Unreal3Material") ||
+				!stricmp(ClassName, "TexPanner") || !stricmp(ClassName, "TexScaler") ||
+				!stricmp(ClassName, "TexRotator") || !stricmp(ClassName, "TexOscillator") ||
+				!stricmp(ClassName, "Combiner") || !stricmp(ClassName, "FinalBlend") ||
+				!stricmp(ClassName, "MaterialSequence") || !stricmp(ClassName, "MaterialSwitch") ||
+				!stricmp(ClassName, "ColorModifier") || !stricmp(ClassName, "OpacityModifier"))
+				continue;
+		}
+		if (Package->Game == GAME_SplinterCell && (Package->ArVer == 171 || Package->ArVer == 172))
+		{
+			if (!stricmp(ClassName, "Shader") || !stricmp(ClassName, "TexPanner") || !stricmp(ClassName, "TexScaler") ||
+				!stricmp(ClassName, "HeatTextureModifier") || !stricmp(ClassName, "EMFTextureModifier"))
+				continue;
+		}
+		if (!IsKnownClass(ClassName))
 			continue;
 		if (progress && !progress->Tick()) return false;
 		Package->CreateExport(idx);

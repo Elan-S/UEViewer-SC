@@ -132,10 +132,178 @@ void UAnimSet::Serialize(FArchive &Ar)
 #define DBG(...)
 #endif
 
+static bool ReadAO2CompressedByteStream(FArchive &Ar, TArray<uint8> &CompressedByteStream)
+{
+	guard(ReadAO2CompressedByteStream);
+
+	const int StartPos = Ar.Tell();
+	const int StopPos  = Ar.GetStopper();
+	if (StopPos <= StartPos)
+		return false;
+
+	for (int Pad = 0; Pad <= 0x400 && StartPos + Pad + 4 <= StopPos; Pad++)
+	{
+		Ar.Seek(StartPos + Pad);
+
+		int Count;
+		Ar << Count;
+		if (Count < 0)
+			continue;
+
+		const int DataStart = Ar.Tell();
+		const int DataEnd   = DataStart + Count;
+		if (DataEnd < DataStart || DataEnd > StopPos)
+			continue;
+
+		CompressedByteStream.Empty(Count);
+		CompressedByteStream.AddUninitialized(Count);
+		if (Count)
+			Ar.Serialize(CompressedByteStream.GetData(), Count);
+
+		if (Pad)
+			appPrintf("ArmyOfTwo AnimSequence: skipped %d byte(s) before CompressedByteStream at %X\n", Pad, StartPos);
+		return true;
+	}
+
+	Ar.Seek(StartPos);
+	const int Remaining = StopPos - StartPos;
+	CompressedByteStream.Empty(Remaining);
+	CompressedByteStream.AddUninitialized(Remaining);
+	if (Remaining)
+		Ar.Serialize(CompressedByteStream.GetData(), Remaining);
+	appPrintf("ArmyOfTwo AnimSequence: using %d raw trailing byte(s) as CompressedByteStream at %X\n", Remaining, StartPos);
+	return true;
+
+	unguard;
+}
+
+static void ReadAO2RawTrailingBytes(FArchive &Ar, TArray<uint8> &Data)
+{
+	guard(ReadAO2RawTrailingBytes);
+
+	const int StartPos = Ar.Tell();
+	const int StopPos  = Ar.GetStopper();
+	const int Remaining = StopPos - StartPos;
+	Data.Empty(Remaining);
+	if (Remaining > 0)
+	{
+		Data.AddUninitialized(Remaining);
+		Ar.Serialize(Data.GetData(), Remaining);
+	}
+
+	unguard;
+}
+
+void UAnimSequence::SerializeAO2CompressionInfo(FArchive &Ar, int DataSize)
+{
+	guard(UAnimSequence::SerializeAO2CompressionInfo);
+
+	const int StartPos = Ar.Tell();
+	if (DataSize < 0x58)
+	{
+		Ar.Seek(StartPos + DataSize);
+		return;
+	}
+
+	int Header[21];
+	for (int i = 0; i < ARRAY_COUNT(Header); i++)
+		Ar << Header[i];
+
+	AO2CompressionHeader.Empty(ARRAY_COUNT(Header));
+	AO2CompressionHeader.AddUninitialized(ARRAY_COUNT(Header));
+	for (int i = 0; i < ARRAY_COUNT(Header); i++)
+		AO2CompressionHeader[i] = Header[i];
+
+	const int TrackInfoCount = Header[20];
+	if (TrackInfoCount > 0 && TrackInfoCount < 0x10000 && 0x54 + TrackInfoCount * 4 <= DataSize)
+	{
+		AO2CompressedTrackInfo.Empty(TrackInfoCount);
+		AO2CompressedTrackInfo.AddUninitialized(TrackInfoCount);
+		for (int i = 0; i < TrackInfoCount; i++)
+			Ar << AO2CompressedTrackInfo[i];
+	}
+
+	const int ByteStreamOffset = 0x54 + AO2CompressedTrackInfo.Num() * 4;
+	const int ByteStreamSize = Header[18];
+	if (ByteStreamSize > 0 && ByteStreamOffset + ByteStreamSize <= DataSize)
+	{
+		Ar.Seek(StartPos + ByteStreamOffset);
+		CompressedByteStream.Empty(ByteStreamSize);
+		CompressedByteStream.AddUninitialized(ByteStreamSize);
+		Ar.Serialize(CompressedByteStream.GetData(), ByteStreamSize);
+	}
+
+	const int ExtraOffset = ByteStreamOffset + CompressedByteStream.Num();
+	const int ExtraSize = DataSize - ExtraOffset;
+	AO2CompressionExtraData.Empty(max(ExtraSize, 0));
+	if (ExtraSize > 0)
+	{
+		Ar.Seek(StartPos + ExtraOffset);
+		AO2CompressionExtraData.AddUninitialized(ExtraSize);
+		Ar.Serialize(AO2CompressionExtraData.GetData(), ExtraSize);
+	}
+
+	if (getenv("AO2_ANIM_DEBUG"))
+	{
+		appPrintf("AO2CompressionInfo parsed for %s: size=%d", Name, DataSize);
+		for (int i = 0; i < ARRAY_COUNT(Header); i++)
+			appPrintf(" h%02d=%d", i, Header[i]);
+		appPrintf(" trackInfo=%d byteStream=%d@%X extra=%d@%X\n",
+			AO2CompressedTrackInfo.Num(), CompressedByteStream.Num(), ByteStreamOffset, AO2CompressionExtraData.Num(), ExtraOffset);
+
+		const int TrackPreview = min(AO2CompressedTrackInfo.Num() / 6, 12);
+		for (int TrackIndex = 0; TrackIndex < TrackPreview; TrackIndex++)
+		{
+			const int* T = &AO2CompressedTrackInfo[TrackIndex * 6];
+			appPrintf("  ao2track[%d] = %d %d %d %d %d %d\n",
+				TrackIndex, T[0], T[1], T[2], T[3], T[4], T[5]);
+		}
+		const int BytePreview = min(CompressedByteStream.Num(), 0x80);
+		for (int Pos = 0; Pos < BytePreview; Pos += 16)
+		{
+			appPrintf("  ao2bytes %04X:", Pos);
+			for (int i = 0; i < min(16, BytePreview - Pos); i++)
+				appPrintf(" %02X", CompressedByteStream[Pos + i]);
+			appPrintf("\n");
+		}
+		if (CompressedByteStream.Num() >= 0x20)
+		{
+			const uint8* CountData = CompressedByteStream.GetData() + 0x18;
+			const int ConstantCount = (CountData[0] << 24) | (CountData[1] << 16) | (CountData[2] << 8) | CountData[3];
+			const uint8* DescData = CompressedByteStream.GetData() + 0x10;
+			const int AfterConstants = (DescData[0] << 24) | (DescData[1] << 16) | (DescData[2] << 8) | DescData[3];
+			const int TailPreview = min(CompressedByteStream.Num() - AfterConstants, 0x80);
+			appPrintf("  ao2const count=%d desc=%X tail=%d\n", ConstantCount, AfterConstants, CompressedByteStream.Num() - AfterConstants);
+			for (int Pos = 0; Pos < TailPreview; Pos += 16)
+			{
+				appPrintf("  ao2desc %04X:", AfterConstants + Pos);
+				for (int i = 0; i < min(16, TailPreview - Pos); i++)
+					appPrintf(" %02X", CompressedByteStream[AfterConstants + Pos + i]);
+				appPrintf("\n");
+			}
+		}
+		if (AO2CompressionExtraData.Num())
+		{
+			const int ExtraPreview = min(AO2CompressionExtraData.Num(), 0x100);
+			for (int Pos = 0; Pos < ExtraPreview; Pos += 16)
+			{
+				appPrintf("  ao2extra %04X:", ExtraOffset + Pos);
+				for (int i = 0; i < min(16, ExtraPreview - Pos); i++)
+					appPrintf(" %02X", AO2CompressionExtraData[Pos + i]);
+				appPrintf("\n");
+			}
+		}
+	}
+
+	Ar.Seek(StartPos + DataSize);
+
+	unguard;
+}
+
 void UAnimSequence::Serialize(FArchive &Ar)
 {
 	guard(UAnimSequence::Serialize);
-	assert(Ar.ArVer >= 372);		// older version is not yet ready
+	assert(Ar.ArVer >= 372 || Ar.Game == GAME_R6Vegas2);		// older version is not yet ready
 	Super::Serialize(Ar);
 #if TUROK
 	if (Ar.Game == GAME_Turok) return;
@@ -184,7 +352,85 @@ void UAnimSequence::Serialize(FArchive &Ar)
 	}
 #endif // PLA
 old_code:
+#if R6VEGAS
+	if (Ar.Game == GAME_R6Vegas2)
+	{
+		bIsAdditive = bIsAdditive || m_bIsAdditive;
+		// Rainbow Six Vegas 2 stores the compressed animation payload in a
+		// Ubisoft-specific native block. It is not a stock UE3 TArray<uint8>,
+		// so keep the raw bytes for a game-specific decoder and do not let the
+		// generic serializer interpret the first dword as an array count.
+		ReadAO2RawTrailingBytes(Ar, CompressedByteStream);
+		if (getenv("R6V2_ANIM_DEBUG"))
+		{
+			appPrintf("R6V2 AnimSequence %s/%s: frames=%d origFrames=%d len=%g rate=%g additive=%d force15=%d ignoreLast=%d compressedQuat=%d compressTimes=%d native=%d bytes\n",
+				Outer ? Outer->Name : "None", *SequenceName, NumFrames, m_iOriginalNbFrames, SequenceLength, RateScale,
+				bIsAdditive, m_bForce15FPS, m_bIgnoreLastFrame, m_bCompressedQuat, m_bCompressKeytimes, CompressedByteStream.Num());
+			const int BytePreview = min(CompressedByteStream.Num(), 0xC0);
+			for (int Pos = 0; Pos < BytePreview; Pos += 16)
+			{
+				appPrintf("  r6v2anim %04X:", Pos);
+				for (int i = 0; i < min(16, BytePreview - Pos); i++)
+					appPrintf(" %02X", CompressedByteStream[Pos + i]);
+				appPrintf("\n");
+			}
+		}
+		return;
+	}
+#endif // R6VEGAS
+#if ARMYOF2
+	bool bArmyOfTwoHandled = false;
+	if (Ar.Game == GAME_ArmyOf2)
+	{
+		if (CompressedByteStream.Num())
+		{
+			ReadAO2RawTrailingBytes(Ar, AO2CompressedAnimData);
+			if (getenv("AO2_ANIM_DEBUG"))
+			{
+				appPrintf("ArmyOfTwo AnimSequence %s: native animated data=%d bytes\n", Name, AO2CompressedAnimData.Num());
+				const int BytePreview = min(AO2CompressedAnimData.Num(), 0x40);
+				for (int Pos = 0; Pos < BytePreview; Pos += 16)
+				{
+					appPrintf("  ao2anim %04X:", Pos);
+					for (int i = 0; i < min(16, BytePreview - Pos); i++)
+						appPrintf(" %02X", AO2CompressedAnimData[Pos + i]);
+					appPrintf("\n");
+				}
+			}
+		}
+		else if (!ReadAO2CompressedByteStream(Ar, CompressedByteStream))
+			appError("ArmyOfTwo AnimSequence: couldn't find CompressedByteStream near %X", Ar.Tell());
+		if (Ar.Tell() < Ar.GetStopper())
+			Ar.Seek(Ar.GetStopper());
+		bArmyOfTwoHandled = true;
+	}
+	if (!bArmyOfTwoHandled)
+	{
+#endif // ARMYOF2
 	Ar << CompressedByteStream;
+#if FIRSTASSAULT
+	if (Ar.Game == GAME_FirstAssault && getenv("SWFA_ANIM_DEBUG"))
+	{
+		appPrintf("SWFA AnimSequence %s/%s raw=%d offsets=%d stream=%d frames=%d len=%g trans=%s rot=%s key=%s tail=%d\n",
+			Outer ? Outer->Name : "None", *SequenceName, RawAnimData.Num(), CompressedTrackOffsets.Num(), CompressedByteStream.Num(),
+			NumFrames, SequenceLength, EnumToName(TranslationCompressionFormat), EnumToName(RotationCompressionFormat),
+			EnumToName(KeyEncodingFormat), Ar.GetStopper() - Ar.Tell());
+		if (CompressedByteStream.Num())
+		{
+			int DebugBytes = 0x60;
+			if (const char* DebugEnv = getenv("SWFA_ANIM_DEBUG_BYTES"))
+				DebugBytes = atoi(DebugEnv);
+			const int BytePreview = min(CompressedByteStream.Num(), DebugBytes);
+			for (int Pos = 0; Pos < BytePreview; Pos += 16)
+			{
+				appPrintf("  swfaanim %04X:", Pos);
+				for (int i = 0; i < min(16, BytePreview - Pos); i++)
+					appPrintf(" %02X", CompressedByteStream[Pos + i]);
+				appPrintf("\n");
+			}
+		}
+	}
+#endif
 #if ARGONAUTS
 	if (Ar.Game == GAME_Argonauts && Ar.ArLicenseeVer >= 30)
 	{
@@ -222,8 +468,1642 @@ old_code:
 	#endif
 	}
 #endif // LOST_PLANET3
+#if ARMYOF2
+	}
+#endif // ARMYOF2
 	unguard;
 }
+
+#if ARMYOF2
+static inline uint16 ReadAO2BE16(const uint8* Data)
+{
+	return (Data[0] << 8) | Data[1];
+}
+
+static inline uint16 ReadAO2LE16(const uint8* Data)
+{
+	return Data[0] | (Data[1] << 8);
+}
+
+static inline uint32 ReadAO2BE32(const uint8* Data)
+{
+	return (uint32(Data[0]) << 24) | (uint32(Data[1]) << 16) | (uint32(Data[2]) << 8) | uint32(Data[3]);
+}
+
+static inline uint32 ReadAO2LE32(const uint8* Data)
+{
+	return uint32(Data[0]) | (uint32(Data[1]) << 8) | (uint32(Data[2]) << 16) | (uint32(Data[3]) << 24);
+}
+
+static float ReadAO2BEFloat(const uint8* Data)
+{
+	union
+	{
+		uint32 I;
+		float F;
+	} V;
+	V.I = ReadAO2BE32(Data);
+	return V.F;
+}
+
+static float ReadAO2LEFloat(const uint8* Data)
+{
+	union
+	{
+		uint32 I;
+		float F;
+	} V;
+	V.I = ReadAO2LE32(Data);
+	return V.F;
+}
+
+static float DecodeAO2Sample16(uint16 Packed)
+{
+	return (float(Packed) / 32767.5f) - 1.0f;
+}
+
+static float DecodeAO2Sample16Signed(uint16 Packed)
+{
+	return float((int16)Packed) / 32767.0f;
+}
+
+static float DecodeAO2Half(uint16 Packed)
+{
+	const int Sign = (Packed & 0x8000) ? -1 : 1;
+	const int Exp = (Packed >> 10) & 0x1F;
+	const int Mant = Packed & 0x3FF;
+
+	if (Exp == 0)
+		return Sign * ldexp(float(Mant), -24);
+	if (Exp == 31)
+		return Sign * 65504.0f;
+	return Sign * ldexp(float(Mant + 1024), Exp - 25);
+}
+
+static int GetAO2EnvInt(const char* Name, int Default)
+{
+	const char* Value = getenv(Name);
+	return Value ? atoi(Value) : Default;
+}
+
+static int GetAO2AutoAnimatedHeader(const TArray<uint8>& Data, int NumFrames, int AnimatedComponents)
+{
+	if (NumFrames <= 0 || AnimatedComponents <= 0)
+		return 0;
+
+	const int Flat16Bytes = AnimatedComponents * NumFrames * 2;
+	const int Header = Data.Num() - Flat16Bytes;
+	if (Header >= 0 && Header + Flat16Bytes == Data.Num())
+		return Header;
+	return 0;
+}
+
+static float GetAO2Constant(const TArray<uint8>& Data, int Ref)
+{
+	if (Ref >= 0)
+		return 0.0f;
+
+	const int Index = -Ref - 1;
+	if (Index < 7)
+		return 0.0f;
+
+	const int Offset = 0x20 + (Index - 7) * 4;
+	if (Offset < 0 || Offset + 4 > Data.Num())
+		return 0.0f;
+	return ReadAO2BEFloat(Data.GetData() + Offset);
+}
+
+static int GetAO2DescriptorOffset(const TArray<uint8>& Data)
+{
+	if (Data.Num() < 0x20)
+		return -1;
+
+	const int Offset = ReadAO2BE32(Data.GetData() + 0x10);
+	return (Offset >= 0 && Offset < Data.Num()) ? Offset : -1;
+}
+
+static uint32 ReadAO2BitsMSB(const TArray<uint8>& Data, int BitOffset, int NumBits)
+{
+	uint32 Value = 0;
+	for (int i = 0; i < NumBits; i++)
+	{
+		const int SourceBit = BitOffset + i;
+		const int ByteIndex = SourceBit >> 3;
+		if (ByteIndex < 0 || ByteIndex >= Data.Num())
+			return Value;
+		const int BitIndex = 7 - (SourceBit & 7);
+		Value = (Value << 1) | ((Data[ByteIndex] >> BitIndex) & 1);
+	}
+	return Value;
+}
+
+static float GetAO2AnimatedValue(const TArray<uint8>& Data, int Ref, int FrameIndex, int NumFrames, int NumComponents, int Header, int SampleMode)
+{
+	if (Ref < 0 || NumFrames <= 0 || NumComponents <= 0)
+		return 0.0f;
+
+	const bool bFrameMajor = (SampleMode & 2) != 0;
+	const bool bLittleEndian = (SampleMode & 1) != 0;
+	const bool bSigned = (SampleMode & 4) != 0;
+	const bool bHalf = (SampleMode & 8) != 0;
+
+	const int SampleIndex = bFrameMajor
+		? FrameIndex * NumComponents + Ref
+		: Ref * NumFrames + FrameIndex;
+	const int SampleOffset = Header + SampleIndex * 2;
+	if (SampleOffset < 0 || SampleOffset + 2 > Data.Num())
+		return 0.0f;
+
+	const uint16 Packed = bLittleEndian
+		? ReadAO2LE16(Data.GetData() + SampleOffset)
+		: ReadAO2BE16(Data.GetData() + SampleOffset);
+	if (bHalf)
+		return DecodeAO2Half(Packed);
+	return bSigned ? DecodeAO2Sample16Signed(Packed) : DecodeAO2Sample16(Packed);
+}
+
+static uint16 GetAO2PackedSample16(const TArray<uint8>& Data, int Ref, int FrameIndex, int NumFrames, int NumComponents, int Header, bool bFrameMajor, bool bLittleEndian)
+{
+	if (Ref < 0 || NumFrames <= 0 || NumComponents <= 0)
+		return 0;
+
+	const int SampleIndex = bFrameMajor
+		? FrameIndex * NumComponents + Ref
+		: Ref * NumFrames + FrameIndex;
+	const int SampleOffset = Header + SampleIndex * 2;
+	if (SampleOffset < 0 || SampleOffset + 2 > Data.Num())
+		return 0;
+
+	return bLittleEndian
+		? ReadAO2LE16(Data.GetData() + SampleOffset)
+		: ReadAO2BE16(Data.GetData() + SampleOffset);
+}
+
+static float GetAO2AnimatedBitstreamValue(
+	const TArray<uint8>& Data,
+	const TArray<uint8>& DescriptorData,
+	int DescriptorOffset,
+	int DescriptorSkip,
+	int Ref,
+	int FrameIndex,
+	int SampleMode)
+{
+	if (Ref < 0 || DescriptorOffset < 0)
+		return 0.0f;
+
+	const int DescriptorStride = GetAO2EnvInt("AO2_DESC_STRIDE", 8);
+	const int DescPos = DescriptorOffset + DescriptorSkip + Ref * DescriptorStride;
+	if (DescPos < 0 || DescPos + 4 > DescriptorData.Num())
+		return 0.0f;
+
+	const int BitOffset = ReadAO2BE32(DescriptorData.GetData() + DescPos) + FrameIndex * 16;
+	const uint16 Packed = (uint16)ReadAO2BitsMSB(Data, BitOffset, 16);
+	if (SampleMode & 8)
+		return DecodeAO2Half(Packed);
+	return (SampleMode & 4) ? DecodeAO2Sample16Signed(Packed) : DecodeAO2Sample16(Packed);
+}
+
+static float GetAO2AnimatedValueForMode(
+	const TArray<uint8>& Data,
+	const TArray<uint8>& DescriptorData,
+	int DescriptorOffset,
+	int DescriptorSkip,
+	int Ref,
+	int FrameIndex,
+	int NumFrames,
+	int NumComponents,
+	int Header,
+	int SampleMode)
+{
+	if (SampleMode & 16)
+		return GetAO2AnimatedBitstreamValue(Data, DescriptorData, DescriptorOffset, DescriptorSkip, Ref, FrameIndex, SampleMode);
+	return GetAO2AnimatedValue(Data, Ref, FrameIndex, NumFrames, NumComponents, Header, SampleMode);
+}
+
+static void BuildAO2Quat(const float* V, int RotMode, FQuat& Q)
+{
+	const int Perms[6][3] =
+	{
+		{ 0, 1, 2 },	// XYZ
+		{ 0, 2, 1 },	// XZY
+		{ 1, 0, 2 },	// YXZ
+		{ 1, 2, 0 },	// YZX
+		{ 2, 0, 1 },	// ZXY
+		{ 2, 1, 0 }		// ZYX
+	};
+	const int PermIndex = RotMode % 6;
+	const int SignMode = (RotMode / 6) & 7;
+	const bool bNegW = ((RotMode / 48) & 1) != 0;
+
+	float X = V[Perms[PermIndex][0]];
+	float Y = V[Perms[PermIndex][1]];
+	float Z = V[Perms[PermIndex][2]];
+	if (SignMode & 1) X = -X;
+	if (SignMode & 2) Y = -Y;
+	if (SignMode & 4) Z = -Z;
+
+	Q.X = X;
+	Q.Y = Y;
+	Q.Z = Z;
+	const float WSq = 1.0f - (Q.X * Q.X + Q.Y * Q.Y + Q.Z * Q.Z);
+	Q.W = (WSq > 0.0f) ? sqrt(WSq) : 0.0f;
+	if (bNegW)
+		Q.W = -Q.W;
+
+	const float LenSq = Q.X * Q.X + Q.Y * Q.Y + Q.Z * Q.Z + Q.W * Q.W;
+	if (LenSq > 0.0f)
+	{
+		const float Scale = 1.0f / sqrt(LenSq);
+		Q.X *= Scale;
+		Q.Y *= Scale;
+		Q.Z *= Scale;
+		Q.W *= Scale;
+	}
+	else
+	{
+		Q.Set(0, 0, 0, 1);
+	}
+}
+
+static float ScoreAO2AnimatedOffset(
+	const TArray<uint8>& Data,
+	const TArray<int32>& TrackInfo,
+	int NumTracks,
+	int NumFrames,
+	int NumComponents,
+	int Header,
+	int SampleMode)
+{
+	if (NumFrames <= 1 || NumComponents <= 0)
+		return 1e30f;
+
+	float Score = 0.0f;
+	int Samples = 0;
+	for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+	{
+		const int* Refs = &TrackInfo[TrackIndex * 6];
+		if (Refs[0] < 0 && Refs[1] < 0 && Refs[2] < 0)
+			continue;
+
+		float Prev[3] = { 0, 0, 0 };
+		for (int FrameIndex = 0; FrameIndex < NumFrames; FrameIndex++)
+		{
+			float V[3];
+			float LenSq = 0.0f;
+			for (int ComponentIndex = 0; ComponentIndex < 3; ComponentIndex++)
+			{
+				const int Ref = Refs[ComponentIndex];
+				V[ComponentIndex] = GetAO2AnimatedValue(Data, Ref, FrameIndex, NumFrames, NumComponents, Header, SampleMode);
+				LenSq += V[ComponentIndex] * V[ComponentIndex];
+			}
+			if (LenSq > 1.05f)
+				Score += (LenSq - 1.05f) * 50.0f;
+			if (FrameIndex > 0)
+			{
+				Score += fabs(V[0] - Prev[0]) + fabs(V[1] - Prev[1]) + fabs(V[2] - Prev[2]);
+				Samples++;
+			}
+			Prev[0] = V[0];
+			Prev[1] = V[1];
+			Prev[2] = V[2];
+		}
+	}
+
+	return Samples ? Score / Samples : 1e30f;
+}
+
+static int CountAO2LeadingZeroBytes(const TArray<uint8>& Data);
+static int CountAO2LeadingZeroWords16(const TArray<uint8>& Data);
+
+struct FAO2RootProbeCandidate
+{
+	float Score;
+	int TrackIndex;
+	int Header;
+	int Layout;
+	int Refs[3];
+	uint16 First[3];
+	uint16 Min[3];
+	uint16 Max[3];
+};
+
+struct FAO2MotionProbeCandidate
+{
+	float Score;
+	float Displacement;
+	float PathLength;
+	int TrackIndex;
+	int Header;
+	int SampleMode;
+	FVector First;
+	FVector Last;
+	int Refs[3];
+};
+
+static uint32 GetAO2DescriptorWord(const UAnimSequence* Seq, int Ref);
+
+static void AddAO2RootProbeCandidate(TArray<FAO2RootProbeCandidate>& Best, const FAO2RootProbeCandidate& Candidate)
+{
+	const int MaxBest = 12;
+	int InsertAt = 0;
+	while (InsertAt < Best.Num() && Best[InsertAt].Score <= Candidate.Score)
+		InsertAt++;
+	if (InsertAt >= MaxBest)
+		return;
+	Best.Insert(Candidate, InsertAt);
+	if (Best.Num() > MaxBest)
+		Best.RemoveAt(MaxBest);
+}
+
+static void AddAO2MotionProbeCandidate(TArray<FAO2MotionProbeCandidate>& Best, const FAO2MotionProbeCandidate& Candidate)
+{
+	const int MaxBest = 16;
+	int InsertAt = 0;
+	while (InsertAt < Best.Num() && Best[InsertAt].Score >= Candidate.Score)
+		InsertAt++;
+	if (InsertAt >= MaxBest)
+		return;
+	Best.Insert(Candidate, InsertAt);
+	if (Best.Num() > MaxBest)
+		Best.RemoveAt(MaxBest);
+}
+
+static FVector ReadAO2ProbeTranslation(const UAnimSequence* Seq, const int* Refs, int FrameIndex, int NumComponents, int Header, int SampleMode)
+{
+	FVector V;
+	float* Values[3] = { &V.X, &V.Y, &V.Z };
+	for (int Axis = 0; Axis < 3; Axis++)
+	{
+		const int Ref = Refs[Axis];
+		*Values[Axis] = Ref < 0
+			? GetAO2Constant(Seq->CompressedByteStream, Ref)
+			: GetAO2AnimatedValue(Seq->AO2CompressedAnimData, Ref, FrameIndex, Seq->NumFrames, NumComponents, Header, SampleMode);
+	}
+	return V;
+}
+
+static float AO2Distance(const FVector& A, const FVector& B)
+{
+	const float X = A.X - B.X;
+	const float Y = A.Y - B.Y;
+	const float Z = A.Z - B.Z;
+	return sqrt(X * X + Y * Y + Z * Z);
+}
+
+static bool AO2FiniteVector(const FVector& V)
+{
+	return V.X == V.X && V.Y == V.Y && V.Z == V.Z && fabs(V.X) < 1e20f && fabs(V.Y) < 1e20f && fabs(V.Z) < 1e20f;
+}
+
+static void ProbeAO2MotionCandidates(const UAnimSequence* Seq, const UAnimSet* Owner, int NumTracks, int AnimatedComponents, int AutoHeader)
+{
+	guard(ProbeAO2MotionCandidates);
+
+	if (!getenv("AO2_MOTION_PROBE"))
+		return;
+	if (Seq->NumFrames <= 1 || AnimatedComponents <= 0 || !Seq->AO2CompressedTrackInfo.Num())
+		return;
+
+	const int Flat16Bytes = AnimatedComponents * Seq->NumFrames * 2;
+	const int Delta16 = Seq->AO2CompressedAnimData.Num() - Flat16Bytes;
+	const int LeadingZeroBytes = CountAO2LeadingZeroBytes(Seq->AO2CompressedAnimData);
+	const int HeaderCandidates[] =
+	{
+		AutoHeader,
+		max(0, Delta16),
+		Align(max(0, Delta16), 4),
+		LeadingZeroBytes,
+		Align(LeadingZeroBytes, 4),
+		64,
+		0
+	};
+
+	TArray<FAO2MotionProbeCandidate> Best;
+	for (int HeaderIndex = 0; HeaderIndex < ARRAY_COUNT(HeaderCandidates); HeaderIndex++)
+	{
+		const int Header = HeaderCandidates[HeaderIndex];
+		if (Header < 0 || Header >= Seq->AO2CompressedAnimData.Num())
+			continue;
+
+		for (int SampleMode = 0; SampleMode < 16; SampleMode++)
+		{
+			for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+			{
+				const int* Refs = &Seq->AO2CompressedTrackInfo[TrackIndex * 6 + 3];
+				if (Refs[0] < 0 && Refs[1] < 0 && Refs[2] < 0)
+					continue;
+
+				FVector First = ReadAO2ProbeTranslation(Seq, Refs, 0, AnimatedComponents, Header, SampleMode);
+				FVector Prev = First;
+				float PathLength = 0.0f;
+				float MaxStep = 0.0f;
+				bool bBad = false;
+				for (int FrameIndex = 1; FrameIndex < Seq->NumFrames; FrameIndex++)
+				{
+					const FVector Cur = ReadAO2ProbeTranslation(Seq, Refs, FrameIndex, AnimatedComponents, Header, SampleMode);
+					if (!AO2FiniteVector(Cur))
+					{
+						bBad = true;
+						break;
+					}
+					const float Step = AO2Distance(Cur, Prev);
+					PathLength += Step;
+					MaxStep = max(MaxStep, Step);
+					Prev = Cur;
+				}
+				if (bBad)
+					continue;
+
+				const FVector Last = Prev;
+				const float Displacement = AO2Distance(Last, First);
+				if (PathLength <= 0.0001f)
+					continue;
+
+				const float Smoothness = MaxStep / PathLength;
+				if (Smoothness > 0.85f)
+					continue;
+
+				FAO2MotionProbeCandidate C;
+				C.Displacement = Displacement;
+				C.PathLength = PathLength;
+				C.Score = Displacement / (1.0f + PathLength * 0.25f + Smoothness * 10.0f);
+				C.TrackIndex = TrackIndex;
+				C.Header = Header;
+				C.SampleMode = SampleMode;
+				C.First = First;
+				C.Last = Last;
+				C.Refs[0] = Refs[0];
+				C.Refs[1] = Refs[1];
+				C.Refs[2] = Refs[2];
+				AddAO2MotionProbeCandidate(Best, C);
+			}
+		}
+	}
+
+	appPrintf("AO2MOTION %s frames=%d animated=%d autoHeader=%d candidates=%d\n",
+		*Seq->SequenceName, Seq->NumFrames, AnimatedComponents, AutoHeader, Best.Num());
+	for (int i = 0; i < Best.Num(); i++)
+	{
+		const FAO2MotionProbeCandidate& C = Best[i];
+		const char* TrackName = (Owner && C.TrackIndex < Owner->TrackBoneNames.Num()) ? *Owner->TrackBoneNames[C.TrackIndex] : "?";
+		appPrintf("  motionCand[%02d] score=%g track=%d(%s) header=%d mode=%d refs=(%d,%d,%d) disp=%g path=%g first=(%g,%g,%g) last=(%g,%g,%g)\n",
+			i, C.Score, C.TrackIndex, TrackName, C.Header, C.SampleMode,
+			C.Refs[0], C.Refs[1], C.Refs[2], C.Displacement, C.PathLength,
+			C.First.X, C.First.Y, C.First.Z, C.Last.X, C.Last.Y, C.Last.Z);
+	}
+
+	unguard;
+}
+
+static void ProbeAO2RootMotionTracks(const UAnimSequence* Seq, int NumTracks, int AnimatedComponents, int AutoHeader)
+{
+	guard(ProbeAO2RootMotionTracks);
+
+	if (!getenv("AO2_ROOT_PROBE"))
+		return;
+	if (Seq->NumFrames <= 0 || AnimatedComponents <= 0 || !Seq->AO2CompressedTrackInfo.Num())
+		return;
+
+	const int Flat16Bytes = AnimatedComponents * Seq->NumFrames * 2;
+	const int Delta16 = Seq->AO2CompressedAnimData.Num() - Flat16Bytes;
+	const int LeadingZeroBytes = CountAO2LeadingZeroBytes(Seq->AO2CompressedAnimData);
+	const int HeaderCandidates[] =
+	{
+		AutoHeader,
+		max(0, Delta16),
+		Align(max(0, Delta16), 4),
+		LeadingZeroBytes,
+		Align(LeadingZeroBytes, 4),
+		64,
+		0
+	};
+
+	appPrintf("AO2ROOTPROBE %s frames=%d animated=%d animBytes=%d autoHeader=%d flat16=%d\n",
+		*Seq->SequenceName, Seq->NumFrames, AnimatedComponents, Seq->AO2CompressedAnimData.Num(), AutoHeader, Flat16Bytes);
+
+	int ZeroPosTracks = 0;
+	for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+	{
+		const int* Refs = &Seq->AO2CompressedTrackInfo[TrackIndex * 6];
+		bool bZeroPos = true;
+		for (int Axis = 0; Axis < 3; Axis++)
+		{
+			const int Ref = Refs[3 + Axis];
+			if (Ref >= 0 || fabs(GetAO2Constant(Seq->CompressedByteStream, Ref)) > 0.0001f)
+			{
+				bZeroPos = false;
+				break;
+			}
+		}
+		if (!bZeroPos)
+			continue;
+		if (ZeroPosTracks < 12)
+		{
+			appPrintf("  zeroPosTrack[%d] track=%d rot=(%d,%d,%d) pos=(%d,%d,%d)\n",
+				ZeroPosTracks, TrackIndex, Refs[0], Refs[1], Refs[2], Refs[3], Refs[4], Refs[5]);
+		}
+		ZeroPosTracks++;
+	}
+	if (ZeroPosTracks)
+		appPrintf("  zeroPosTrackCount=%d\n", ZeroPosTracks);
+
+	if (Seq->AO2CompressedTrackInfo.Num() >= 6)
+	{
+		const int* RootRefs = &Seq->AO2CompressedTrackInfo[0];
+		appPrintf("  track0 refs rot=(%d,%d,%d) pos=(%d,%d,%d)\n",
+			RootRefs[0], RootRefs[1], RootRefs[2], RootRefs[3], RootRefs[4], RootRefs[5]);
+		for (int Slot = 0; Slot < 6; Slot++)
+		{
+			const int Ref = RootRefs[Slot];
+			if (Ref < 0)
+				continue;
+			for (int Layout = 0; Layout < 4; Layout++)
+			{
+				const bool bFrameMajor = (Layout & 2) != 0;
+				const bool bLittleEndian = (Layout & 1) != 0;
+				uint16 MinValue = 0xFFFF;
+				uint16 MaxValue = 0;
+				uint16 First = 0;
+				uint16 Last = 0;
+				float Delta = 0.0f;
+				for (int FrameIndex = 0; FrameIndex < Seq->NumFrames; FrameIndex++)
+				{
+					const uint16 Packed = GetAO2PackedSample16(Seq->AO2CompressedAnimData, Ref, FrameIndex, Seq->NumFrames, AnimatedComponents, AutoHeader, bFrameMajor, bLittleEndian);
+					if (FrameIndex == 0)
+						First = Packed;
+					else
+						Delta += abs((int)Packed - (int)Last);
+					Last = Packed;
+					MinValue = min(MinValue, Packed);
+					MaxValue = max(MaxValue, Packed);
+				}
+				appPrintf("  rootSlotSample slot=%d ref=%d header=%d layout=%s/%s first=%04X last=%04X min=%04X max=%04X delta=%g desc=%08X\n",
+					Slot, Ref, AutoHeader,
+					bFrameMajor ? "frameMajor" : "refMajor",
+					bLittleEndian ? "LE" : "BE",
+					First, Last, MinValue, MaxValue, Delta, GetAO2DescriptorWord(Seq, Ref));
+			}
+
+			const uint32 Desc = GetAO2DescriptorWord(Seq, Ref);
+			const int Starts[] =
+			{
+				(int)(Desc & 0xFFFF),
+				(int)(Desc & 0xFFFFFF),
+				(int)((Desc >> 8) & 0xFFFF),
+				(int)((Desc >> 16) & 0xFFFF)
+			};
+			const char* StartNames[] = { "lo16", "lo24", "mid16", "hi16" };
+			for (int StartIndex = 0; StartIndex < ARRAY_COUNT(Starts); StartIndex++)
+			{
+				for (int bAsBits = 0; bAsBits < 2; bAsBits++)
+				{
+					uint16 MinValue = 0xFFFF;
+					uint16 MaxValue = 0;
+					uint16 First = 0;
+					uint16 Last = 0;
+					float Delta = 0.0f;
+					bool bValid = true;
+					for (int FrameIndex = 0; FrameIndex < Seq->NumFrames; FrameIndex++)
+					{
+						uint16 Packed;
+						if (bAsBits)
+						{
+							const int BitOffset = Starts[StartIndex] + FrameIndex * 16;
+							if (BitOffset < 0 || BitOffset + 16 > Seq->AO2CompressedAnimData.Num() * 8)
+							{
+								bValid = false;
+								break;
+							}
+							Packed = (uint16)ReadAO2BitsMSB(Seq->AO2CompressedAnimData, BitOffset, 16);
+						}
+						else
+						{
+							const int ByteOffset = Starts[StartIndex] + FrameIndex * 2;
+							if (ByteOffset < 0 || ByteOffset + 2 > Seq->AO2CompressedAnimData.Num())
+							{
+								bValid = false;
+								break;
+							}
+							Packed = ReadAO2BE16(Seq->AO2CompressedAnimData.GetData() + ByteOffset);
+						}
+						if (FrameIndex == 0)
+							First = Packed;
+						else
+							Delta += abs((int)Packed - (int)Last);
+						Last = Packed;
+						MinValue = min(MinValue, Packed);
+						MaxValue = max(MaxValue, Packed);
+					}
+					if (bValid)
+					{
+						appPrintf("  rootSlotDescSample slot=%d ref=%d start=%s/%s value=%d first=%04X last=%04X min=%04X max=%04X delta=%g\n",
+							Slot, Ref, StartNames[StartIndex], bAsBits ? "bit" : "byte", Starts[StartIndex],
+							First, Last, MinValue, MaxValue, Delta);
+					}
+				}
+			}
+		}
+	}
+
+	TArray<FAO2RootProbeCandidate> Best;
+	for (int HeaderIndex = 0; HeaderIndex < ARRAY_COUNT(HeaderCandidates); HeaderIndex++)
+	{
+		const int Header = HeaderCandidates[HeaderIndex];
+		if (Header < 0 || Header + Flat16Bytes > Seq->AO2CompressedAnimData.Num())
+			continue;
+
+		for (int Layout = 0; Layout < 4; Layout++)
+		{
+			const bool bFrameMajor = (Layout & 2) != 0;
+			const bool bLittleEndian = (Layout & 1) != 0;
+
+			for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+			{
+				const int* Refs = &Seq->AO2CompressedTrackInfo[TrackIndex * 6];
+				if (Refs[3] < 0 || Refs[4] < 0 || Refs[5] < 0)
+					continue;
+
+				FAO2RootProbeCandidate Candidate;
+				Candidate.Score = 0.0f;
+				Candidate.TrackIndex = TrackIndex;
+				Candidate.Header = Header;
+				Candidate.Layout = Layout;
+				for (int Axis = 0; Axis < 3; Axis++)
+				{
+					const int Ref = Refs[3 + Axis];
+					Candidate.Refs[Axis] = Ref;
+					uint16 MinValue = 0xFFFF;
+					uint16 MaxValue = 0;
+					uint16 Prev = 0;
+					float Delta = 0.0f;
+					float CenterBias = 0.0f;
+					for (int FrameIndex = 0; FrameIndex < Seq->NumFrames; FrameIndex++)
+					{
+						const uint16 Packed = GetAO2PackedSample16(Seq->AO2CompressedAnimData, Ref, FrameIndex, Seq->NumFrames, AnimatedComponents, Header, bFrameMajor, bLittleEndian);
+						if (FrameIndex == 0)
+						{
+							Candidate.First[Axis] = Packed;
+							Prev = Packed;
+						}
+						else
+						{
+							Delta += abs((int)Packed - (int)Prev);
+							Prev = Packed;
+						}
+						MinValue = min(MinValue, Packed);
+						MaxValue = max(MaxValue, Packed);
+					}
+					Candidate.Min[Axis] = MinValue;
+					Candidate.Max[Axis] = MaxValue;
+					CenterBias += min(abs((int)Candidate.First[Axis]), abs((int)Candidate.First[Axis] - 0x8000));
+					Candidate.Score += Delta + float(MaxValue - MinValue) * 4.0f + CenterBias * 0.01f;
+				}
+				AddAO2RootProbeCandidate(Best, Candidate);
+			}
+		}
+	}
+
+	for (int i = 0; i < Best.Num(); i++)
+	{
+		const FAO2RootProbeCandidate& C = Best[i];
+		appPrintf("  rootCand[%d] score=%g track=%d header=%d layout=%s/%s refs=(%d,%d,%d) first=(%04X,%04X,%04X) min=(%04X,%04X,%04X) max=(%04X,%04X,%04X)\n",
+			i, C.Score, C.TrackIndex, C.Header,
+			(C.Layout & 2) ? "frameMajor" : "refMajor",
+			(C.Layout & 1) ? "LE" : "BE",
+			C.Refs[0], C.Refs[1], C.Refs[2],
+			C.First[0], C.First[1], C.First[2],
+			C.Min[0], C.Min[1], C.Min[2],
+			C.Max[0], C.Max[1], C.Max[2]);
+	}
+
+	unguard;
+}
+
+static int CountAO2LeadingZeroBytes(const TArray<uint8>& Data)
+{
+	int Count = 0;
+	while (Count < Data.Num() && Data[Count] == 0)
+		Count++;
+	return Count;
+}
+
+static int CountAO2LeadingZeroWords16(const TArray<uint8>& Data)
+{
+	int Count = 0;
+	while (Count + 1 < Data.Num() && Data[Count] == 0 && Data[Count + 1] == 0)
+	{
+		Count += 2;
+	}
+	return Count / 2;
+}
+
+static void AnalyzeAO2NativeBlock(
+	const UAnimSequence* Seq,
+	int MaxRef,
+	int PosRefs,
+	int NegRefs,
+	int SlotPos[6],
+	int SlotNeg[6])
+{
+	guard(AnalyzeAO2NativeBlock);
+
+	if (!getenv("AO2_STRUCT_DEBUG"))
+		return;
+
+	if (MaxRef < 0 || Seq->NumFrames <= 0)
+		return;
+
+	const int AnimatedRefs = MaxRef + 1;
+	const int AnimBytes = Seq->AO2CompressedAnimData.Num();
+	const int Flat16Bytes = AnimatedRefs * Seq->NumFrames * 2;
+	const int Flat32Bytes = AnimatedRefs * Seq->NumFrames * 4;
+	const int Delta16 = AnimBytes - Flat16Bytes;
+	const int Delta32 = AnimBytes - Flat32Bytes;
+	const int LeadingZeroBytes = CountAO2LeadingZeroBytes(Seq->AO2CompressedAnimData);
+	const int LeadingZeroWords16 = CountAO2LeadingZeroWords16(Seq->AO2CompressedAnimData);
+
+	appPrintf("  nativeSizeCompare flat16=%d delta16=%d flat32=%d delta32=%d leadingZeroBytes=%d leadingZeroWords16=%d\n",
+		Flat16Bytes, Delta16, Flat32Bytes, Delta32, LeadingZeroBytes, LeadingZeroWords16);
+
+	const int ExtraPerRef = AnimatedRefs ? Delta16 / AnimatedRefs : 0;
+	const int ExtraRemainder = AnimatedRefs ? Delta16 % AnimatedRefs : 0;
+	const int ExtraPerPosRef = PosRefs ? Delta16 / PosRefs : 0;
+	const int ExtraPosRemainder = PosRefs ? Delta16 % PosRefs : 0;
+	appPrintf("  nativeDeltaShape perAnimatedRef=%d rem=%d perPositiveUse=%d rem=%d\n",
+		ExtraPerRef, ExtraRemainder, ExtraPerPosRef, ExtraPosRemainder);
+
+	const int Starts[] =
+	{
+		0,
+		LeadingZeroBytes,
+		Align(LeadingZeroBytes, 4),
+		max(0, Delta16),
+		Align(max(0, Delta16), 4),
+		64
+	};
+	for (int i = 0; i < ARRAY_COUNT(Starts); i++)
+	{
+		const int Start = Starts[i];
+		if (Start < 0 || Start > AnimBytes)
+			continue;
+		const int Remaining = AnimBytes - Start;
+		if (Remaining < 0)
+			continue;
+		const bool Flat16Fits = Remaining >= Flat16Bytes;
+		const bool Flat16Exact = Remaining == Flat16Bytes;
+		const int Tail = Remaining - Flat16Bytes;
+		appPrintf("  candidateSampleStart[%d]=%d remaining=%d flat16Fits=%d exact=%d tail=%d\n",
+			i, Start, Remaining, Flat16Fits ? 1 : 0, Flat16Exact ? 1 : 0, Tail);
+	}
+
+	const int RotRefs = SlotPos[0] + SlotPos[1] + SlotPos[2];
+	const int PosOnlyRefs = SlotPos[3] + SlotPos[4] + SlotPos[5];
+	appPrintf("  animatedSlotShape rotRefs=%d posRefs=%d rotStatic=%d posStatic=%d\n",
+		RotRefs, PosOnlyRefs, SlotNeg[0] + SlotNeg[1] + SlotNeg[2], SlotNeg[3] + SlotNeg[4] + SlotNeg[5]);
+
+	unguard;
+}
+
+static void AnalyzeAO2ConstantStream(const UAnimSequence* Seq, int NegRefs)
+{
+	guard(AnalyzeAO2ConstantStream);
+
+	if (!getenv("AO2_STRUCT_DEBUG"))
+		return;
+
+	const TArray<uint8>& Stream = Seq->CompressedByteStream;
+	if (Stream.Num() < 0x20)
+		return;
+
+	const int Word00 = ReadAO2BE32(Stream.GetData() + 0x00);
+	const int Word08 = ReadAO2BE32(Stream.GetData() + 0x08);
+	const int Word10 = ReadAO2BE32(Stream.GetData() + 0x10);
+	const int Word18 = ReadAO2BE32(Stream.GetData() + 0x18);
+	const int ExpectedFloatTableEnd = 0x20 + max(0, NegRefs - 7) * 4;
+	appPrintf("  streamWords be[00]=%X be[08]=%X be[10]=%X be[18]=%X word18MinusNeg=%d descMinusExpected=%d\n",
+		Word00, Word08, Word10, Word18, Word18 - NegRefs, Word10 - ExpectedFloatTableEnd);
+
+	if (Word10 >= 0 && Word10 <= Stream.Num())
+	{
+		appPrintf("  streamRegions header=0x20 specialConstants=7 floatConstants=%d floatRegion=0x20..0x%X tail=%d\n",
+			max(0, NegRefs - 7), Word10, Stream.Num() - Word10);
+	}
+
+	unguard;
+}
+
+static uint32 GetAO2DescriptorWord(const UAnimSequence* Seq, int Ref)
+{
+	if (Ref < 0 || Seq->CompressedByteStream.Num() < 0x20)
+		return 0;
+	const int DescriptorOffset = ReadAO2BE32(Seq->CompressedByteStream.GetData() + 0x10);
+	const int Offset = DescriptorOffset + Ref * 4;
+	if (Offset < 0 || Offset + 4 > Seq->CompressedByteStream.Num())
+		return 0;
+	return ReadAO2BE32(Seq->CompressedByteStream.GetData() + Offset);
+}
+
+static int FindAO2ExtraModeTable(const TArray<uint8>& Data)
+{
+	if (!Data.Num())
+		return -1;
+
+	int BestPos = -1;
+	int BestCount = 0;
+	for (int Pos = 0; Pos < Data.Num(); Pos++)
+	{
+		int Count = 0;
+		int ModeCounts[4] = { 0, 0, 0, 0 };
+		for (int i = Pos; i < Data.Num(); i++)
+		{
+			const uint8 B = Data[i];
+			if (B > 2 || (B == 0 && Count > 0 && ModeCounts[1] + ModeCounts[2] > 8))
+				break;
+			Count++;
+			ModeCounts[B]++;
+		}
+		if (Count > BestCount && Count >= 16 && ModeCounts[1] + ModeCounts[2] >= Count / 2)
+		{
+			BestPos = Pos;
+			BestCount = Count;
+		}
+	}
+	return BestPos;
+}
+
+static void ProbeAO2CompressionExtra(const UAnimSequence* Seq, int MaxRef)
+{
+	guard(ProbeAO2CompressionExtra);
+
+	if (!getenv("AO2_EXTRA_PROBE") && !getenv("AO2_ANIM_DEBUG"))
+		return;
+	if (!Seq->AO2CompressionExtraData.Num())
+		return;
+
+	const TArray<uint8>& Extra = Seq->AO2CompressionExtraData;
+	const int ModeTable = FindAO2ExtraModeTable(Extra);
+	int ModeCounts[4] = { 0, 0, 0, 0 };
+	if (ModeTable >= 0)
+	{
+		for (int i = ModeTable; i < Extra.Num(); i++)
+		{
+			const uint8 B = Extra[i];
+			if (B > 2)
+				break;
+			if (B < ARRAY_COUNT(ModeCounts))
+				ModeCounts[B]++;
+		}
+	}
+
+	int ModeLen = 0;
+	while (ModeTable >= 0 && ModeTable + ModeLen < Extra.Num() && Extra[ModeTable + ModeLen] <= 2)
+		ModeLen++;
+
+	int SlotPositive[6] = { 0, 0, 0, 0, 0, 0 };
+	int SlotModeCounts[6][3];
+	memset(SlotModeCounts, 0, sizeof(SlotModeCounts));
+	for (int i = 0; i < Seq->AO2CompressedTrackInfo.Num(); i++)
+	{
+		const int Ref = Seq->AO2CompressedTrackInfo[i];
+		if (Ref < 0)
+			continue;
+		const int Slot = i % 6;
+		SlotPositive[Slot]++;
+		if (ModeTable >= 0 && Ref < ModeLen)
+		{
+			const int Mode = Extra[ModeTable + Ref];
+			if (Mode >= 0 && Mode < 3)
+				SlotModeCounts[Slot][Mode]++;
+		}
+	}
+
+	appPrintf("AO2EXTRA %s bytes=%d modeTable=%d modeLen=%d modeCounts=[%d,%d,%d,%d] maxRef=%d\n",
+		*Seq->SequenceName, Extra.Num(), ModeTable, ModeLen,
+		ModeCounts[0], ModeCounts[1], ModeCounts[2], ModeCounts[3], MaxRef);
+	appPrintf("  extraSlotPos rot=(%d,%d,%d) pos=(%d,%d,%d) mode1BySlot=(%d,%d,%d,%d,%d,%d) mode2BySlot=(%d,%d,%d,%d,%d,%d)\n",
+		SlotPositive[0], SlotPositive[1], SlotPositive[2], SlotPositive[3], SlotPositive[4], SlotPositive[5],
+		SlotModeCounts[0][1], SlotModeCounts[1][1], SlotModeCounts[2][1], SlotModeCounts[3][1], SlotModeCounts[4][1], SlotModeCounts[5][1],
+		SlotModeCounts[0][2], SlotModeCounts[1][2], SlotModeCounts[2][2], SlotModeCounts[3][2], SlotModeCounts[4][2], SlotModeCounts[5][2]);
+	if (ModeTable >= 0)
+	{
+		for (int BytesMode1 = 1; BytesMode1 <= 8; BytesMode1++)
+		{
+			for (int BytesMode2 = 1; BytesMode2 <= 8; BytesMode2++)
+			{
+				const int PerFrame = ModeCounts[1] * BytesMode1 + ModeCounts[2] * BytesMode2;
+				const int Total = PerFrame * Seq->NumFrames;
+				const int Delta = Seq->AO2CompressedAnimData.Num() - Total;
+				if (abs(Delta) <= 4096 || (BytesMode1 == 4 && BytesMode2 == 2) || (BytesMode1 == 2 && BytesMode2 == 2))
+				{
+					appPrintf("  extraBudget m1=%d m2=%d perFrame=%d total=%d delta=%d\n",
+						BytesMode1, BytesMode2, PerFrame, Total, Delta);
+				}
+			}
+		}
+	}
+
+	if (ModeTable > 0)
+	{
+		const int WordCount = ModeTable / 4;
+		for (int i = 0; i < min(WordCount, 48); i++)
+		{
+			const uint8* P = Extra.GetData() + i * 4;
+			appPrintf("  extraWord[%02d]=%08X (%d) bef=%g\n", i, ReadAO2BE32(P), ReadAO2BE32(P), ReadAO2BEFloat(P));
+		}
+	}
+
+	if (ModeTable >= 0)
+	{
+		const int PrintCount = min(ModeLen, 96);
+		for (int Pos = 0; Pos < PrintCount; Pos += 32)
+		{
+			appPrintf("  extraMode %04X:", ModeTable + Pos);
+			for (int i = 0; i < min(32, PrintCount - Pos); i++)
+				appPrintf(" %02X", Extra[ModeTable + Pos + i]);
+			appPrintf("\n");
+		}
+	}
+
+	if (ModeTable >= 0 && getenv("AO2_EXTRA_MAP_PROBE"))
+	{
+		int Printed = 0;
+		for (int TrackIndex = 0; TrackIndex < Seq->AO2CompressedTrackInfo.Num() / 6 && Printed < 48; TrackIndex++)
+		{
+			const int* Refs = &Seq->AO2CompressedTrackInfo[TrackIndex * 6];
+			for (int Slot = 0; Slot < 6 && Printed < 48; Slot++)
+			{
+				const int Ref = Refs[Slot];
+				if (Ref < 0 || Ref >= ModeLen)
+					continue;
+				appPrintf("  extraMap[%02d] track=%d slot=%d ref=%d mode=%d desc=%08X\n",
+					Printed, TrackIndex, Slot, Ref, Extra[ModeTable + Ref], GetAO2DescriptorWord(Seq, Ref));
+				Printed++;
+			}
+		}
+	}
+
+	unguard;
+}
+
+static void ProbeAO2TailSamples(const UAnimSequence* Seq, const UAnimSet* Owner, int NumTracks, int MaxRef)
+{
+	guard(ProbeAO2TailSamples);
+
+	if (!getenv("AO2_TAIL_PROBE"))
+		return;
+	if (Seq->NumFrames <= 0 || !Seq->AO2CompressionExtraData.Num() || !Seq->AO2CompressedAnimData.Num())
+		return;
+
+	const char* Filter = getenv("AO2_TAIL_SEQ");
+	if (Filter && Filter[0] && !strstr(*Seq->SequenceName, Filter))
+		return;
+
+	const TArray<uint8>& Extra = Seq->AO2CompressionExtraData;
+	const int ModeTable = FindAO2ExtraModeTable(Extra);
+	if (ModeTable < 0)
+		return;
+
+	int ModeLen = 0;
+	while (ModeTable + ModeLen < Extra.Num() && Extra[ModeTable + ModeLen] <= 2)
+		ModeLen++;
+	if (ModeLen <= 0)
+		return;
+
+	int ModeCounts[3] = { 0, 0, 0 };
+	for (int Ref = 0; Ref < ModeLen; Ref++)
+	{
+		const int Mode = Extra[ModeTable + Ref];
+		if (Mode >= 0 && Mode < ARRAY_COUNT(ModeCounts))
+			ModeCounts[Mode]++;
+	}
+	int MinPositiveRef = 0x7FFFFFFF;
+	for (int i = 0; i < Seq->AO2CompressedTrackInfo.Num(); i++)
+	{
+		const int Ref = Seq->AO2CompressedTrackInfo[i];
+		if (Ref >= 0)
+			MinPositiveRef = min(MinPositiveRef, Ref);
+	}
+	if (MinPositiveRef == 0x7FFFFFFF)
+		MinPositiveRef = 0;
+
+	appPrintf("AO2TAIL %s frames=%d animBytes=%d maxRef=%d modeTable=%d modeLen=%d modes=[%d,%d,%d]\n",
+		*Seq->SequenceName, Seq->NumFrames, Seq->AO2CompressedAnimData.Num(), MaxRef, ModeTable, ModeLen,
+		ModeCounts[0], ModeCounts[1], ModeCounts[2]);
+
+	const int PreferredM1 = GetAO2EnvInt("AO2_TAIL_M1", 0);
+	const int PreferredM2 = GetAO2EnvInt("AO2_TAIL_M2", 0);
+	const int ForcedRefBase = GetAO2EnvInt("AO2_TAIL_REF_BASE", -999999);
+	for (int BytesMode1 = 1; BytesMode1 <= 8; BytesMode1++)
+	{
+		if (PreferredM1 && BytesMode1 != PreferredM1)
+			continue;
+		for (int BytesMode2 = 1; BytesMode2 <= 8; BytesMode2++)
+		{
+			if (PreferredM2 && BytesMode2 != PreferredM2)
+				continue;
+
+			const int ModeBytes[3] = { 0, BytesMode1, BytesMode2 };
+			const int PerFrame = ModeCounts[1] * BytesMode1 + ModeCounts[2] * BytesMode2;
+			if (PerFrame <= 0)
+				continue;
+			const int Header = Seq->AO2CompressedAnimData.Num() - PerFrame * Seq->NumFrames;
+			if (Header < 0 || Header > 4096)
+				continue;
+			if ((Header & 1) && !PreferredM1 && !PreferredM2)
+				continue;
+
+			TArray<int> RefOffsets;
+			RefOffsets.Empty(ModeLen + 1);
+			RefOffsets.AddZeroed(ModeLen + 1);
+			for (int Ref = 0; Ref < ModeLen; Ref++)
+			{
+				const int Mode = Extra[ModeTable + Ref];
+				RefOffsets[Ref + 1] = RefOffsets[Ref] + ((Mode >= 0 && Mode < 3) ? ModeBytes[Mode] : 0);
+			}
+			if (RefOffsets[ModeLen] != PerFrame)
+				continue;
+
+			for (int BaseIndex = 0; BaseIndex < 3; BaseIndex++)
+			{
+				const int RefBase = (BaseIndex == 2) ? ForcedRefBase : (BaseIndex ? MinPositiveRef : 0);
+				if (BaseIndex == 2 && ForcedRefBase == -999999)
+					continue;
+				if (BaseIndex && RefBase == 0)
+					continue;
+
+				const int DescriptorOffset = GetAO2DescriptorOffset(Seq->CompressedByteStream);
+				for (int Layout = 0; Layout < 3; Layout++)
+				{
+					appPrintf("  tailLayout m1=%d m2=%d header=%d perFrame=%d end=%d refBase=%d order=%s\n",
+						BytesMode1, BytesMode2, Header, PerFrame, Header + PerFrame * Seq->NumFrames, RefBase,
+						(Layout == 2) ? "desc-bitstream" : (Layout ? "ref-major" : "frame-major"));
+					if (Layout == 2 && DescriptorOffset < 0)
+						continue;
+
+					int Printed = 0;
+					for (int TrackIndex = 0; TrackIndex < NumTracks && Printed < 18; TrackIndex++)
+					{
+						const int* Refs = &Seq->AO2CompressedTrackInfo[TrackIndex * 6 + 3];
+						for (int Axis = 0; Axis < 3 && Printed < 18; Axis++)
+						{
+							const int Ref = Refs[Axis];
+							const int ModeIndex = Ref - RefBase;
+							if (Ref < 0 || ModeIndex < 0 || ModeIndex >= ModeLen || Extra[ModeTable + ModeIndex] != 2)
+								continue;
+
+							const int ByteCount = ModeBytes[2];
+							const int FramesToRead = min(Seq->NumFrames, 64);
+							int MinBE16 = 0x7FFFFFFF, MaxBE16 = -0x7FFFFFFF;
+							int MinLE16 = 0x7FFFFFFF, MaxLE16 = -0x7FFFFFFF;
+							float MinBEF = 1e30f, MaxBEF = -1e30f;
+							float MinLEF = 1e30f, MaxLEF = -1e30f;
+							int Bad = 0;
+							char FirstBytes[32];
+							FirstBytes[0] = 0;
+
+							for (int FrameIndex = 0; FrameIndex < FramesToRead; FrameIndex++)
+							{
+								uint8 Temp[8];
+								const uint8* Data = NULL;
+								if (Layout == 2)
+								{
+									const int DescPos = DescriptorOffset + 24 + Ref * 8;
+									if (DescPos < 0 || DescPos + 4 > Seq->CompressedByteStream.Num() || ByteCount > 4)
+									{
+										Bad = 1;
+										break;
+									}
+									const int BitOffset = ReadAO2BE32(Seq->CompressedByteStream.GetData() + DescPos) + FrameIndex * ByteCount * 8;
+									const uint32 Packed = ReadAO2BitsMSB(Seq->AO2CompressedAnimData, BitOffset, ByteCount * 8);
+									for (int i = 0; i < ByteCount; i++)
+										Temp[i] = (Packed >> ((ByteCount - i - 1) * 8)) & 0xFF;
+									Data = Temp;
+								}
+								else
+								{
+									const int Offset = Layout
+										? Header + RefOffsets[ModeIndex] * Seq->NumFrames + FrameIndex * ByteCount
+										: Header + FrameIndex * PerFrame + RefOffsets[ModeIndex];
+									if (Offset < 0 || Offset + ByteCount > Seq->AO2CompressedAnimData.Num())
+									{
+										Bad = 1;
+										break;
+									}
+									Data = Seq->AO2CompressedAnimData.GetData() + Offset;
+								}
+								if (FrameIndex == 0)
+								{
+									char* Dst = FirstBytes;
+									for (int i = 0; i < ByteCount && i < 8; i++)
+									{
+										appSprintf(Dst, 32 - int(Dst - FirstBytes), "%02X", Data[i]);
+										Dst += 2;
+									}
+									*Dst = 0;
+								}
+								if (ByteCount >= 2)
+								{
+									const int BE16 = (int16)ReadAO2BE16(Data);
+									const int LE16 = (int16)ReadAO2LE16(Data);
+									MinBE16 = min(MinBE16, BE16); MaxBE16 = max(MaxBE16, BE16);
+									MinLE16 = min(MinLE16, LE16); MaxLE16 = max(MaxLE16, LE16);
+								}
+								if (ByteCount >= 4)
+								{
+									const float BEF = ReadAO2BEFloat(Data);
+									const float LEF = ReadAO2LEFloat(Data);
+									if (BEF == BEF && fabs(BEF) < 1e20f) { MinBEF = min(MinBEF, BEF); MaxBEF = max(MaxBEF, BEF); }
+									if (LEF == LEF && fabs(LEF) < 1e20f) { MinLEF = min(MinLEF, LEF); MaxLEF = max(MaxLEF, LEF); }
+								}
+							}
+
+							const char* TrackName = (Owner && TrackIndex < Owner->TrackBoneNames.Num()) ? *Owner->TrackBoneNames[TrackIndex] : "?";
+							appPrintf("    posRef track=%d(%s) axis=%d ref=%d modeIndex=%d first=%s bad=%d be16=[%d,%d] le16=[%d,%d] bef=[%g,%g] lef=[%g,%g]\n",
+								TrackIndex, TrackName, Axis, Ref, ModeIndex, FirstBytes, Bad, MinBE16, MaxBE16, MinLE16, MaxLE16,
+								MinBEF, MaxBEF, MinLEF, MaxLEF);
+							Printed++;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	unguard;
+}
+
+static void ProbeAO2DescriptorTable(const UAnimSequence* Seq, int MaxRef)
+{
+	guard(ProbeAO2DescriptorTable);
+
+	if (!getenv("AO2_DESC_TABLE_PROBE"))
+		return;
+	if (MaxRef < 0 || Seq->CompressedByteStream.Num() < 0x20)
+		return;
+
+	const int DescriptorOffset = ReadAO2BE32(Seq->CompressedByteStream.GetData() + 0x10);
+	const int DescriptorCount = (Seq->CompressedByteStream.Num() - DescriptorOffset) / 4;
+	appPrintf("AO2DESCTABLE %s descOffset=%X descCount=%d maxRef=%d animBytes=%d animBits=%d\n",
+		*Seq->SequenceName, DescriptorOffset, DescriptorCount, MaxRef, Seq->AO2CompressedAnimData.Num(), Seq->AO2CompressedAnimData.Num() * 8);
+
+	if (Seq->AO2CompressedTrackInfo.Num() >= 6)
+	{
+		const int* RootRefs = &Seq->AO2CompressedTrackInfo[0];
+		for (int Slot = 0; Slot < 6; Slot++)
+		{
+			const int Ref = RootRefs[Slot];
+			if (Ref >= 0)
+			{
+				const uint32 Word = GetAO2DescriptorWord(Seq, Ref);
+				appPrintf("  rootSlot%d ref=%d desc=%08X hi=%04X lo=%04X bit0=%d bit1=%d masked30=%d masked28=%d bef=%g\n",
+					Slot, Ref, Word, Word >> 16, Word & 0xFFFF, Word & 1, (Word >> 1) & 1,
+					Word & 0x3FFFFFFF, Word & 0x0FFFFFFF, ReadAO2BEFloat(Seq->CompressedByteStream.GetData() + DescriptorOffset + Ref * 4));
+			}
+			else
+			{
+				appPrintf("  rootSlot%d ref=%d constant=%g\n", Slot, Ref, GetAO2Constant(Seq->CompressedByteStream, Ref));
+			}
+		}
+	}
+
+	const int PrintCount = min(MaxRef + 1, 32);
+	for (int Ref = 0; Ref < PrintCount; Ref++)
+	{
+		const uint32 Word = GetAO2DescriptorWord(Seq, Ref);
+		appPrintf("  desc[%d]=%08X hi=%04X lo=%04X bits01=%d%d masked30=%d masked28=%d bef=%g\n",
+			Ref, Word, Word >> 16, Word & 0xFFFF, (Word >> 1) & 1, Word & 1,
+			Word & 0x3FFFFFFF, Word & 0x0FFFFFFF, ReadAO2BEFloat(Seq->CompressedByteStream.GetData() + DescriptorOffset + Ref * 4));
+	}
+
+	unguard;
+}
+
+static void DumpAO2StructDebug(const UAnimSequence* Seq, const UAnimSet* Owner)
+{
+	guard(DumpAO2StructDebug);
+
+	if (!getenv("AO2_STRUCT_DEBUG"))
+		return;
+
+	const int NumTracks = Owner ? Owner->TrackBoneNames.Num() : 0;
+	const int TrackRows = Seq->AO2CompressedTrackInfo.Num() / 6;
+	appPrintf("AO2STRUCT %s/%s frames=%d length=%g rateScale=%g ownerTracks=%d trackRows=%d trackInts=%d constBytes=%d animBytes=%d\n",
+		Owner ? Owner->Name : "?", *Seq->SequenceName, Seq->NumFrames, Seq->SequenceLength, Seq->RateScale,
+		NumTracks, TrackRows, Seq->AO2CompressedTrackInfo.Num(), Seq->CompressedByteStream.Num(), Seq->AO2CompressedAnimData.Num());
+
+	if (Seq->AO2CompressionHeader.Num())
+	{
+		appPrintf("  header:");
+		for (int i = 0; i < Seq->AO2CompressionHeader.Num(); i++)
+			appPrintf(" h%02d=%d", i, Seq->AO2CompressionHeader[i]);
+		appPrintf("\n");
+
+		if (Seq->AO2CompressionHeader.Num() >= 21)
+		{
+			const int ExpectedTrackBytes = Seq->AO2CompressionHeader[20] * 4;
+			const int ByteStreamOffset = 0x54 + ExpectedTrackBytes;
+			appPrintf("  layout dataSizeFields: trackCount=%d trackBytes=%d byteStreamOffset=%X byteStreamSize(h18)=%d tableA(h14)=%d tableB(h16)=%d\n",
+				Seq->AO2CompressionHeader[20], ExpectedTrackBytes, ByteStreamOffset, Seq->AO2CompressionHeader[18],
+				Seq->AO2CompressionHeader[14], Seq->AO2CompressionHeader[16]);
+		}
+	}
+
+	int MinRef = 0;
+	int MaxRef = -1;
+	int PosRefs = 0;
+	int NegRefs = 0;
+	int ZeroRefs = 0;
+	int SlotPos[6] = { 0, 0, 0, 0, 0, 0 };
+	int SlotNeg[6] = { 0, 0, 0, 0, 0, 0 };
+	int SlotMin[6] = { 0, 0, 0, 0, 0, 0 };
+	int SlotMax[6] = { -1, -1, -1, -1, -1, -1 };
+	for (int i = 0; i < Seq->AO2CompressedTrackInfo.Num(); i++)
+	{
+		const int Ref = Seq->AO2CompressedTrackInfo[i];
+		const int Slot = i % 6;
+		if (Ref >= 0)
+		{
+			PosRefs++;
+			if (Ref == 0)
+				ZeroRefs++;
+			MaxRef = max(MaxRef, Ref);
+			SlotPos[Slot]++;
+			SlotMax[Slot] = max(SlotMax[Slot], Ref);
+		}
+		else
+		{
+			NegRefs++;
+			MinRef = min(MinRef, Ref);
+			SlotNeg[Slot]++;
+			SlotMin[Slot] = min(SlotMin[Slot], Ref);
+		}
+	}
+	appPrintf("  refs pos=%d neg=%d zero=%d min=%d max=%d animatedComponentGuess=%d\n",
+		PosRefs, NegRefs, ZeroRefs, MinRef, MaxRef, MaxRef + 1);
+	AnalyzeAO2NativeBlock(Seq, MaxRef, PosRefs, NegRefs, SlotPos, SlotNeg);
+	ProbeAO2DescriptorTable(Seq, MaxRef);
+	ProbeAO2CompressionExtra(Seq, MaxRef);
+	for (int Slot = 0; Slot < 6; Slot++)
+		appPrintf("  slot%d pos=%d neg=%d min=%d max=%d\n", Slot, SlotPos[Slot], SlotNeg[Slot], SlotMin[Slot], SlotMax[Slot]);
+
+	if (MaxRef >= 0 && MaxRef < 0x20000)
+	{
+		TArray<int> UseCount;
+		UseCount.Empty(MaxRef + 1);
+		UseCount.AddZeroed(MaxRef + 1);
+		for (int i = 0; i < Seq->AO2CompressedTrackInfo.Num(); i++)
+		{
+			const int Ref = Seq->AO2CompressedTrackInfo[i];
+			if (Ref >= 0 && Ref <= MaxRef)
+				UseCount[Ref]++;
+		}
+		int Missing = 0;
+		int Duplicated = 0;
+		for (int i = 0; i <= MaxRef; i++)
+		{
+			if (!UseCount[i])
+				Missing++;
+			else if (UseCount[i] > 1)
+				Duplicated++;
+		}
+		appPrintf("  positiveRefRange count=%d missing=%d duplicatedRefs=%d\n", MaxRef + 1, Missing, Duplicated);
+	}
+
+	if (Seq->CompressedByteStream.Num() >= 0x20)
+	{
+		AnalyzeAO2ConstantStream(Seq, NegRefs);
+	}
+
+	const int StreamPreview = min(Seq->CompressedByteStream.Num(), 0x60);
+	for (int Pos = 0; Pos < StreamPreview; Pos += 16)
+	{
+		appPrintf("  stream %04X:", Pos);
+		for (int i = 0; i < min(16, StreamPreview - Pos); i++)
+			appPrintf(" %02X", Seq->CompressedByteStream[Pos + i]);
+		appPrintf("\n");
+	}
+	const int AnimPreview = min(Seq->AO2CompressedAnimData.Num(), 0x60);
+	for (int Pos = 0; Pos < AnimPreview; Pos += 16)
+	{
+		appPrintf("  anim %04X:", Pos);
+		for (int i = 0; i < min(16, AnimPreview - Pos); i++)
+			appPrintf(" %02X", Seq->AO2CompressedAnimData[Pos + i]);
+		appPrintf("\n");
+	}
+
+	unguard;
+}
+
+bool UAnimSequence::DecodeAO2Anims(CAnimSequence *Dst, UAnimSet *Owner) const
+{
+	guard(UAnimSequence::DecodeAO2Anims);
+
+	static const CVec3 nullVec  = { 0, 0, 0 };
+	static const CQuat nullQuat = { 0, 0, 0, 1 };
+
+	const int NumTracks = Owner->TrackBoneNames.Num();
+	DumpAO2StructDebug(this, Owner);
+	if (AO2CompressedTrackInfo.Num() != NumTracks * 6)
+		return false;
+
+	Dst->Tracks.Empty(NumTracks);
+
+	int MaxAnimatedRef = -1;
+	int MinConstantRef = 0;
+	for (int i = 0; i < AO2CompressedTrackInfo.Num(); i++)
+	{
+		const int Ref = AO2CompressedTrackInfo[i];
+		if (Ref >= 0)
+			MaxAnimatedRef = max(MaxAnimatedRef, Ref);
+		else
+			MinConstantRef = min(MinConstantRef, Ref);
+	}
+
+	const int AnimatedComponents = MaxAnimatedRef + 1;
+	int AnimatedHeader = GetAO2AutoAnimatedHeader(AO2CompressedAnimData, NumFrames, AnimatedComponents);
+	ProbeAO2DescriptorTable(this, MaxAnimatedRef);
+	ProbeAO2RootMotionTracks(this, NumTracks, AnimatedComponents, AnimatedHeader);
+	ProbeAO2MotionCandidates(this, Owner, NumTracks, AnimatedComponents, AnimatedHeader);
+	ProbeAO2TailSamples(this, Owner, NumTracks, MaxAnimatedRef);
+
+	const int SampleMode = GetAO2EnvInt("AO2_SAMPLE_MODE", 0);
+	const int RotMode = GetAO2EnvInt("AO2_ROT_MODE", 0);
+	const int DescriptorOffset = GetAO2DescriptorOffset(CompressedByteStream);
+	const int DescriptorSkip = GetAO2EnvInt("AO2_DESC_SKIP", 24);
+	const int HeaderOverride = GetAO2EnvInt("AO2_ANIM_OFFSET", -1);
+	if (HeaderOverride >= 0)
+		AnimatedHeader = HeaderOverride;
+
+	if (getenv("AO2_ANIM_DEBUG"))
+		appPrintf("AO2 decode %s: tracks=%d frames=%d refs animated=%d const=%d animBytes=%d header=%d flat16=%d sampleMode=%d rotMode=%d\n",
+			Name, NumTracks, NumFrames, AnimatedComponents, -MinConstantRef, AO2CompressedAnimData.Num(), AnimatedHeader,
+			AnimatedComponents * NumFrames * 2, SampleMode, RotMode);
+	if (getenv("AO2_ANIM_DEBUG") && DescriptorOffset >= 0)
+		appPrintf("  ao2descriptor offset=%X skip=%d count=%d\n", DescriptorOffset, DescriptorSkip, (CompressedByteStream.Num() - DescriptorOffset - DescriptorSkip) / GetAO2EnvInt("AO2_DESC_STRIDE", 8));
+	if (getenv("AO2_DESC_DEBUG") && DescriptorOffset >= 0)
+	{
+		const int DescCount = (CompressedByteStream.Num() - DescriptorOffset) / 4;
+		const int PrintCount = min(DescCount, min(AnimatedComponents, 24));
+		const int PairCount = max(0, (CompressedByteStream.Num() - DescriptorOffset - 24) / 8);
+		appPrintf("  ao2descShape direct4=%d skip24pair8=%d animatedRefs=%d\n", DescCount, PairCount, AnimatedComponents);
+		for (int RefIndex = 0; RefIndex < PrintCount; RefIndex++)
+		{
+			const uint8* D = CompressedByteStream.GetData() + DescriptorOffset + RefIndex * 4;
+			const uint32 BE = ReadAO2BE32(D);
+			const uint32 LE = ReadAO2LE32(D);
+			appPrintf("  ao2descRef[%d] bytes=%02X %02X %02X %02X be=%08X le=%08X bef=%g lef=%g lo16=%u hi16=%u lo15=%u hi17=%u\n",
+				RefIndex, D[0], D[1], D[2], D[3], BE, LE, ReadAO2BEFloat(D), ReadAO2LEFloat(D),
+				BE & 0xFFFF, BE >> 16, BE & 0x7FFF, BE >> 15);
+		}
+	}
+
+	if (getenv("AO2_ANIM_SCAN"))
+	{
+		const int NeededBytes = AnimatedComponents * NumFrames * 2;
+		const int MaxScan = max(0, min(AO2CompressedAnimData.Num() - NeededBytes, 0x800));
+		for (int Mode = 0; Mode < 16; Mode++)
+		{
+			float BestScore = 1e30f;
+			int BestOffset = 0;
+			for (int Offset = 0; Offset < MaxScan; Offset += 2)
+			{
+				const float Score = ScoreAO2AnimatedOffset(AO2CompressedAnimData, AO2CompressedTrackInfo, NumTracks, NumFrames, AnimatedComponents, Offset, Mode);
+				if (Score < BestScore)
+				{
+					BestScore = Score;
+					BestOffset = Offset;
+				}
+			}
+			appPrintf("  ao2scan %s mode=%d bestOffset=%d score=%g\n", Name, Mode, BestOffset, BestScore);
+		}
+	}
+
+	for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+	{
+		CAnimTrack *A = new CAnimTrack;
+		Dst->Tracks.Add(A);
+
+		const int* Refs = &AO2CompressedTrackInfo[TrackIndex * 6];
+		A->KeyQuat.Empty(NumFrames);
+		A->KeyPos.Empty(NumFrames);
+
+		for (int FrameIndex = 0; FrameIndex < NumFrames; FrameIndex++)
+		{
+			float V[6];
+			for (int ComponentIndex = 0; ComponentIndex < 6; ComponentIndex++)
+			{
+				const int Ref = Refs[ComponentIndex];
+				if (Ref < 0)
+				{
+					V[ComponentIndex] = GetAO2Constant(CompressedByteStream, Ref);
+				}
+				else
+				{
+					V[ComponentIndex] = GetAO2AnimatedValueForMode(AO2CompressedAnimData, CompressedByteStream, DescriptorOffset, DescriptorSkip, Ref, FrameIndex, NumFrames, AnimatedComponents, AnimatedHeader, SampleMode);
+				}
+			}
+
+			FQuat Q;
+			BuildAO2Quat(V, RotMode, Q);
+			if (getenv("AO2_ANIM_DEBUG_VALUES") && TrackIndex < 4 && FrameIndex < 4)
+				appPrintf("  ao2val track=%d frame=%d raw=(%g %g %g | %g %g %g) quat=(%g %g %g %g)\n",
+					TrackIndex, FrameIndex, V[0], V[1], V[2], V[3], V[4], V[5], Q.X, Q.Y, Q.Z, Q.W);
+			A->KeyQuat.Add(CVT(Q));
+
+			CVec3 Pos;
+			Pos.Set(V[3], V[4], V[5]);
+			A->KeyPos.Add(Pos);
+		}
+
+		if (!A->KeyQuat.Num())
+			A->KeyQuat.Add(nullQuat);
+		if (!A->KeyPos.Num())
+			A->KeyPos.Add(nullVec);
+	}
+
+	return true;
+
+	unguard;
+}
+#endif // ARMYOF2
+
+#if R6VEGAS
+
+static uint16 R6V2ReadU16(const uint8* Data)
+{
+	return Data[0] | (Data[1] << 8);
+}
+
+static int16 R6V2ReadS16(const uint8* Data)
+{
+	return (int16)R6V2ReadU16(Data);
+}
+
+static uint32 R6V2ReadU32(const uint8* Data)
+{
+	return Data[0] | (Data[1] << 8) | (Data[2] << 16) | (Data[3] << 24);
+}
+
+static bool R6V2FindTrackHeader(const uint8* Data, int DataSize, int& Pos, int NumFrames)
+{
+	const int StartPos = Pos;
+	const int MaxProbe = min(32, DataSize - StartPos - 8);
+	for (int Probe = 0; Probe <= MaxProbe; Probe += 4)
+	{
+		const int TestPos = StartPos + Probe;
+		const uint16 TransCount = R6V2ReadU16(Data + TestPos);
+		const uint16 RotCount   = R6V2ReadU16(Data + TestPos + 2);
+		const uint32 TransSize  = R6V2ReadU32(Data + TestPos + 4);
+
+		if (TransCount > max(NumFrames * 2, 1) && TransCount != 0xFFFF)
+			continue;
+		if (RotCount > max(NumFrames * 2, 1) && RotCount != 0xFFFF)
+			continue;
+		if (TransSize > (uint32)(DataSize - TestPos - 8))
+			continue;
+		if (TransSize % 6)
+			continue;
+		if (TransSize > 0x4000)
+			continue;
+
+		Pos = TestPos;
+		return true;
+	}
+	return false;
+}
+
+static bool R6V2ShouldUseTranslationTrack(const UAnimSet* Owner, int TrackIndex)
+{
+	if (TrackIndex == 0)
+		return true;
+	if (!Owner->bAnimRotationOnly)
+		return true;
+	if (!Owner->TrackBoneNames.IsValidIndex(TrackIndex))
+		return false;
+
+	const FName BoneName = Owner->TrackBoneNames[TrackIndex];
+	for (int i = 0; i < Owner->UseTranslationBoneNames.Num(); i++)
+		if (Owner->UseTranslationBoneNames[i] == BoneName)
+			return true;
+	for (int i = 0; i < Owner->ForceMeshTranslationBoneNames.Num(); i++)
+		if (Owner->ForceMeshTranslationBoneNames[i] == BoneName)
+			return false;
+	return false;
+}
+
+bool UAnimSequence::DecodeR6V2Anims(CAnimSequence *Dst, UAnimSet *Owner) const
+{
+	guard(UAnimSequence::DecodeR6V2Anims);
+
+	const int NumTracks = Owner->TrackBoneNames.Num();
+	const uint8* Data = CompressedByteStream.GetData();
+	const int DataSize = CompressedByteStream.Num();
+	if (!Data || DataSize < 32 || NumTracks <= 0)
+		return false;
+
+	int Pos = 0;
+	if (DataSize >= 8 && R6V2ReadU32(Data + 4) == (uint32)NumTracks)
+		Pos += 4;	// native block starts with an absolute package/file pointer
+
+	const int TrackCount = R6V2ReadU32(Data + Pos);
+	if (TrackCount != NumTracks)
+	{
+		appNotify("R6V2 AnimSequence %s/%s has %d native tracks, expected %d",
+			Owner->Name, *SequenceName, TrackCount, NumTracks);
+		return false;
+	}
+
+	Pos += 4;
+	Pos += 20;		// zero/flags header seen before the per-track blocks
+
+	Dst->Tracks.Empty(NumTracks);
+	static const CVec3 nullVec = { 0, 0, 0 };
+	static const CQuat nullQuat = { 0, 0, 0, 1 };
+
+	for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+	{
+		if (!R6V2FindTrackHeader(Data, DataSize, Pos, max(m_iOriginalNbFrames, NumFrames)))
+			return false;
+		if (Pos + 8 > DataSize)
+			return false;
+
+		uint16 StoredTransKeys = R6V2ReadU16(Data + Pos);
+		uint16 StoredRotKeys   = R6V2ReadU16(Data + Pos + 2);
+		uint32 TransSize       = R6V2ReadU32(Data + Pos + 4);
+		Pos += 8;
+
+		if (TransSize > (uint32)(DataSize - Pos))
+			return false;
+
+		CAnimTrack *A = new CAnimTrack;
+		Dst->Tracks.Add(A);
+
+		const int TransKeys = TransSize / 6;
+		const bool UseTranslation = R6V2ShouldUseTranslationTrack(Owner, TrackIndex);
+		if (UseTranslation && TransKeys > 0 && TransSize == (uint32)(TransKeys * 6))
+		{
+			A->KeyPos.Empty(TransKeys);
+			for (int KeyIndex = 0; KeyIndex < TransKeys; KeyIndex++)
+			{
+				const uint8* Key = Data + Pos + KeyIndex * 6;
+				CVec3 V;
+				V[0] = R6V2ReadS16(Key    ) / 64.0f;
+				V[1] = R6V2ReadS16(Key + 2) / 64.0f;
+				V[2] = R6V2ReadS16(Key + 4) / 64.0f;
+				A->KeyPos.Add(V);
+			}
+		}
+		Pos += TransSize;
+		Pos = Align(Pos, 4);
+		if (Pos > DataSize)
+			return false;
+
+		if (Pos + 4 > DataSize)
+			return false;
+
+		uint32 RotSize = R6V2ReadU32(Data + Pos);
+		Pos += 4;
+		if (RotSize > (uint32)(DataSize - Pos))
+			return false;
+
+		const int RotKeys = RotSize / 6;
+		if (RotKeys > 0 && RotSize == (uint32)(RotKeys * 6))
+		{
+			A->KeyQuat.Empty(RotKeys);
+			for (int KeyIndex = 0; KeyIndex < RotKeys; KeyIndex++)
+			{
+				const uint8* Key = Data + Pos + KeyIndex * 6;
+				FQuatFixed48NoW Q;
+				Q.X = R6V2ReadU16(Key);
+				Q.Y = R6V2ReadU16(Key + 2);
+				Q.Z = R6V2ReadU16(Key + 4);
+				FQuat Q2 = Q;
+				A->KeyQuat.Add(CVT(Q2));
+			}
+		}
+		else if (RotSize == 0)
+		{
+			// Leave the rotation empty so the bind pose is used. This mirrors
+			// the meaning of a missing track better than forcing identity.
+		}
+		Pos += RotSize;
+		Pos = Align(Pos, 4);
+		if (Pos > DataSize)
+			return false;
+
+		if (getenv("R6V2_ANIM_DEBUG") && TrackIndex < 6)
+		{
+			appPrintf("  r6v2 track[%d] pos=%X stored=%d/%d transBytes=%d rotBytes=%d keys=%d/%d\n",
+				TrackIndex, Pos, StoredTransKeys, StoredRotKeys, TransSize, RotSize, A->KeyPos.Num(), A->KeyQuat.Num());
+		}
+	}
+
+	return true;
+
+	unguard;
+}
+
+#endif // R6VEGAS
 
 
 static void ReadTimeArray(FArchive &Ar, int NumKeys, TArray<float> &Times, int NumFrames)
@@ -532,6 +2412,141 @@ bool UAnimSequence::DecodeTrans3Anims(CAnimSequence *Dst, UAnimSet *Owner) const
 #endif // TRANSFORMERS
 
 
+#if FIRSTASSAULT
+
+static uint32 SWFAReadBE32(const uint8* Data)
+{
+	return (Data[0] << 24) | (Data[1] << 16) | (Data[2] << 8) | Data[3];
+}
+
+static uint16 SWFAReadBE16(const uint8* Data)
+{
+	return (Data[0] << 8) | Data[1];
+}
+
+static int SWFASignExtend(uint32 Value, int Bits)
+{
+	const uint32 Mask = 1u << (Bits - 1);
+	return (int)((Value ^ Mask) - Mask);
+}
+
+static CQuat SWFADecodeQuat32(uint32 Packed)
+{
+	// EdgeAnim stores 32-bit "smallest three" quaternions. A zero word decodes
+	// to identity: W is omitted and XYZ are zero.
+	const int Missing = Packed >> 30;
+	const float Scale = 0.7071067811865475f / 511.0f;
+	float Stored[3];
+	Stored[0] = SWFASignExtend((Packed >> 20) & 0x3FF, 10) * Scale;
+	Stored[1] = SWFASignExtend((Packed >> 10) & 0x3FF, 10) * Scale;
+	Stored[2] = SWFASignExtend( Packed        & 0x3FF, 10) * Scale;
+
+	float Components[4];
+	int StoredIndex = 0;
+	float Sum = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		if (i == Missing)
+			continue;
+		Components[i] = Stored[StoredIndex++];
+		Sum += Components[i] * Components[i];
+	}
+	Components[Missing] = sqrt(max(0.0f, 1.0f - Sum));
+
+	CQuat Q;
+	Q.X = Components[0];
+	Q.Y = Components[1];
+	Q.Z = Components[2];
+	Q.W = Components[3];
+	return Q;
+}
+
+static bool SWFAIsEdgeAnimStream(const TArray<uint8>& Data)
+{
+	return Data.Num() >= 4 && Data[0] == 'E' && Data[1] == 'A' && Data[2] == '0' && Data[3] == '5';
+}
+
+bool UAnimSequence::DecodeSWFAAnims(CAnimSequence *Dst, UAnimSet *Owner) const
+{
+	guard(UAnimSequence::DecodeSWFAAnims);
+
+	if (!SWFAIsEdgeAnimStream(CompressedByteStream))
+		return false;
+
+	const int NumTracks = Owner->TrackBoneNames.Num();
+	if (NumTracks <= 0)
+		return false;
+
+	static const CVec3 nullVec  = { 0, 0, 0 };
+	static const CQuat nullQuat = { 0, 0, 0, 1 };
+
+	Dst->Tracks.Empty(NumTracks);
+	for (int TrackIndex = 0; TrackIndex < NumTracks; TrackIndex++)
+	{
+		CAnimTrack *A = new CAnimTrack;
+		Dst->Tracks.Add(A);
+		A->KeyPos.Add(nullVec);
+		A->KeyQuat.Add(nullQuat);
+	}
+
+	const uint8* Data = CompressedByteStream.GetData();
+	const int StaticRotCount = SWFAReadBE16(Data + 0x16);
+	const int StaticTransCount = SWFAReadBE16(Data + 0x18);
+	const int AnimatedRotCount = SWFAReadBE16(Data + 0x1E);
+	const int AnimatedTransCount = SWFAReadBE16(Data + 0x20);
+	int TablePos = 0x60;
+	const int StaticRotTable = TablePos;
+	TablePos += StaticRotCount * 2;
+	TablePos += StaticTransCount * 2;
+	if (AnimatedRotCount || AnimatedTransCount)
+		TablePos = Align(TablePos, 16);
+	const int AnimatedRotTable = TablePos;
+	TablePos += AnimatedRotCount * 2;
+	TablePos += AnimatedTransCount * 2;
+	const int StaticRotData = Align(TablePos, 16);
+
+	if (StaticRotCount >= 0 && StaticRotData + StaticRotCount * 4 <= CompressedByteStream.Num())
+	{
+		for (int i = 0; i < StaticRotCount; i++)
+		{
+			const int TrackIndex = SWFAReadBE16(Data + StaticRotTable + i * 2);
+			if (TrackIndex < 0 || TrackIndex >= Dst->Tracks.Num())
+				continue;
+			CAnimTrack* A = Dst->Tracks[TrackIndex];
+			A->KeyQuat.Empty(1);
+			A->KeyQuat.Add(SWFADecodeQuat32(SWFAReadBE32(Data + StaticRotData + i * 4)));
+		}
+	}
+
+	const int AnimatedRotData = SWFAReadBE32(Data + 0x5C);
+	const int MinAnimatedRotData = StaticRotData + StaticRotCount * 4;
+	if (AnimatedRotCount > 0 && AnimatedRotData >= MinAnimatedRotData && AnimatedRotData + AnimatedRotCount * 4 <= CompressedByteStream.Num())
+	{
+		for (int i = 0; i < AnimatedRotCount; i++)
+		{
+			const int TrackIndex = SWFAReadBE16(Data + AnimatedRotTable + i * 2);
+			if (TrackIndex < 0 || TrackIndex >= Dst->Tracks.Num())
+				continue;
+			CAnimTrack* A = Dst->Tracks[TrackIndex];
+			A->KeyQuat.Empty(1);
+			A->KeyQuat.Add(SWFADecodeQuat32(SWFAReadBE32(Data + AnimatedRotData + i * 4)));
+		}
+	}
+
+	if (getenv("SWFA_ANIM_DEBUG"))
+	{
+		appPrintf("SWFA EdgeAnim %s/%s: stream=%d hdr0=%08X hdr1=%08X tracks=%d frames=%d staticRot=%d staticTrans=%d animRot=%d animTrans=%d staticRotData=%X animRotData=%X\n",
+			Owner->Name, *SequenceName, CompressedByteStream.Num(), SWFAReadBE32(Data + 4), SWFAReadBE32(Data + 8), NumTracks, NumFrames,
+			StaticRotCount, StaticTransCount, AnimatedRotCount, AnimatedTransCount, StaticRotData, AnimatedRotData);
+	}
+
+	return true;
+	unguard;
+}
+
+#endif // FIRSTASSAULT
+
+
 #if BLADENSOUL
 
 void ReadBnS_ZOnlyRLE(FArchive& Reader, int RotKeys, CAnimTrack* A)
@@ -749,6 +2764,69 @@ void UAnimSet::ConvertAnims()
 			continue;
 		}
 #endif // BATMAN
+#if R6VEGAS
+		if (ArGame == GAME_R6Vegas2 && Seq->CompressedByteStream.Num())
+		{
+			CAnimSequence *Dst = new CAnimSequence(Seq);
+			Dst->Name      = Seq->SequenceName;
+			Dst->NumFrames = Seq->NumFrames;
+			Dst->Rate      = Seq->SequenceLength ? Seq->NumFrames / Seq->SequenceLength * Seq->RateScale : 30.0f;
+			Dst->bAdditive = Seq->bIsAdditive;
+
+			if (Seq->DecodeR6V2Anims(Dst, this))
+			{
+				AnimSet->Sequences.Add(Dst);
+			}
+			else
+			{
+				delete Dst;
+			}
+			continue;
+		}
+#endif // R6VEGAS
+#if FIRSTASSAULT
+		if (ArGame == GAME_FirstAssault && Seq->CompressedByteStream.Num())
+		{
+			CAnimSequence *Dst = new CAnimSequence(Seq);
+			Dst->Name      = Seq->SequenceName;
+			Dst->NumFrames = Seq->NumFrames;
+			Dst->Rate      = Seq->SequenceLength ? Seq->NumFrames / Seq->SequenceLength * Seq->RateScale : 30.0f;
+			Dst->bAdditive = Seq->bIsAdditive;
+
+			if (Seq->DecodeSWFAAnims(Dst, this))
+			{
+				AnimSet->Sequences.Add(Dst);
+			}
+			else
+			{
+				delete Dst;
+			}
+			continue;
+		}
+#endif // FIRSTASSAULT
+#if ARMYOF2
+		if (ArGame == GAME_ArmyOf2 && Seq->AO2CompressedTrackInfo.Num() == NumTracks * 6)
+		{
+			CAnimSequence *Dst = new CAnimSequence(Seq);
+			Dst->Name      = Seq->SequenceName;
+			Dst->NumFrames = Seq->NumFrames;
+			Dst->Rate      = Seq->SequenceLength ? Seq->NumFrames / Seq->SequenceLength * Seq->RateScale : 30.0f;
+			Dst->bAdditive = Seq->bIsAdditive;
+
+			if (Seq->DecodeAO2Anims(Dst, this))
+			{
+				AnimSet->Sequences.Add(Dst);
+				if (getenv("AO2_ANIM_DEBUG"))
+					appPrintf("AO2 AnimSequence %s/%s: decoded %d track refs, %d constant bytes, %d animated bytes\n",
+						Name, *Seq->SequenceName, Seq->AO2CompressedTrackInfo.Num(), Seq->CompressedByteStream.Num(), Seq->AO2CompressedAnimData.Num());
+			}
+			else
+			{
+				delete Dst;
+			}
+			continue;
+		}
+#endif // ARMYOF2
 		// some checks
 		int offsetsPerBone = 4;
 		if (Seq->KeyEncodingFormat == AKF_PerTrackCompression)
