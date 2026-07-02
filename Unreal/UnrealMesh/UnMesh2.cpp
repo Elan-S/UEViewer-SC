@@ -5136,14 +5136,24 @@ static int FindSCCTBoneByName(const TArray<FMeshBone> &Bones, const char *Name)
 	return -1;
 }
 
+static bool SCCTPaletteContainsBone(const FSCCTBonePalette &Palette, int BoneIndex)
+{
+	if (BoneIndex < 0)
+		return false;
+	for (int Local = 0; Local < 256; Local++)
+		if (Palette.Map[Local] == BoneIndex)
+			return true;
+	return false;
+}
+
 static void FixSCCTLeadingBonePaletteEntry(TArray<FSCCTBonePalette> &Palettes, const TArray<FMeshBone> &Bones, const char *MeshName)
 {
 	guard(FixSCCTLeadingBonePaletteEntry);
-	if (stricmp(MeshName, "COOP_Player") && stricmp(MeshName, "NPCA"))
-		return;
 	int Spine2Bone = FindSCCTBoneByName(Bones, "B Spine2");
 	if (Spine2Bone < 0)
 		return;
+	int LeftClavicleBone = FindSCCTBoneByName(Bones, "B L Clavicle");
+	int RightClavicleBone = FindSCCTBoneByName(Bones, "B R Clavicle");
 	for (int PaletteIndex = 0; PaletteIndex < Palettes.Num(); PaletteIndex++)
 	{
 		FSCCTBonePalette &P = Palettes[PaletteIndex];
@@ -5151,8 +5161,11 @@ static void FixSCCTLeadingBonePaletteEntry(TArray<FSCCTBonePalette> &Palettes, c
 			continue;
 		if (!IsSCCTBoneNameLike(Bones, P.Map[0], "Finger"))
 			continue;
-		if (!IsSCCTBoneNameLike(Bones, P.Map[1], "Spine") &&
-			!IsSCCTBoneNameLike(Bones, P.Map[1], "Clavicle"))
+		const bool bTorsoSecond = IsSCCTBoneNameLike(Bones, P.Map[1], "Spine") ||
+			IsSCCTBoneNameLike(Bones, P.Map[1], "Clavicle");
+		const bool bHasBothClavicles = SCCTPaletteContainsBone(P, LeftClavicleBone) &&
+			SCCTPaletteContainsBone(P, RightClavicleBone);
+		if (!bTorsoSecond && !bHasBothClavicles)
 		{
 			continue;
 		}
