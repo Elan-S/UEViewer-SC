@@ -1376,6 +1376,39 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 	MoveRawKeyCounts.Empty(SeqCount);
 	TArray<int> MoveRawFrameSpans;
 	MoveRawFrameSpans.Empty(SeqCount);
+	auto CopySCCTAnalogTrack = [](AnalogTrack &Dst, const AnalogTrack &Src)
+	{
+		Dst.Flags = Src.Flags;
+		CopyArray(Dst.KeyPos, Src.KeyPos);
+		CopyArray(Dst.KeyQuat, Src.KeyQuat);
+		CopyArray(Dst.KeyTime, Src.KeyTime);
+	};
+	auto CopySCCTMotionChunk = [&](MotionChunk &Dst, const MotionChunk &Src)
+	{
+		Dst.RootSpeed3D = Src.RootSpeed3D;
+		Dst.TrackTime = Src.TrackTime;
+		Dst.StartBone = Src.StartBone;
+		Dst.Flags = Src.Flags;
+		CopyArray(Dst.BoneIndices, Src.BoneIndices);
+		Dst.AnimTracks.Empty(Src.AnimTracks.Num());
+		Dst.AnimTracks.AddZeroed(Src.AnimTracks.Num());
+		for (int TrackIndex = 0; TrackIndex < Src.AnimTracks.Num(); TrackIndex++)
+			CopySCCTAnalogTrack(Dst.AnimTracks[TrackIndex], Src.AnimTracks[TrackIndex]);
+		CopySCCTAnalogTrack(Dst.RootTrack, Src.RootTrack);
+	};
+	auto MergeSCCTRootCompanion = [&](MotionChunk &Dst, const MotionChunk &RootSrc)
+	{
+		if (!RootSrc.AnimTracks.Num() || !Dst.AnimTracks.Num())
+			return;
+		// In SCCT NPC sets these bare root-only blocks are companion timing records.
+		// Their translation payload is not in the same space as the compressed
+		// full-body root track, so keep the real root transform from Dst.
+		Dst.TrackTime = max(Dst.TrackTime, RootSrc.TrackTime);
+	};
+	MotionChunk PendingRootCompanion;
+	int PendingRootKeyCount = 1;
+	int PendingRootFrameSpan = 1;
+	bool bHasPendingRootCompanion = false;
 	int TotalTracks = 0;
 	int MotionSearchPos = PayloadStart;
 	int MotionDataEnd = SeqCandidates.Num() ? SeqCandidates[0].Pos : Ar.GetStopper();
@@ -1618,6 +1651,8 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 
 		int MaxTrackKeys = 1;
 		int MaxTrackFrameSpan = 1;
+		int NonEmptyTrackCount = 0;
+		int NonEmptyNonRootTrackCount = 0;
 		for (int TrackIndex = 0; TrackIndex < TrackCount; TrackIndex++)
 		{
 			int SavePos = Ar.Tell();
@@ -1625,6 +1660,9 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			Ar << NumKeys << RotSize << PosSize;
 			if (NumKeys == 0 && RotSize == 0 && PosSize == 0)
 				continue;
+			NonEmptyTrackCount++;
+			if (TrackIndex > 0)
+				NonEmptyNonRootTrackCount++;
 			if (getenv("SCCT_DEBUG_TRACKS") && TrackIndex < 8)
 			{
 				appPrintf("SCCT track seq=%d track=%d pos=%X keys=%d rotSize=%d posSize=%d compress=%d\n",
@@ -1657,33 +1695,69 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			TotalTracks++;
 		}
 		Dst->TrackTime = MaxTrackKeys;
-		MoveRawKeyCounts.Add(MaxTrackKeys);
-		MoveRawFrameSpans.Add(MaxTrackFrameSpan);
 		if (getenv("SCCT_DEBUG_SEQMAP"))
 			appPrintf("SCCT raw move %d: end=%X keys=%d span=%d\n", SeqIndex, Ar.Tell(), MaxTrackKeys, MaxTrackFrameSpan);
 		MotionSearchPos = Ar.Tell();
+
+		if (CompressType == 0 && TrackCount <= 2 && NonEmptyTrackCount == 0)
+		{
+			if (getenv("SCCT_DEBUG_SEQMAP"))
+				appPrintf("SCCT raw move %d: ignored empty bare block\n", SeqIndex);
+			Moves.RemoveAt(Moves.Num() - 1);
+			SeqIndex--;
+			continue;
+		}
+
+		const bool bRootOnlyBareCompanion =
+			CompressType == 0 &&
+			TrackCount <= 2 &&
+			NonEmptyTrackCount <= 1 &&
+			NonEmptyNonRootTrackCount == 0 &&
+			Dst->AnimTracks.Num() &&
+			(Dst->AnimTracks[0].KeyQuat.Num() || Dst->AnimTracks[0].KeyPos.Num());
+		if (bRootOnlyBareCompanion)
+		{
+			bool bMerged = false;
+			if (Moves.Num() >= 2)
+			{
+				MotionChunk &PrevMove = Moves[Moves.Num() - 2];
+				if (PrevMove.AnimTracks.Num() > 2 && MoveRawKeyCounts.Num())
+				{
+					MergeSCCTRootCompanion(PrevMove, *Dst);
+					MoveRawKeyCounts[MoveRawKeyCounts.Num() - 1] = max(MoveRawKeyCounts[MoveRawKeyCounts.Num() - 1], MaxTrackKeys);
+					MoveRawFrameSpans[MoveRawFrameSpans.Num() - 1] = max(MoveRawFrameSpans[MoveRawFrameSpans.Num() - 1], MaxTrackFrameSpan);
+					bMerged = true;
+					if (getenv("SCCT_DEBUG_SEQMAP"))
+						appPrintf("SCCT raw move %d: merged root companion into previous move\n", SeqIndex);
+				}
+			}
+			if (!bMerged)
+			{
+				CopySCCTMotionChunk(PendingRootCompanion, *Dst);
+				PendingRootKeyCount = MaxTrackKeys;
+				PendingRootFrameSpan = MaxTrackFrameSpan;
+				bHasPendingRootCompanion = true;
+				if (getenv("SCCT_DEBUG_SEQMAP"))
+					appPrintf("SCCT raw move %d: holding root companion for next move\n", SeqIndex);
+			}
+			Moves.RemoveAt(Moves.Num() - 1);
+			continue;
+		}
+
+		if (bHasPendingRootCompanion)
+		{
+			MergeSCCTRootCompanion(*Dst, PendingRootCompanion);
+			MaxTrackKeys = max(MaxTrackKeys, PendingRootKeyCount);
+			MaxTrackFrameSpan = max(MaxTrackFrameSpan, PendingRootFrameSpan);
+			bHasPendingRootCompanion = false;
+			if (getenv("SCCT_DEBUG_SEQMAP"))
+				appPrintf("SCCT raw move %d: merged held root companion\n", SeqIndex);
+		}
+
+		MoveRawKeyCounts.Add(MaxTrackKeys);
+		MoveRawFrameSpans.Add(MaxTrackFrameSpan);
 	}
 
-	auto CopySCCTAnalogTrack = [](AnalogTrack &Dst, const AnalogTrack &Src)
-	{
-		Dst.Flags = Src.Flags;
-		CopyArray(Dst.KeyPos, Src.KeyPos);
-		CopyArray(Dst.KeyQuat, Src.KeyQuat);
-		CopyArray(Dst.KeyTime, Src.KeyTime);
-	};
-	auto CopySCCTMotionChunk = [&](MotionChunk &Dst, const MotionChunk &Src)
-	{
-		Dst.RootSpeed3D = Src.RootSpeed3D;
-		Dst.TrackTime = Src.TrackTime;
-		Dst.StartBone = Src.StartBone;
-		Dst.Flags = Src.Flags;
-		CopyArray(Dst.BoneIndices, Src.BoneIndices);
-		Dst.AnimTracks.Empty(Src.AnimTracks.Num());
-		Dst.AnimTracks.AddZeroed(Src.AnimTracks.Num());
-		for (int TrackIndex = 0; TrackIndex < Src.AnimTracks.Num(); TrackIndex++)
-			CopySCCTAnalogTrack(Dst.AnimTracks[TrackIndex], Src.AnimTracks[TrackIndex]);
-		CopySCCTAnalogTrack(Dst.RootTrack, Src.RootTrack);
-	};
 	TArray<MotionChunk> PairedMoves;
 	int MoveIndex = 0;
 	auto SCCTFramesMatch = [](int Frames, int Span) -> bool
