@@ -1092,6 +1092,35 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		}
 		return Q;
 	};
+	auto DecodeSCCTQuat48 = [](uint16 X, uint16 Y, uint16 Z) -> FQuat
+	{
+		static const float Shift = 0.70710678118f;
+		static const float Scale = 1.41421356237f;
+		float A = (X & 0x7FFF) / 32767.0f * Scale - Shift;
+		float B = (Y & 0x7FFF) / 32767.0f * Scale - Shift;
+		float C = (Z & 0x7FFF) / 32767.0f * Scale - Shift;
+		float MissingSq = 1.0f - (A * A + B * B + C * C);
+		float D = (MissingSq > 0) ? sqrt(MissingSq) : 0.0f;
+
+		FQuat Q;
+		int Selector = ((X >> 15) & 1) | ((Y >> 14) & 2);
+		switch (Selector)
+		{
+		case 0:
+			Q.Set(D, A, B, C);
+			break;
+		case 1:
+			Q.Set(A, D, B, C);
+			break;
+		case 2:
+			Q.Set(A, B, D, C);
+			break;
+		default:
+			Q.Set(A, B, C, D);
+			break;
+		}
+		return Q;
+	};
 	auto DecodeSCCTVector = [](const int16 *Packed, float Scale, bool MirrorY) -> FVector
 	{
 		FVector V;
@@ -1127,9 +1156,9 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			{
 				if (CompressType == 0)
 				{
-					FQuatFixed48NoW PackedQuat;
-					Ar << PackedQuat;
-					Track.KeyQuat.Add(PackedQuat);
+					uint16 PackedQuat[3];
+					Ar << PackedQuat[0] << PackedQuat[1] << PackedQuat[2];
+					Track.KeyQuat.Add(DecodeSCCTQuat48(PackedQuat[0], PackedQuat[1], PackedQuat[2]));
 				}
 				else
 				{
