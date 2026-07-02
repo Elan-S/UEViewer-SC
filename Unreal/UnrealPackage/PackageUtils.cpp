@@ -260,6 +260,36 @@ static void ScanPackageExports(UnPackage* package, CGameFileInfo* file)
 	} */
 }
 
+static bool TryScanPackageExports(UnPackage* package, CGameFileInfo* file)
+{
+	TRY
+	{
+		ScanPackageExports(package, file);
+		return true;
+	}
+	CATCH
+	{
+		file->NumSkeletalMeshes = 0;
+		file->NumStaticMeshes = 0;
+		file->NumAnimations = 0;
+		file->NumTextures = 0;
+
+		FStaticString<MAX_PACKAGE_PATH> RelativeName;
+		file->GetRelativeName(RelativeName);
+		appPrintf("WARNING: skipping package exports during content scan: %s\n", *RelativeName);
+		if (GError.History[0])
+		{
+			char ErrorLine[512];
+			appStrncpyz(ErrorLine, GError.History, ARRAY_COUNT(ErrorLine));
+			char *LineEnd = strchr(ErrorLine, '\n');
+			if (LineEnd) *LineEnd = 0;
+			appPrintf("         %s\n", ErrorLine);
+		}
+		GError.ClearError();
+		return false;
+	}
+}
+
 bool ScanContent(const TArray<const CGameFileInfo*>& Packages, IProgressCallback* Progress)
 {
 	guard(ScanContent);
@@ -288,20 +318,43 @@ bool ScanContent(const TArray<const CGameFileInfo*>& Packages, IProgressCallback
 		}
 
 		file->IsPackageScanned = true;
+		file->NumSkeletalMeshes = 0;
+		file->NumStaticMeshes = 0;
+		file->NumAnimations = 0;
+		file->NumTextures = 0;
 
 		if (file->Package)
 		{
 			// package already loaded
-			ScanPackageExports(file->Package, file);
+			TryScanPackageExports(file->Package, file);
 		}
 		else
 		{
-			UnPackage* package = UnPackage::LoadPackage(file, /*silent=*/ true);	// should always return non-NULL
+			UnPackage* package = NULL;
+			TRY
+			{
+				package = UnPackage::LoadPackage(file, /*silent=*/ true);
+			}
+			CATCH
+			{
+				FStaticString<MAX_PACKAGE_PATH> RelativeName;
+				file->GetRelativeName(RelativeName);
+				appPrintf("WARNING: skipping package during content scan: %s\n", *RelativeName);
+				if (GError.History[0])
+				{
+					char ErrorLine[512];
+					appStrncpyz(ErrorLine, GError.History, ARRAY_COUNT(ErrorLine));
+					char *LineEnd = strchr(ErrorLine, '\n');
+					if (LineEnd) *LineEnd = 0;
+					appPrintf("         %s\n", ErrorLine);
+				}
+				GError.ClearError();
+			}
 			if (!package) continue;		// should not happen
 			// Don't keep the package's reader open
 			package->CloseReader();
 
-			ScanPackageExports(package, file);
+			TryScanPackageExports(package, file);
 		#if 0
 			// this code is disabled: it works, however we're going to use ScanContent not just to get objects counts,
 			// but also for collecting object references

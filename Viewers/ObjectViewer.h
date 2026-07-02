@@ -80,6 +80,9 @@ class CMaterialViewer : public CObjectViewer
 {
 public:
 	bool			IsTexture;
+	bool			HasResolvedTextureData;
+	int				ResolvedTextureWidth;
+	int				ResolvedTextureHeight;
 	static bool		ShowOutline;
 	static bool		ShowChannels;
 	static int		ShapeIndex;

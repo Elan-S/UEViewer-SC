@@ -4,6 +4,7 @@
 #include "UnMesh2.h"
 #include "UnMeshTypes.h"
 #include "UnrealPackage/UnPackage.h"
+#include "GameSpecific/UnUbisoft.h"
 
 #include "UnrealMaterial/UnMaterial.h"
 #include "UnrealMaterial/UnMaterial2.h" // for UMaterial* serialization
@@ -831,6 +832,16 @@ static uint16 ReadSCDAUInt16At(FArchive &Ar, int Pos, bool BigEndian)
 	return BigEndian ? (uint16)((B[0] << 8) | B[1]) : (uint16)(B[0] | (B[1] << 8));
 }
 
+static unsigned ReadSCDAUInt32At(FArchive &Ar, int Pos, bool BigEndian)
+{
+	byte B[4];
+	Ar.Seek(Pos);
+	Ar.Serialize(B, 4);
+	return BigEndian
+		? ((unsigned)B[0] << 24) | ((unsigned)B[1] << 16) | ((unsigned)B[2] << 8) | B[3]
+		: ((unsigned)B[0]) | ((unsigned)B[1] << 8) | ((unsigned)B[2] << 16) | ((unsigned)B[3] << 24);
+}
+
 static float ReadSCDAFloatAt(FArchive &Ar, int Pos, bool BigEndian)
 {
 	byte B[4];
@@ -936,6 +947,150 @@ static void DumpSCDAPackedVertexCandidates(FArchive &Ar, int Start, int Stop)
 	Ar.Seek(SavePos);
 }
 
+struct FSCDAInlineTriangleStreamCandidate
+{
+	int Start;
+	int Stride;
+	int VertexCount;
+	float Score;
+};
+
+static bool ScoreSCDAInlineTriangleStream(FArchive &Ar, int Start, int Stop, int Pos, int Stride, FSCDAInlineTriangleStreamCandidate& Best)
+{
+	guard(ScoreSCDAInlineTriangleStream);
+	if (Stride < 12 || Pos < Start || Pos + Stride * 9 > Stop)
+		return false;
+
+	const int MaxVertexCount = min((Stop - Pos) / Stride, 20000);
+	if (MaxVertexCount < 9)
+		return false;
+
+	int ValidCount = 0;
+	int ZeroCount = 0;
+	int SmallTailScore = 0;
+	float MinX = 0, MinY = 0, MinZ = 0;
+	float MaxX = 0, MaxY = 0, MaxZ = 0;
+	bool bHaveBounds = false;
+
+	for (int i = 0; i < MaxVertexCount; i++)
+	{
+		int VPos = Pos + i * Stride;
+		float X = ReadSCDAFloatAt(Ar, VPos + 0, false);
+		float Y = ReadSCDAFloatAt(Ar, VPos + 4, false);
+		float Z = ReadSCDAFloatAt(Ar, VPos + 8, false);
+		if (!IsSaneSCDAFloat(X) || !IsSaneSCDAFloat(Y) || !IsSaneSCDAFloat(Z))
+			break;
+		float Sum = fabs(X) + fabs(Y) + fabs(Z);
+		if (Sum < 0.0001f)
+			ZeroCount++;
+		else
+		{
+			if (!bHaveBounds)
+			{
+				MinX = MaxX = X;
+				MinY = MaxY = Y;
+				MinZ = MaxZ = Z;
+				bHaveBounds = true;
+			}
+			else
+			{
+				if (X < MinX) MinX = X; if (X > MaxX) MaxX = X;
+				if (Y < MinY) MinY = Y; if (Y > MaxY) MaxY = Y;
+				if (Z < MinZ) MinZ = Z; if (Z > MaxZ) MaxZ = Z;
+			}
+		}
+
+		if (Stride >= 24)
+		{
+			unsigned A = ReadSCDAUInt32At(Ar, VPos + 12, false);
+			unsigned B = ReadSCDAUInt32At(Ar, VPos + 16, false);
+			unsigned C = ReadSCDAUInt32At(Ar, VPos + 20, false);
+			if (A <= 32) SmallTailScore++;
+			if (B <= 4) SmallTailScore++;
+			if (C <= 16) SmallTailScore++;
+		}
+		ValidCount++;
+	}
+
+	int VertexCount = ValidCount - (ValidCount % 3);
+	if (VertexCount < 9)
+		return false;
+	if (!bHaveBounds || (MaxX - MinX) + (MaxY - MinY) + (MaxZ - MinZ) < 1.0f)
+		return false;
+	if (ZeroCount > VertexCount / 2)
+		return false;
+
+	float Score = (float)VertexCount;
+	Score += (float)SmallTailScore * 0.25f;
+	Score -= (float)(Pos - Start) * 0.01f;
+	Score -= (float)Stride * 0.1f;
+	if (Score <= Best.Score)
+		return false;
+
+	Best.Start = Pos;
+	Best.Stride = Stride;
+	Best.VertexCount = VertexCount;
+	Best.Score = Score;
+	return true;
+	unguard;
+}
+
+static bool FindSCDAInlineTriangleStream(FArchive &Ar, int Start, int Stop,
+	TArray<FVector>& OutPoints, TArray<FMeshWedge>& OutWedges, TArray<VTriangle>& OutTriangles,
+	int& OutPointsPos)
+{
+	guard(FindSCDAInlineTriangleStream);
+	if (Stop <= Start || Stop - Start > 0x30000)
+		return false;
+
+	FSCDAInlineTriangleStreamCandidate Best;
+	memset(&Best, 0, sizeof(Best));
+	Best.Start = -1;
+	Best.Score = 0.0f;
+
+	static const int Strides[] = { 24, 28, 32, 36, 40, 44, 48, 60 };
+	for (int s = 0; s < ARRAY_COUNT(Strides); s++)
+	{
+		int Stride = Strides[s];
+		for (int Pos = Start; Pos < Start + Stride && Pos + Stride * 9 <= Stop; Pos++)
+			ScoreSCDAInlineTriangleStream(Ar, Start, Stop, Pos, Stride, Best);
+	}
+
+	if (Best.Start < 0 || Best.VertexCount < 9)
+		return false;
+
+	OutPoints.Empty(Best.VertexCount);
+	OutPoints.AddZeroed(Best.VertexCount);
+	OutWedges.Empty(Best.VertexCount);
+	OutWedges.AddZeroed(Best.VertexCount);
+	for (int i = 0; i < Best.VertexCount; i++)
+	{
+		int VPos = Best.Start + i * Best.Stride;
+		OutPoints[i].X = ReadSCDAFloatAt(Ar, VPos + 0, false);
+		OutPoints[i].Y = ReadSCDAFloatAt(Ar, VPos + 4, false);
+		OutPoints[i].Z = ReadSCDAFloatAt(Ar, VPos + 8, false);
+		OutWedges[i].iVertex = i;
+	}
+
+	int TriangleCount = Best.VertexCount / 3;
+	OutTriangles.Empty(TriangleCount);
+	OutTriangles.AddZeroed(TriangleCount);
+	for (int i = 0; i < TriangleCount; i++)
+	{
+		OutTriangles[i].WedgeIndex[0] = i * 3 + 0;
+		OutTriangles[i].WedgeIndex[1] = i * 3 + 1;
+		OutTriangles[i].WedgeIndex[2] = i * 3 + 2;
+		OutTriangles[i].MatIndex = 0;
+	}
+
+	OutPointsPos = Best.Start;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA inline triangle stream: pos=%08X stride=%d verts=%d tris=%d score=%g\n",
+			Best.Start, Best.Stride, Best.VertexCount, TriangleCount, Best.Score);
+	return true;
+	unguard;
+}
+
 static bool FindSCDARawVectorBlock(FArchive &Ar, int Start, int Stop, TArray<FVector>& OutPoints, int& OutPos)
 {
 	guard(FindSCDARawVectorBlock);
@@ -1039,6 +1194,172 @@ static bool FindSCDARawVectorBlock(FArchive &Ar, int Start, int Stop, TArray<FVe
 	unguard;
 }
 
+static bool IsSaneSCDATriangleArea(float Area)
+{
+	return Area >= 0.000001f && Area <= 1.0e14f;
+}
+
+static void PrepareSCDASkeletalMeshForView(USkeletalMesh& Mesh)
+{
+	guard(PrepareSCDASkeletalMeshForView);
+	Mesh.MeshScale.Set(1.0f, 1.0f, 1.0f);
+	Mesh.MeshOrigin.Set(0.0f, 0.0f, 0.0f);
+	Mesh.RotOrigin.Set(0, 0, 0);
+	if (!Mesh.Points.Num())
+		return;
+
+	FVector Min, Max;
+	Min.Set(3.4e38f, 3.4e38f, 3.4e38f);
+	Max.Set(-3.4e38f, -3.4e38f, -3.4e38f);
+	for (int i = 0; i < Mesh.Points.Num(); i++)
+	{
+		const FVector& P = Mesh.Points[i];
+		Min.X = min(Min.X, P.X); Min.Y = min(Min.Y, P.Y); Min.Z = min(Min.Z, P.Z);
+		Max.X = max(Max.X, P.X); Max.Y = max(Max.Y, P.Y); Max.Z = max(Max.Z, P.Z);
+	}
+
+	Mesh.BoundingBox.Min = Min;
+	Mesh.BoundingBox.Max = Max;
+	Mesh.BoundingBox.IsValid = 1;
+	Mesh.BoundingSphere.X = (Min.X + Max.X) * 0.5f;
+	Mesh.BoundingSphere.Y = (Min.Y + Max.Y) * 0.5f;
+	Mesh.BoundingSphere.Z = (Min.Z + Max.Z) * 0.5f;
+	float RadiusSq = 1.0f;
+	for (int i = 0; i < Mesh.Points.Num(); i++)
+	{
+		const FVector& P = Mesh.Points[i];
+		const float DX = P.X - Mesh.BoundingSphere.X;
+		const float DY = P.Y - Mesh.BoundingSphere.Y;
+		const float DZ = P.Z - Mesh.BoundingSphere.Z;
+		RadiusSq = max(RadiusSq, DX * DX + DY * DY + DZ * DZ);
+	}
+	Mesh.BoundingSphere.R = sqrt(RadiusSq);
+	unguard;
+}
+
+static float GetSCDATriangleAreaSq(const TArray<FVector>& Points, int A, int B, int C)
+{
+	const float ABx = Points[B].X - Points[A].X;
+	const float ABy = Points[B].Y - Points[A].Y;
+	const float ABz = Points[B].Z - Points[A].Z;
+	const float ACx = Points[C].X - Points[A].X;
+	const float ACy = Points[C].Y - Points[A].Y;
+	const float ACz = Points[C].Z - Points[A].Z;
+	const float CX = ABy * ACz - ABz * ACy;
+	const float CY = ABz * ACx - ABx * ACz;
+	const float CZ = ABx * ACy - ABy * ACx;
+	return CX * CX + CY * CY + CZ * CZ;
+}
+
+static bool GetSCDAWedgeTriangleAreaSq(const TArray<FVector>& Points, const TArray<FMeshWedge>& Wedges, int A, int B, int C, float& OutArea)
+{
+	if (A < 0 || B < 0 || C < 0 || A >= Wedges.Num() || B >= Wedges.Num() || C >= Wedges.Num())
+		return false;
+	const int PA = Wedges[A].iVertex;
+	const int PB = Wedges[B].iVertex;
+	const int PC = Wedges[C].iVertex;
+	if (PA < 0 || PB < 0 || PC < 0 || PA >= Points.Num() || PB >= Points.Num() || PC >= Points.Num())
+		return false;
+	if (PA == PB || PA == PC || PB == PC)
+		return false;
+	OutArea = GetSCDATriangleAreaSq(Points, PA, PB, PC);
+	return true;
+}
+
+static bool GetSCDAWedgeTriangleMetrics(const TArray<FVector>& Points, const TArray<FMeshWedge>& Wedges, int A, int B, int C, float& OutArea, float& OutMaxEdge)
+{
+	if (A < 0 || B < 0 || C < 0 || A >= Wedges.Num() || B >= Wedges.Num() || C >= Wedges.Num())
+		return false;
+	const int PA = Wedges[A].iVertex;
+	const int PB = Wedges[B].iVertex;
+	const int PC = Wedges[C].iVertex;
+	if (PA < 0 || PB < 0 || PC < 0 || PA >= Points.Num() || PB >= Points.Num() || PC >= Points.Num())
+		return false;
+	if (PA == PB || PA == PC || PB == PC)
+		return false;
+	const FVector& APos = Points[PA];
+	const FVector& BPos = Points[PB];
+	const FVector& CPos = Points[PC];
+	float DX = APos.X - BPos.X;
+	float DY = APos.Y - BPos.Y;
+	float DZ = APos.Z - BPos.Z;
+	const float E0 = sqrt(DX * DX + DY * DY + DZ * DZ);
+	DX = BPos.X - CPos.X;
+	DY = BPos.Y - CPos.Y;
+	DZ = BPos.Z - CPos.Z;
+	const float E1 = sqrt(DX * DX + DY * DY + DZ * DZ);
+	DX = CPos.X - APos.X;
+	DY = CPos.Y - APos.Y;
+	DZ = CPos.Z - APos.Z;
+	const float E2 = sqrt(DX * DX + DY * DY + DZ * DZ);
+	OutMaxEdge = max(E0, max(E1, E2));
+	OutArea = GetSCDATriangleAreaSq(Points, PA, PB, PC);
+	return true;
+}
+
+static bool FindSCDAPackedVectorBlock(FArchive &Ar, int Start, int Stop, TArray<FVector>& OutPoints, int& OutPos)
+{
+	guard(FindSCDAPackedVectorBlock);
+	int BestPos = 0;
+	int BestCount = 0;
+	int BestStride = 0;
+	int BestExtent = 0;
+	for (int Stride = 20; Stride <= 48; Stride += 4)
+	{
+		for (int Base = Start; Base < Start + Stride && Base <= Stop - 6; Base++)
+		{
+			int Count = 0;
+			int MinX =  0x7FFFFFFF, MinY =  0x7FFFFFFF, MinZ =  0x7FFFFFFF;
+			int MaxX = -0x7FFFFFFF, MaxY = -0x7FFFFFFF, MaxZ = -0x7FFFFFFF;
+			for (int Pos = Base; Pos <= Stop - Stride; Pos += Stride)
+			{
+				int16 X, Y, Z;
+				Ar.Seek(Pos);
+				Ar << X << Y << Z;
+				if (X == -32768 || Y == -32768 || Z == -32768)
+					break;
+				if (abs((int)X) > 30000 || abs((int)Y) > 30000 || abs((int)Z) > 30000)
+					break;
+				MinX = min(MinX, (int)X); MaxX = max(MaxX, (int)X);
+				MinY = min(MinY, (int)Y); MaxY = max(MaxY, (int)Y);
+				MinZ = min(MinZ, (int)Z); MaxZ = max(MaxZ, (int)Z);
+				Count++;
+				if (Count > 100000)
+					break;
+			}
+			int Extent = (MaxX - MinX) + (MaxY - MinY) + (MaxZ - MinZ);
+			if (Count < 64 || Extent < 256)
+				continue;
+			if (Count > BestCount || (Count == BestCount && Extent > BestExtent))
+			{
+				BestPos = Base;
+				BestCount = Count;
+				BestStride = Stride;
+				BestExtent = Extent;
+			}
+		}
+	}
+	if (!BestCount)
+		return false;
+
+	OutPoints.Empty(BestCount);
+	OutPoints.AddUninitialized(BestCount);
+	for (int i = 0; i < BestCount; i++)
+	{
+		int16 X, Y, Z;
+		Ar.Seek(BestPos + i * BestStride);
+		Ar << X << Y << Z;
+		OutPoints[i].Set(X / 32.0f, Y / 32.0f, Z / 32.0f);
+	}
+	OutPos = BestPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA packed vector block: pos=%08X count=%d stride=%d extent=%d first=(%g,%g,%g)\n",
+			BestPos, BestCount, BestStride, BestExtent,
+			OutPoints[0].X, OutPoints[0].Y, OutPoints[0].Z);
+	return true;
+	unguard;
+}
+
 static bool ReadSCDARawFaceRecords(FArchive &Ar, int Pos, int Stop, int Count, int PointCount, bool BigEndian, TArray<VTriangle>& OutTriangles)
 {
 	guard(ReadSCDARawFaceRecords);
@@ -1070,12 +1391,913 @@ static bool ReadSCDARawFaceRecords(FArchive &Ar, int Pos, int Stop, int Count, i
 	unguard;
 }
 
+struct FSCDANativeMeshHeader
+{
+	int MaterialCount;
+	int MaterialRefsPos;
+	int TransformPos;
+	int TopologyCountPos;
+	int TopologyDataPos;
+	int TopologyWordCount;
+	int FirstMarkerWord;
+	int SecondMarkerWord;
+	int FacePos;
+	int FaceCount;
+	int MaxFaceIndex;
+};
+
+static bool ReadSCDANativeMeshHeader(FArchive &Ar, int Start, int Stop, FSCDANativeMeshHeader& H, TArray<int> *MaterialRefs = NULL)
+{
+	guard(ReadSCDANativeMeshHeader);
+	memset(&H, 0, sizeof(H));
+	if (Start < 0 || Start + 0x34 > Stop ||
+		ReadSCDAUInt32At(Ar, Start + 0x00, false) != 0xC32CD01C ||
+		ReadSCDAUInt32At(Ar, Start + 0x0C, false) != 0x432CD01C)
+		return false;
+
+	Ar.Seek(Start + 0x33);
+	Ar << AR_INDEX(H.MaterialCount);
+	if (H.MaterialCount < 1 || H.MaterialCount > 64)
+		return false;
+	H.MaterialRefsPos = Ar.Tell();
+	if (MaterialRefs)
+		MaterialRefs->Empty(H.MaterialCount);
+	for (int i = 0; i < H.MaterialCount; i++)
+	{
+		int Ref;
+		Ar << AR_INDEX(Ref);
+		if (MaterialRefs)
+			MaterialRefs->Add(Ref);
+	}
+
+	// SCDA stores a second, optional material-reference array before the
+	// fixed transform block. Donald uses it; Sam's meshes serialize it empty.
+	int SecondaryMaterialCount;
+	Ar << AR_INDEX(SecondaryMaterialCount);
+	if (SecondaryMaterialCount < 0 || SecondaryMaterialCount > 64)
+		return false;
+	for (int i = 0; i < SecondaryMaterialCount; i++)
+	{
+		int Ref;
+		Ar << AR_INDEX(Ref);
+	}
+
+	H.TransformPos = Ar.Tell();
+	if (H.TransformPos + 36 > Stop ||
+		ReadSCDAUInt32At(Ar, H.TransformPos + 0, false) != 0x3F800000 ||
+		ReadSCDAUInt32At(Ar, H.TransformPos + 4, false) != 0x3F800000 ||
+		ReadSCDAUInt32At(Ar, H.TransformPos + 8, false) != 0x3F800000)
+		return false;
+	H.TopologyCountPos = H.TransformPos + 36;
+	if (H.TopologyCountPos + 4 > Stop)
+		return false;
+	H.TopologyWordCount = ReadSCDAUInt32At(Ar, H.TopologyCountPos, false);
+	H.TopologyDataPos = H.TopologyCountPos + 4;
+	if (H.TopologyWordCount < 16 || H.TopologyWordCount > 100000 ||
+		H.TopologyDataPos + H.TopologyWordCount * 2 > Stop)
+		return false;
+
+	H.FirstMarkerWord = -1;
+	H.SecondMarkerWord = -1;
+	uint16 Marker = 0;
+	for (int i = 0; i < H.TopologyWordCount; i++)
+	{
+		const uint16 Value = ReadSCDAUInt16At(Ar, H.TopologyDataPos + i * 2, false);
+		if (!(Value & 0xE000))
+			continue;
+		if (H.FirstMarkerWord < 0)
+		{
+			H.FirstMarkerWord = i;
+			Marker = Value;
+		}
+		else
+		{
+			if (Value != Marker)
+				return false;
+			H.SecondMarkerWord = i;
+			break;
+		}
+	}
+	if (H.FirstMarkerWord < 0 || H.SecondMarkerWord <= H.FirstMarkerWord + 1)
+		return false;
+
+	H.FaceCount = H.SecondMarkerWord - H.FirstMarkerWord - 1;
+	H.FacePos = H.TopologyDataPos + (H.SecondMarkerWord + 1) * 2;
+	if (H.FaceCount < 1 || H.FaceCount > 100000 || H.FacePos + H.FaceCount * 8 > Stop)
+		return false;
+
+	H.MaxFaceIndex = 0;
+	for (int i = 0; i < H.FaceCount; i++)
+	{
+		const int Pos = H.FacePos + i * 8;
+		const uint16 A = ReadSCDAUInt16At(Ar, Pos + 0, false);
+		const uint16 B = ReadSCDAUInt16At(Ar, Pos + 2, false);
+		const uint16 C = ReadSCDAUInt16At(Ar, Pos + 4, false);
+		const uint16 Material = ReadSCDAUInt16At(Ar, Pos + 6, false);
+		if (A == B || A == C || B == C || Material >= H.MaterialCount)
+			return false;
+		H.MaxFaceIndex = max(H.MaxFaceIndex, max((int)A, max((int)B, (int)C)));
+	}
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA native mesh header: materials=%d transform=%08X topologyCount=%08X words=%d markers=%d,%d faces=%08X count=%d maxIndex=%d\n",
+			H.MaterialCount, H.TransformPos, H.TopologyCountPos, H.TopologyWordCount,
+			H.FirstMarkerWord, H.SecondMarkerWord, H.FacePos, H.FaceCount, H.MaxFaceIndex);
+	return true;
+	unguard;
+}
+
+static bool ReadSCDANativeVertexStream(FArchive &Ar, int Start, int Stop, int VertexCount,
+	TArray<FVector>& OutPoints, TArray<FMeshWedge>& OutWedges, TArray<FVertInfluence>& OutInfluences,
+	int& OutDataPos, int& OutBoneCount)
+{
+	guard(ReadSCDANativeVertexStream);
+	if (VertexCount < 1 || VertexCount > 65535)
+		return false;
+
+	int FoundDataPos = 0;
+	int CandidateCount = 0;
+	for (int CountPos = Start; CountPos < Stop; CountPos++)
+	{
+		int Pos = CountPos;
+		byte B = 0;
+		if (Pos >= Stop)
+			break;
+		Ar.Seek(Pos++);
+		Ar << B;
+		const bool Negative = (B & 0x80) != 0;
+		int Count = B & 0x3F;
+		int Shift = 6;
+		if (B & 0x40)
+		{
+			do
+			{
+				if (Pos >= Stop || Shift > 27)
+				goto next_count_pos;
+				Ar.Seek(Pos++);
+				Ar << B;
+				Count |= (B & 0x7F) << Shift;
+				Shift += 7;
+			} while (B & 0x80);
+		}
+		if (Negative)
+			Count = -Count;
+		const int DataPos = Pos;
+		if (Count != VertexCount || DataPos + VertexCount * 36 > Stop)
+			continue;
+
+		FVector Min, Max;
+		Min.Set(3.4e38f, 3.4e38f, 3.4e38f);
+		Max.Set(-3.4e38f, -3.4e38f, -3.4e38f);
+		bool Valid = true;
+		for (int i = 0; i < VertexCount; i++)
+		{
+			const int Pos = DataPos + i * 36;
+			const float X = ReadSCDAFloatAt(Ar, Pos + 0, false);
+			const float Y = ReadSCDAFloatAt(Ar, Pos + 4, false);
+			const float Z = ReadSCDAFloatAt(Ar, Pos + 8, false);
+			if (!IsSaneSCDAFloat(X) || !IsSaneSCDAFloat(Y) || !IsSaneSCDAFloat(Z))
+			{
+				Valid = false;
+				break;
+			}
+			Min.X = min(Min.X, X); Min.Y = min(Min.Y, Y); Min.Z = min(Min.Z, Z);
+			Max.X = max(Max.X, X); Max.Y = max(Max.Y, Y); Max.Z = max(Max.Z, Z);
+		}
+		if (!Valid)
+			continue;
+		const float Extent = (Max.X - Min.X) + (Max.Y - Min.Y) + (Max.Z - Min.Z);
+		if (Extent < 10.0f || Extent > 5000.0f)
+			continue;
+		FoundDataPos = DataPos;
+		CandidateCount++;
+	next_count_pos:;
+	}
+	if (CandidateCount != 1)
+	{
+		if (getenv("SC4_DEBUG_MESH"))
+			appPrintf("SCDA native vertex stream declaration is not unique: count=%d candidates=%d\n", VertexCount, CandidateCount);
+		return false;
+	}
+
+	OutPoints.Empty(VertexCount);
+	OutPoints.AddUninitialized(VertexCount);
+	OutWedges.Empty(VertexCount);
+	OutWedges.AddZeroed(VertexCount);
+	OutInfluences.Empty(VertexCount * 2);
+	OutBoneCount = 0;
+	for (int i = 0; i < VertexCount; i++)
+	{
+		const int Pos = FoundDataPos + i * 36;
+		OutPoints[i].Set(
+			ReadSCDAFloatAt(Ar, Pos + 0, false),
+			ReadSCDAFloatAt(Ar, Pos + 4, false),
+			ReadSCDAFloatAt(Ar, Pos + 8, false)
+		);
+		OutWedges[i].iVertex = i;
+		OutWedges[i].TexUV.U = ReadSCDAUInt16At(Ar, Pos + 12, false) / 2048.0f;
+		OutWedges[i].TexUV.V = ReadSCDAUInt16At(Ar, Pos + 14, false) / 2048.0f;
+		int WeightSum = 0;
+		for (int j = 0; j < 4; j++)
+		{
+			const byte Bone = ReadSCDAUInt16At(Ar, Pos + 28 + j, false) & 0xFF;
+			const byte Weight = ReadSCDAUInt16At(Ar, Pos + 32 + j, false) & 0xFF;
+			WeightSum += Weight;
+			if (!Weight)
+				continue;
+			FVertInfluence& Influence = OutInfluences[OutInfluences.AddDefaulted()];
+			Influence.Weight = Weight / 255.0f;
+			Influence.PointIndex = i;
+			Influence.BoneIndex = Bone;
+			OutBoneCount = max(OutBoneCount, (int)Bone + 1);
+		}
+		if (WeightSum != 255)
+			return false;
+	}
+	OutDataPos = FoundDataPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA native vertex stream: count=%d stride=36 data=%08X-%08X uvOff=12 influences=%d bones=%d first=(%g,%g,%g) uv=(%g,%g)\n",
+			VertexCount, FoundDataPos, FoundDataPos + VertexCount * 36,
+			OutInfluences.Num(), OutBoneCount,
+			OutPoints[0].X, OutPoints[0].Y, OutPoints[0].Z,
+			OutWedges[0].TexUV.U, OutWedges[0].TexUV.V);
+	return true;
+	unguard;
+}
+
+struct FSCDANativeBonePalette
+{
+	int		MaterialIndex;
+	int		FirstFace;
+	int		LastFace;
+	byte	Map[256];
+
+	void Clear()
+	{
+		MaterialIndex = -1;
+		FirstFace = LastFace = -1;
+		memset(Map, 0xFF, sizeof(Map));
+	}
+};
+
+struct FSCDANativeFaceRun
+{
+	int		MaterialIndex;
+	int		FirstFace;
+	int		FaceCount;
+};
+
+static bool ReadSCDANativeBonePalette(FArchive &Ar, int Pos, int Stop, int ExpectedFaceCount,
+	int LocalBoneCount, int GlobalBoneCount, FSCDANativeBonePalette& Palette, int& OutEnd)
+{
+	guard(ReadSCDANativeBonePalette);
+	if (Pos < 0 || Pos + 3 > Stop)
+		return false;
+	if ((int)ReadSCDAUInt16At(Ar, Pos, false) != ExpectedFaceCount)
+		return false;
+	byte Count = 0;
+	Ar.Seek(Pos + 2);
+	Ar << Count;
+	if (Count < 1 || Count > 64 || Pos + 3 + Count * 2 > Stop)
+		return false;
+
+	Palette.Clear();
+	int UsedLocals = 0;
+	for (int i = 0; i < Count; i++)
+	{
+		byte GlobalBone = 0, LocalBone = 0;
+		Ar << GlobalBone << LocalBone;
+		if (GlobalBone >= GlobalBoneCount || LocalBone >= LocalBoneCount)
+			return false;
+		if (Palette.Map[LocalBone] == 0xFF)
+			UsedLocals++;
+		Palette.Map[LocalBone] = GlobalBone;
+	}
+	if (UsedLocals < min(LocalBoneCount, 2))
+		return false;
+	OutEnd = Pos + 3 + Count * 2;
+	return true;
+	unguard;
+}
+
+static bool FindSCDANativeBonePalettes(FArchive &Ar, int Start, int Stop, const TArray<VTriangle>& Triangles,
+	int LocalBoneCount, int GlobalBoneCount, TArray<FSCDANativeBonePalette>& Palettes)
+{
+	guard(FindSCDANativeBonePalettes);
+	const bool DebugPalette = getenv("SCDA_DEBUG_PALETTE") != NULL;
+	if (DebugPalette)
+		appPrintf("SCDA palette finder enter: start=%08X stop=%08X tris=%d local=%d global=%d\n",
+			Start, Stop, Triangles.Num(), LocalBoneCount, GlobalBoneCount);
+	Palettes.Empty();
+	if (!Triangles.Num() || LocalBoneCount <= 0 || GlobalBoneCount <= 0)
+		return false;
+
+	static FSCDANativeFaceRun Runs[128];
+	int RunCount = 0;
+	for (int Face = 0; Face < Triangles.Num(); Face++)
+	{
+		int Mat = Triangles[Face].MatIndex;
+		if (Mat < 0 || Mat >= 256)
+			return false;
+		if (!RunCount || Runs[RunCount - 1].MaterialIndex != Mat)
+		{
+			if (RunCount >= ARRAY_COUNT(Runs))
+				return false;
+			Runs[RunCount].MaterialIndex = Mat;
+			Runs[RunCount].FirstFace = Face;
+			Runs[RunCount].FaceCount = 1;
+			RunCount++;
+		}
+		else
+		{
+			Runs[RunCount - 1].FaceCount++;
+		}
+	}
+	if (!RunCount)
+		return false;
+	if (DebugPalette)
+		appPrintf("SCDA palette finder faceRuns=%d firstFaces=%d firstMat=%d\n",
+			RunCount, Runs[0].FaceCount, Runs[0].MaterialIndex);
+
+	int SavePos = Ar.Tell();
+	int BestStart = 0;
+	static byte BestMaps[64][64];
+	static byte ChainMaps[64][64];
+	static int BestMaterials[64];
+	static int BestFirstFaces[64];
+	static int BestLastFaces[64];
+	memset(BestMaps, 0xFF, sizeof(BestMaps));
+	memset(ChainMaps, 0xFF, sizeof(ChainMaps));
+	if (DebugPalette)
+		appPrintf("SCDA palette finder flat buffers ready\n");
+	int BestPaletteCount = 0;
+	int ValidChainCandidates = 0;
+	int LastLoggedChainStart = -1;
+	for (int Pos = Start; Pos < Stop - 8; Pos++)
+	{
+		int ChainCount = 0;
+		memset(ChainMaps, 0xFF, sizeof(ChainMaps));
+		int ScanPos = Pos;
+		int ChainFirstStart = -1;
+		bool Valid = true;
+		for (int i = 0; i < RunCount; i++)
+		{
+			const int FaceCount = Runs[i].FaceCount;
+			bool Found = false;
+			for (int Candidate = ScanPos; Candidate < Stop - 8 && Candidate < ScanPos + 0x80; Candidate++)
+			{
+				FSCDANativeBonePalette P;
+				int End = 0;
+				if (!ReadSCDANativeBonePalette(Ar, Candidate, Stop, FaceCount, LocalBoneCount, GlobalBoneCount, P, End))
+					continue;
+				if (ChainFirstStart < 0)
+					ChainFirstStart = Candidate;
+				for (int Local = 0; Local < LocalBoneCount && Local < 64; Local++)
+					ChainMaps[ChainCount][Local] = P.Map[Local];
+				ChainCount++;
+				ScanPos = End;
+				Found = true;
+				break;
+			}
+			if (!Found)
+			{
+				Valid = false;
+				break;
+			}
+		}
+		if (Valid && ChainCount == RunCount)
+		{
+			ValidChainCandidates++;
+			if (DebugPalette && ChainFirstStart != LastLoggedChainStart)
+			{
+				LastLoggedChainStart = ChainFirstStart;
+				appPrintf("SCDA palette chain candidate %d at %08X\n", ValidChainCandidates, ChainFirstStart);
+				if (RunCount > 0)
+				{
+					appPrintf("  first:");
+					for (int Local = 0; Local < LocalBoneCount && Local < 16; Local++)
+						if (ChainMaps[0][Local] != 0xFF)
+							appPrintf(" %d->%d", Local, ChainMaps[0][Local]);
+					appPrintf("\n");
+				}
+				if (RunCount > 8)
+				{
+					appPrintf("  run8:");
+					for (int Local = 0; Local < LocalBoneCount && Local < 16; Local++)
+						if (ChainMaps[8][Local] != 0xFF)
+							appPrintf(" %d->%d", Local, ChainMaps[8][Local]);
+					appPrintf("\n");
+				}
+			}
+			if (!BestPaletteCount)
+			{
+				BestStart = ChainFirstStart;
+				BestPaletteCount = ChainCount;
+				for (int i = 0; i < ChainCount; i++)
+				{
+					BestMaterials[i] = Runs[i].MaterialIndex;
+					BestFirstFaces[i] = Runs[i].FirstFace;
+					BestLastFaces[i] = Runs[i].FirstFace + Runs[i].FaceCount - 1;
+					for (int Local = 0; Local < LocalBoneCount && Local < 64; Local++)
+						BestMaps[i][Local] = ChainMaps[i][Local];
+				}
+			}
+		}
+	}
+	Ar.Seek(SavePos);
+	if (!BestPaletteCount)
+		return false;
+
+	Palettes.Empty(BestPaletteCount);
+	for (int i = 0; i < BestPaletteCount; i++)
+	{
+		FSCDANativeBonePalette P;
+		P.Clear();
+		P.MaterialIndex = BestMaterials[i];
+		P.FirstFace = BestFirstFaces[i];
+		P.LastFace = BestLastFaces[i];
+		for (int Local = 0; Local < LocalBoneCount && Local < 64; Local++)
+			P.Map[Local] = BestMaps[i][Local];
+		new (Palettes) FSCDANativeBonePalette(P);
+	}
+	if (getenv("SC4_DEBUG_MESH"))
+	{
+		appPrintf("SCDA bone palettes: pos=%08X sections=%d localBones=%d globalBones=%d\n",
+			BestStart, Palettes.Num(), LocalBoneCount, GlobalBoneCount);
+		for (int i = 0; i < Palettes.Num(); i++)
+		{
+			appPrintf("  faces=%d-%d mat=%d", Palettes[i].FirstFace, Palettes[i].LastFace, Palettes[i].MaterialIndex);
+			for (int Local = 0; Local < LocalBoneCount && Local < 32; Local++)
+				if (Palettes[i].Map[Local] != 0xFF)
+					appPrintf(" %d->%d", Local, Palettes[i].Map[Local]);
+			appPrintf("\n");
+		}
+	}
+	return true;
+	unguard;
+}
+
+static bool ApplySCDANativeBonePalettes(const TArray<VTriangle>& Triangles, int PointCount,
+	const TArray<FSCDANativeBonePalette>& Palettes, TArray<FVertInfluence>& Influences)
+{
+	guard(ApplySCDANativeBonePalettes);
+	if (!Triangles.Num() || !Palettes.Num() || !Influences.Num() || PointCount <= 0)
+		return false;
+
+	TArray<const FSCDANativeBonePalette*> PaletteByPoint;
+	PaletteByPoint.Empty(PointCount);
+	PaletteByPoint.AddZeroed(PointCount);
+	TArray<int> PaletteIndexByPoint;
+	PaletteIndexByPoint.Empty(PointCount);
+	PaletteIndexByPoint.AddZeroed(PointCount);
+	for (int i = 0; i < PointCount; i++)
+		PaletteIndexByPoint[i] = -1;
+	int PointPaletteConflicts = 0;
+	for (int PaletteIndex = 0; PaletteIndex < Palettes.Num(); PaletteIndex++)
+	{
+		const FSCDANativeBonePalette* P = &Palettes[PaletteIndex];
+		const int FirstFace = max(P->FirstFace, 0);
+		const int LastFace = min(P->LastFace, Triangles.Num() - 1);
+		for (int Face = FirstFace; Face <= LastFace; Face++)
+		{
+			for (int j = 0; j < 3; j++)
+			{
+				int PointIndex = Triangles[Face].WedgeIndex[j];
+				if (PointIndex >= 0 && PointIndex < PointCount)
+				{
+					if (!PaletteByPoint[PointIndex])
+					{
+						PaletteByPoint[PointIndex] = P;
+						PaletteIndexByPoint[PointIndex] = PaletteIndex;
+					}
+					else if (PaletteByPoint[PointIndex] != P)
+						PointPaletteConflicts++;
+				}
+			}
+		}
+	}
+
+	static int LocalUsage[64][64];
+	static float LocalWeightUsage[64][64];
+	memset(LocalUsage, 0, sizeof(LocalUsage));
+	memset(LocalWeightUsage, 0, sizeof(LocalWeightUsage));
+	int Remapped = 0;
+	for (int i = 0; i < Influences.Num(); i++)
+	{
+		FVertInfluence& I = Influences[i];
+		if (I.PointIndex < 0 || I.PointIndex >= PointCount)
+			continue;
+		const FSCDANativeBonePalette* P = PaletteByPoint[I.PointIndex];
+		if (!P)
+			continue;
+		int LocalBone = I.BoneIndex;
+		int PaletteIndex = PaletteIndexByPoint[I.PointIndex];
+		if (PaletteIndex >= 0 && PaletteIndex < 64 && LocalBone >= 0 && LocalBone < 64)
+		{
+			LocalUsage[PaletteIndex][LocalBone]++;
+			LocalWeightUsage[PaletteIndex][LocalBone] += I.Weight;
+		}
+		if (LocalBone >= 0 && LocalBone < 256 && P->Map[LocalBone] != 0xFF)
+		{
+			I.BoneIndex = P->Map[LocalBone];
+			Remapped++;
+		}
+	}
+	if (getenv("SC4_DEBUG_MESH"))
+	{
+		appPrintf("SCDA bone palette remap: influences=%d remapped=%d pointConflicts=%d\n",
+			Influences.Num(), Remapped, PointPaletteConflicts);
+		if (getenv("SCDA_DEBUG_PALETTE"))
+		{
+			for (int PaletteIndex = 0; PaletteIndex < Palettes.Num() && PaletteIndex < 64; PaletteIndex++)
+			{
+				appPrintf("  usage faces=%d-%d", Palettes[PaletteIndex].FirstFace, Palettes[PaletteIndex].LastFace);
+				for (int Local = 0; Local < 64; Local++)
+					if (LocalUsage[PaletteIndex][Local])
+						appPrintf(" %d:%d/%.1f", Local, LocalUsage[PaletteIndex][Local], LocalWeightUsage[PaletteIndex][Local]);
+				appPrintf("\n");
+			}
+		}
+	}
+	return Remapped > 0;
+	unguard;
+}
+
+static int CountSCDARawFaceRecordRun(FArchive &Ar, int Pos, int Stop, const TArray<FVector>& Points, bool BigEndian,
+	int& ValidCount, float& AreaScore, float& AvgMaxEdge, int& LongEdges)
+{
+	guard(CountSCDARawFaceRecordRun);
+	const int PointCount = Points.Num();
+	ValidCount = 0;
+	AreaScore = 0;
+	AvgMaxEdge = 3.4e38f;
+	LongEdges = 0;
+	if (PointCount <= 0 || Pos < 0 || Pos + 8 > Stop)
+		return 0;
+
+	int RawCount = 0;
+	float SumMaxEdge = 0;
+	for (int P = Pos; P <= Stop - 8; P += 8)
+	{
+		uint16 A = ReadSCDAUInt16At(Ar, P + 0, BigEndian);
+		uint16 B = ReadSCDAUInt16At(Ar, P + 2, BigEndian);
+		uint16 C = ReadSCDAUInt16At(Ar, P + 4, BigEndian);
+		uint16 Aux = ReadSCDAUInt16At(Ar, P + 6, BigEndian);
+		if (A >= PointCount || B >= PointCount || C >= PointCount || Aux > 255)
+			break;
+		RawCount++;
+		if (A == B || A == C || B == C)
+			continue;
+		const float Area = GetSCDATriangleAreaSq(Points, A, B, C);
+		if (Area > 1.0e14f)
+			continue;
+		const FVector& PA = Points[A];
+		const FVector& PB = Points[B];
+		const FVector& PC = Points[C];
+		const float ABx = PB.X - PA.X, ABy = PB.Y - PA.Y, ABz = PB.Z - PA.Z;
+		const float BCx = PC.X - PB.X, BCy = PC.Y - PB.Y, BCz = PC.Z - PB.Z;
+		const float CAx = PA.X - PC.X, CAy = PA.Y - PC.Y, CAz = PA.Z - PC.Z;
+		const float E0 = sqrt(ABx * ABx + ABy * ABy + ABz * ABz);
+		const float E1 = sqrt(BCx * BCx + BCy * BCy + BCz * BCz);
+		const float E2 = sqrt(CAx * CAx + CAy * CAy + CAz * CAz);
+		const float MaxEdge = max(E0, max(E1, E2));
+		SumMaxEdge += MaxEdge;
+		if (MaxEdge > 35.0f)
+			LongEdges++;
+		AreaScore += min(Area, 1000000.0f);
+		ValidCount++;
+		if (RawCount > 100000)
+			break;
+	}
+	if (ValidCount > 0)
+		AvgMaxEdge = SumMaxEdge / ValidCount;
+	return RawCount;
+	unguard;
+}
+
+static bool ReadSCDARawFaceRecordsChecked(FArchive &Ar, int Pos, int Stop, int RawCount, const TArray<FVector>& Points, bool BigEndian, TArray<VTriangle>& OutTriangles)
+{
+	guard(ReadSCDARawFaceRecordsChecked);
+	const int PointCount = Points.Num();
+	if (RawCount < 1 || PointCount <= 0 || Pos < 0 || Pos + RawCount * 8 > Stop)
+		return false;
+	OutTriangles.Empty(RawCount);
+	for (int i = 0; i < RawCount; i++)
+	{
+		int P = Pos + i * 8;
+		uint16 A = ReadSCDAUInt16At(Ar, P + 0, BigEndian);
+		uint16 B = ReadSCDAUInt16At(Ar, P + 2, BigEndian);
+		uint16 C = ReadSCDAUInt16At(Ar, P + 4, BigEndian);
+		uint16 Aux = ReadSCDAUInt16At(Ar, P + 6, BigEndian);
+		if (A >= PointCount || B >= PointCount || C >= PointCount || Aux > 255)
+		{
+			OutTriangles.Empty();
+			return false;
+		}
+		if (A == B || A == C || B == C)
+			continue;
+		const float Area = GetSCDATriangleAreaSq(Points, A, B, C);
+		if (Area > 1.0e14f)
+			continue;
+		int Index = OutTriangles.AddZeroed(1);
+		VTriangle &T = OutTriangles[Index];
+		T.WedgeIndex[0] = A;
+		T.WedgeIndex[1] = B;
+		T.WedgeIndex[2] = C;
+		T.MatIndex = Aux & 0xFF;
+		T.AuxMatIndex = 0;
+		T.SmoothingGroups = 0;
+	}
+	return OutTriangles.Num() > 0;
+	unguard;
+}
+
+struct FSCDAStripCandidate
+{
+	int Pos;
+	int IndexCount;
+	int TriangleCount;
+	int LongEdges;
+	float AvgMaxEdge;
+};
+
+static bool AppendSCDAStripTriangles(FArchive &Ar, int Pos, int IndexCount, const TArray<FVector>& Points, TArray<VTriangle>& OutTriangles)
+{
+	guard(AppendSCDAStripTriangles);
+	int IndexBase = OutTriangles.Num();
+	for (int i = 2; i < IndexCount; i++)
+	{
+		uint16 I0 = ReadSCDAUInt16At(Ar, Pos + (i - 2) * 2, false);
+		uint16 I1 = ReadSCDAUInt16At(Ar, Pos + (i - 1) * 2, false);
+		uint16 I2 = ReadSCDAUInt16At(Ar, Pos + i * 2, false);
+		uint16 A, B, C;
+		if (i & 1)
+		{
+			A = I0; B = I1; C = I2;
+		}
+		else
+		{
+			A = I1; B = I0; C = I2;
+		}
+		if (A >= Points.Num() || B >= Points.Num() || C >= Points.Num() || A == B || A == C || B == C)
+			continue;
+		int OutIndex = OutTriangles.AddZeroed(1);
+		VTriangle &T = OutTriangles[OutIndex];
+		T.WedgeIndex[0] = A;
+		T.WedgeIndex[1] = B;
+		T.WedgeIndex[2] = C;
+		T.MatIndex = 0;
+		T.AuxMatIndex = 0;
+		T.SmoothingGroups = 0;
+	}
+	return OutTriangles.Num() > IndexBase;
+	unguard;
+}
+
+static bool FindSCDACoherentStripBlocks(FArchive &Ar, int Start, int Stop, const TArray<FVector>& Points, int PointsPos, int VertexStride, TArray<VTriangle>& OutTriangles, int& OutPos)
+{
+	guard(FindSCDACoherentStripBlocks);
+	const int PointCount = Points.Num();
+	if (PointCount <= 0 || PointCount > 65535 || VertexStride <= 0)
+		return false;
+	int ScanStart = PointsPos + PointCount * VertexStride;
+	ScanStart = max(ScanStart, Start);
+	if (ScanStart >= Stop - 6)
+		return false;
+
+	TArray<FSCDAStripCandidate> Candidates;
+	for (int Pos = ScanStart; Pos <= Stop - 6; Pos += 2)
+	{
+		int IndexCount = 0;
+		int Triangles = 0;
+		int LongEdges = 0;
+		float SumMaxEdge = 0;
+		uint16 Prev2 = 0, Prev1 = 0;
+		for (int P = Pos; P <= Stop - 2; P += 2)
+		{
+			uint16 I = ReadSCDAUInt16At(Ar, P, false);
+			if (I >= PointCount)
+				break;
+			IndexCount++;
+			if (IndexCount < 3)
+			{
+				Prev2 = Prev1;
+				Prev1 = I;
+				continue;
+			}
+			uint16 A, B, C;
+			if (IndexCount & 1)
+			{
+				A = Prev2; B = Prev1; C = I;
+			}
+			else
+			{
+				A = Prev1; B = Prev2; C = I;
+			}
+			Prev2 = Prev1;
+			Prev1 = I;
+			if (A == B || A == C || B == C)
+				continue;
+			float DX = Points[A].X - Points[B].X;
+			float DY = Points[A].Y - Points[B].Y;
+			float DZ = Points[A].Z - Points[B].Z;
+			float E0 = sqrt(DX * DX + DY * DY + DZ * DZ);
+			DX = Points[B].X - Points[C].X;
+			DY = Points[B].Y - Points[C].Y;
+			DZ = Points[B].Z - Points[C].Z;
+			float E1 = sqrt(DX * DX + DY * DY + DZ * DZ);
+			DX = Points[C].X - Points[A].X;
+			DY = Points[C].Y - Points[A].Y;
+			DZ = Points[C].Z - Points[A].Z;
+			float E2 = sqrt(DX * DX + DY * DY + DZ * DZ);
+			float MaxEdge = max(E0, max(E1, E2));
+			SumMaxEdge += MaxEdge;
+			if (MaxEdge > 15.0f)
+				LongEdges++;
+			Triangles++;
+			if (IndexCount > 4096)
+				break;
+		}
+		if (Triangles >= 12)
+		{
+			float AvgMaxEdge = SumMaxEdge / Triangles;
+			if (AvgMaxEdge < 18.0f && LongEdges * 10 < Triangles)
+			{
+				FSCDAStripCandidate &C = Candidates[Candidates.AddDefaulted()];
+				C.Pos = Pos;
+				C.IndexCount = IndexCount;
+				C.TriangleCount = Triangles;
+				C.LongEdges = LongEdges;
+				C.AvgMaxEdge = AvgMaxEdge;
+				Pos += max(0, IndexCount * 2 - 2);
+			}
+		}
+	}
+	if (!Candidates.Num())
+		return false;
+
+	OutTriangles.Empty();
+	OutPos = Candidates[0].Pos;
+	for (int i = 0; i < Candidates.Num(); i++)
+		AppendSCDAStripTriangles(Ar, Candidates[i].Pos, Candidates[i].IndexCount, Points, OutTriangles);
+	if (OutTriangles.Num() < 60)
+		return false;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA coherent strip blocks: blocks=%d triangles=%d first=%08X\n",
+			Candidates.Num(), OutTriangles.Num(), OutPos);
+	return true;
+	unguard;
+}
+
 static bool FindSCDARawIndexBlock(FArchive &Ar, int Start, int Stop, const TArray<FVector>& Points, int PointsPos, TArray<VTriangle>& OutTriangles, int& OutPos)
 {
 	guard(FindSCDARawIndexBlock);
 	int PointCount = Points.Num();
 	if (PointCount <= 0 || PointCount > 65535)
 		return false;
+
+	if (PointCount <= 255)
+	{
+		int BestPos = 0;
+		int BestTriangleCount = 0;
+		bool BestStrip = false;
+		for (int Mode = 0; Mode < 2; Mode++)
+		{
+			const bool Strip = Mode != 0;
+			for (int Pos = Start; Pos <= Stop - (Strip ? 3 : 4); Pos++)
+			{
+				int TriangleCount = 0;
+				int IndexCount = 0;
+				byte Prev2 = 0, Prev1 = 0;
+				for (int P = Pos; P < Stop; P++)
+				{
+					byte I;
+					Ar.Seek(P);
+					Ar << I;
+					if (I >= PointCount)
+						break;
+					IndexCount++;
+					byte A, B, C;
+					if (!Strip)
+					{
+						if ((IndexCount % 3) != 0)
+							continue;
+						byte B0, B1;
+						Ar.Seek(P - 2);
+						Ar << B0 << B1;
+						A = B0; B = B1; C = I;
+					}
+					else
+					{
+						if (IndexCount < 3)
+						{
+							Prev2 = Prev1;
+							Prev1 = I;
+							continue;
+						}
+						if (IndexCount & 1)
+						{
+							A = Prev2; B = Prev1; C = I;
+						}
+						else
+						{
+							A = Prev1; B = Prev2; C = I;
+						}
+						Prev2 = Prev1;
+						Prev1 = I;
+					}
+					if (A == B || A == C || B == C)
+						continue;
+					float ABx = Points[B].X - Points[A].X;
+					float ABy = Points[B].Y - Points[A].Y;
+					float ABz = Points[B].Z - Points[A].Z;
+					float ACx = Points[C].X - Points[A].X;
+					float ACy = Points[C].Y - Points[A].Y;
+					float ACz = Points[C].Z - Points[A].Z;
+					float CX = ABy * ACz - ABz * ACy;
+					float CY = ABz * ACx - ABx * ACz;
+					float CZ = ABx * ACy - ABy * ACx;
+					float Area = CX * CX + CY * CY + CZ * CZ;
+					if (!IsSaneSCDATriangleArea(Area))
+					{
+						if (!Strip)
+							break;
+						continue;
+					}
+					TriangleCount++;
+					if (IndexCount > 20000)
+						break;
+				}
+				if (TriangleCount > BestTriangleCount)
+				{
+					BestPos = Pos;
+					BestTriangleCount = TriangleCount;
+					BestStrip = Strip;
+				}
+				if (!Strip && TriangleCount >= 30)
+					Pos += max(0, TriangleCount * 3 - 1);
+				else if (Strip && TriangleCount >= 30)
+					Pos += max(0, TriangleCount + 2 - 1);
+			}
+		}
+		if (BestTriangleCount >= 30)
+		{
+			OutTriangles.Empty(BestTriangleCount);
+			OutTriangles.AddZeroed(BestTriangleCount);
+			int OutIndex = 0;
+			byte Prev2 = 0, Prev1 = 0;
+			int IndexCount = 0;
+			for (int P = BestPos; P < Stop && OutIndex < BestTriangleCount; P++)
+			{
+				byte I;
+				Ar.Seek(P);
+				Ar << I;
+				if (I >= PointCount)
+					break;
+				IndexCount++;
+				byte A, B, C;
+				if (!BestStrip)
+				{
+					if ((IndexCount % 3) != 0)
+						continue;
+					byte B0, B1;
+					Ar.Seek(P - 2);
+					Ar << B0 << B1;
+					A = B0; B = B1; C = I;
+				}
+				else
+				{
+					if (IndexCount < 3)
+					{
+						Prev2 = Prev1;
+						Prev1 = I;
+						continue;
+					}
+					if (IndexCount & 1)
+					{
+						A = Prev2; B = Prev1; C = I;
+					}
+					else
+					{
+						A = Prev1; B = Prev2; C = I;
+					}
+					Prev2 = Prev1;
+					Prev1 = I;
+				}
+				if (A == B || A == C || B == C)
+					continue;
+				OutTriangles[OutIndex].WedgeIndex[0] = A;
+				OutTriangles[OutIndex].WedgeIndex[1] = B;
+				OutTriangles[OutIndex].WedgeIndex[2] = C;
+				OutIndex++;
+			}
+			OutTriangles.RemoveAt(OutIndex, OutTriangles.Num() - OutIndex);
+			OutPos = BestPos;
+			if (getenv("SC4_DEBUG_MESH"))
+				appPrintf("SCDA raw byte index block: pos=%08X triangles=%d mode=%s\n",
+					BestPos, OutTriangles.Num(), BestStrip ? "strip" : "list");
+			return true;
+		}
+	}
 
 	if (PointsPos >= Start + 8)
 	{
@@ -1101,64 +2323,60 @@ static bool FindSCDARawIndexBlock(FArchive &Ar, int Start, int Stop, const TArra
 	}
 
 	int BestRecordPos = 0;
-	int BestRecordCount = 0;
+	int BestRecordRawCount = 0;
+	int BestRecordValidCount = 0;
+	float BestRecordArea = 0;
+	float BestRecordAvgMaxEdge = 3.4e38f;
+	int BestRecordLongEdges = 0;
 	bool BestRecordBigEndian = false;
-	for (int Endian = 0; Endian < 2; Endian++)
+	for (int Endian = 0; Endian < 1; Endian++)
 	{
 		const bool BigEndian = Endian != 0;
 		for (int Pos = Start; Pos <= Stop - 8; Pos++)
 		{
-			int Count = 0;
-			for (int P = Pos; P <= Stop - 8; P += 8)
+			int ValidCount = 0;
+			float AreaScore = 0;
+			float AvgMaxEdge = 3.4e38f;
+			int LongEdges = 0;
+			const int RawCount = CountSCDARawFaceRecordRun(Ar, Pos, Stop, Points, BigEndian,
+				ValidCount, AreaScore, AvgMaxEdge, LongEdges);
+			if (AvgMaxEdge > 25.0f || LongEdges * 5 >= ValidCount)
 			{
-				uint16 A = ReadSCDAUInt16At(Ar, P + 0, BigEndian);
-				uint16 B = ReadSCDAUInt16At(Ar, P + 2, BigEndian);
-				uint16 C = ReadSCDAUInt16At(Ar, P + 4, BigEndian);
-				uint16 Aux = ReadSCDAUInt16At(Ar, P + 6, BigEndian);
-				if (A >= PointCount || B >= PointCount || C >= PointCount || Aux > 255)
-					break;
-				if (A == B || A == C || B == C)
-					break;
-				float ABx = Points[B].X - Points[A].X;
-				float ABy = Points[B].Y - Points[A].Y;
-				float ABz = Points[B].Z - Points[A].Z;
-				float ACx = Points[C].X - Points[A].X;
-				float ACy = Points[C].Y - Points[A].Y;
-				float ACz = Points[C].Z - Points[A].Z;
-				float CX = ABy * ACz - ABz * ACy;
-				float CY = ABz * ACx - ABx * ACz;
-				float CZ = ABx * ACy - ABy * ACx;
-				float Area = CX * CX + CY * CY + CZ * CZ;
-				if (Area < 0.000001f || Area > 1000000000.0f)
-					break;
-				Count++;
-				if (Count > 100000)
-					break;
+				if (RawCount >= 300)
+					Pos += RawCount * 8 - 1;
+				continue;
 			}
-			if (Count > BestRecordCount)
+			if (ValidCount > BestRecordValidCount || (ValidCount == BestRecordValidCount && AreaScore > BestRecordArea))
 			{
 				BestRecordPos = Pos;
-				BestRecordCount = Count;
+				BestRecordRawCount = RawCount;
+				BestRecordValidCount = ValidCount;
+				BestRecordArea = AreaScore;
+				BestRecordAvgMaxEdge = AvgMaxEdge;
+				BestRecordLongEdges = LongEdges;
 				BestRecordBigEndian = BigEndian;
 			}
-			if (Count >= 300)
-				Pos += Count * 8 - 1;
+			if (RawCount >= 300)
+				Pos += RawCount * 8 - 1;
 		}
 	}
-	if (BestRecordCount >= 300)
+	if (BestRecordValidCount >= 300)
 	{
-		if (!ReadSCDARawFaceRecords(Ar, BestRecordPos, Stop, BestRecordCount, PointCount, BestRecordBigEndian, OutTriangles))
+		if (!ReadSCDARawFaceRecordsChecked(Ar, BestRecordPos, Stop, BestRecordRawCount, Points, BestRecordBigEndian, OutTriangles))
 			return false;
 		OutPos = BestRecordPos;
 		if (getenv("SC4_DEBUG_MESH"))
-			appPrintf("SCDA raw face records: pos=%08X triangles=%d endian=%s stride=8\n",
-				BestRecordPos, OutTriangles.Num(), BestRecordBigEndian ? "BE" : "LE");
+			appPrintf("SCDA raw face records: pos=%08X triangles=%d raw=%d endian=%s stride=8 avgMaxEdge=%g long=%d\n",
+				BestRecordPos, OutTriangles.Num(), BestRecordRawCount, BestRecordBigEndian ? "BE" : "LE",
+				BestRecordAvgMaxEdge, BestRecordLongEdges);
 		return true;
 	}
 
 	int BestPos = 0;
 	int BestTriangleCount = 0;
 	float BestArea = 0;
+	float BestAvgMaxEdge = 3.4e38f;
+	int BestLongEdges = 0;
 	bool BestBigEndian = false;
 	bool BestStrip = false;
 
@@ -1173,6 +2391,8 @@ static bool FindSCDARawIndexBlock(FArchive &Ar, int Start, int Stop, const TArra
 				int TriangleCount = 0;
 				int IndexCount = 0;
 				float AreaScore = 0;
+				float SumMaxEdge = 0;
+				int LongEdges = 0;
 				uint16 Prev2 = 0, Prev1 = 0;
 				for (int P = Pos; P <= Stop - 2; P += 2)
 				{
@@ -1222,28 +2442,47 @@ static bool FindSCDARawIndexBlock(FArchive &Ar, int Start, int Stop, const TArra
 					float ACx = Points[C].X - Points[A].X;
 					float ACy = Points[C].Y - Points[A].Y;
 					float ACz = Points[C].Z - Points[A].Z;
+					const float E0 = sqrt(ABx * ABx + ABy * ABy + ABz * ABz);
+					float BCx = Points[C].X - Points[B].X;
+					float BCy = Points[C].Y - Points[B].Y;
+					float BCz = Points[C].Z - Points[B].Z;
+					const float E1 = sqrt(BCx * BCx + BCy * BCy + BCz * BCz);
+					float CAx = Points[A].X - Points[C].X;
+					float CAy = Points[A].Y - Points[C].Y;
+					float CAz = Points[A].Z - Points[C].Z;
+					const float E2 = sqrt(CAx * CAx + CAy * CAy + CAz * CAz);
+					const float MaxEdge = max(E0, max(E1, E2));
 					float CX = ABy * ACz - ABz * ACy;
 					float CY = ABz * ACx - ABx * ACz;
 					float CZ = ABx * ACy - ABy * ACx;
 					float Area = CX * CX + CY * CY + CZ * CZ;
-					if (Area < 0.000001f || Area > 100000000.0f)
+					if (!IsSaneSCDATriangleArea(Area))
 					{
 						if (!Strip)
 							break;
 						continue;
 					}
 					AreaScore += min(Area, 1000000.0f);
+					SumMaxEdge += MaxEdge;
+					if (MaxEdge > 35.0f)
+						LongEdges++;
 					TriangleCount++;
 					if (IndexCount > 200000)
 						break;
 				}
 				if (TriangleCount < 100)
 					continue;
-				if (TriangleCount > BestTriangleCount || (TriangleCount == BestTriangleCount && AreaScore > BestArea))
+				const float AvgMaxEdge = SumMaxEdge / TriangleCount;
+				if (AvgMaxEdge > 25.0f || LongEdges * 5 >= TriangleCount)
+					continue;
+				if (TriangleCount > BestTriangleCount || (TriangleCount == BestTriangleCount && AvgMaxEdge < BestAvgMaxEdge) ||
+					(TriangleCount == BestTriangleCount && AvgMaxEdge == BestAvgMaxEdge && AreaScore > BestArea))
 				{
 					BestPos = Pos;
 					BestTriangleCount = TriangleCount;
 					BestArea = AreaScore;
+					BestAvgMaxEdge = AvgMaxEdge;
+					BestLongEdges = LongEdges;
 					BestBigEndian = BigEndian;
 					BestStrip = Strip;
 				}
@@ -1307,6 +2546,960 @@ static bool FindSCDARawIndexBlock(FArchive &Ar, int Start, int Stop, const TArra
 	if (getenv("SC4_DEBUG_MESH"))
 		appPrintf("SCDA raw index block: pos=%08X triangles=%d endian=%s mode=%s\n",
 			BestPos, OutTriangles.Num(), BestBigEndian ? "BE" : "LE", BestStrip ? "strip" : "list");
+	return true;
+	unguard;
+}
+
+static bool FindSCDAPackedMeshBlock(FArchive &Ar, int Start, int Stop, TArray<FVector>& OutPoints, TArray<VTriangle>& OutTriangles, int& OutPointsPos, int& OutIndicesPos)
+{
+	guard(FindSCDAPackedMeshBlock);
+	int BestPointsPos = 0;
+	int BestIndicesPos = 0;
+	int BestStride = 0;
+	int BestTriangleCount = 0;
+	bool bSawLargeVertexCandidate = false;
+	TArray<FVector> BestPoints;
+	TArray<VTriangle> BestTriangles;
+
+	for (int Stride = 20; Stride <= 48; Stride += 4)
+	{
+		for (int Base = Start; Base < Start + Stride && Base <= Stop - 6; Base++)
+		{
+			int Count = 0;
+			int MinX =  0x7FFFFFFF, MinY =  0x7FFFFFFF, MinZ =  0x7FFFFFFF;
+			int MaxX = -0x7FFFFFFF, MaxY = -0x7FFFFFFF, MaxZ = -0x7FFFFFFF;
+			int LastX = 0, LastY = 0, LastZ = 0;
+			for (int Pos = Base; Pos <= Stop - Stride; Pos += Stride)
+			{
+				int16 X, Y, Z;
+				Ar.Seek(Pos);
+				Ar << X << Y << Z;
+				if (X == -32768 || Y == -32768 || Z == -32768)
+					break;
+				if (abs((int)X) > 30000 || abs((int)Y) > 30000 || abs((int)Z) > 30000)
+					break;
+				if (Count > 0 &&
+					(abs((int)X - LastX) > 12000 || abs((int)Y - LastY) > 12000 || abs((int)Z - LastZ) > 12000))
+					break;
+				MinX = min(MinX, (int)X); MaxX = max(MaxX, (int)X);
+				MinY = min(MinY, (int)Y); MaxY = max(MaxY, (int)Y);
+				MinZ = min(MinZ, (int)Z); MaxZ = max(MaxZ, (int)Z);
+				LastX = X; LastY = Y; LastZ = Z;
+				Count++;
+				if (Count > 100000)
+					break;
+			}
+			int Extent = (MaxX - MinX) + (MaxY - MinY) + (MaxZ - MinZ);
+			if (Count < 64 || Extent < 256)
+				continue;
+			if (Count >= 512)
+				bSawLargeVertexCandidate = true;
+
+			TArray<FVector> TestPoints;
+			TestPoints.Empty(Count);
+			TestPoints.AddUninitialized(Count);
+			for (int i = 0; i < Count; i++)
+			{
+				int16 X, Y, Z;
+				Ar.Seek(Base + i * Stride);
+				Ar << X << Y << Z;
+				TestPoints[i].Set(X / 32.0f, Y / 32.0f, Z / 32.0f);
+			}
+
+			TArray<VTriangle> TestTriangles;
+			int TestIndicesPos = 0;
+			if (!FindSCDARawIndexBlock(Ar, Start, Stop, TestPoints, Base, TestTriangles, TestIndicesPos))
+				continue;
+			if (TestTriangles.Num() > BestTriangleCount)
+			{
+				CopyArray(BestPoints, TestPoints);
+				CopyArray(BestTriangles, TestTriangles);
+				BestPointsPos = Base;
+				BestIndicesPos = TestIndicesPos;
+				BestStride = Stride;
+				BestTriangleCount = TestTriangles.Num();
+			}
+		}
+	}
+
+	if (!BestTriangleCount)
+		return false;
+	if (bSawLargeVertexCandidate && BestPoints.Num() < 512)
+	{
+		if (getenv("SC4_DEBUG_MESH"))
+			appPrintf("SCDA packed mesh rejected tiny indexed candidate: points=%d triangles=%d; larger vertex candidate present\n",
+				BestPoints.Num(), BestTriangles.Num());
+		return false;
+	}
+	CopyArray(OutPoints, BestPoints);
+	CopyArray(OutTriangles, BestTriangles);
+	OutPointsPos = BestPointsPos;
+	OutIndicesPos = BestIndicesPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA packed mesh block: points=%d triangles=%d stride=%d pointsPos=%08X indicesPos=%08X first=(%g,%g,%g)\n",
+			OutPoints.Num(), OutTriangles.Num(), BestStride, OutPointsPos, OutIndicesPos,
+			OutPoints[0].X, OutPoints[0].Y, OutPoints[0].Z);
+	return true;
+	unguard;
+}
+
+static bool FindSCDARawWedgeIndexBlock(FArchive &Ar, int Start, int Stop, const TArray<FVector>& Points, const TArray<FMeshWedge>& Wedges, TArray<VTriangle>& OutTriangles, int& OutPos)
+{
+	guard(FindSCDARawWedgeIndexBlock);
+	const int WedgeCount = Wedges.Num();
+	if (WedgeCount <= 0 || WedgeCount > 65535 || Points.Num() <= 0)
+		return false;
+	Start = max(Start, 0);
+	if (Start >= Stop - 6)
+		return false;
+
+	int BestPos = 0;
+	int BestTriangleCount = 0;
+	float BestArea = 0;
+	float BestAvgMaxEdge = 3.4e38f;
+	int BestLongEdges = 0;
+	bool BestBigEndian = false;
+	bool BestStrip = false;
+
+	for (int Endian = 0; Endian < 2; Endian++)
+	{
+		const bool BigEndian = Endian != 0;
+		for (int Mode = 0; Mode < 2; Mode++)
+		{
+			const bool Strip = Mode != 0;
+			for (int Pos = Start; Pos <= Stop - (Strip ? 8 : 6); Pos += 2)
+			{
+				int TriangleCount = 0;
+				int IndexCount = 0;
+				float AreaScore = 0;
+				float SumMaxEdge = 0;
+				int LongEdges = 0;
+				uint16 Prev2 = 0, Prev1 = 0;
+				for (int P = Pos; P <= Stop - 2; P += 2)
+				{
+					const uint16 I = ReadSCDAUInt16At(Ar, P, BigEndian);
+					if (I >= WedgeCount)
+						break;
+					IndexCount++;
+					if (!Strip && (IndexCount % 3) != 0)
+						continue;
+					if (Strip && IndexCount < 3)
+					{
+						Prev2 = Prev1;
+						Prev1 = I;
+						continue;
+					}
+
+					uint16 A, B, C;
+					if (!Strip)
+					{
+						A = ReadSCDAUInt16At(Ar, P - 4, BigEndian);
+						B = ReadSCDAUInt16At(Ar, P - 2, BigEndian);
+						C = I;
+					}
+					else if (IndexCount & 1)
+					{
+						A = Prev2; B = Prev1; C = I;
+					}
+					else
+					{
+						A = Prev1; B = Prev2; C = I;
+					}
+					Prev2 = Prev1;
+					Prev1 = I;
+
+					if (A == B || A == C || B == C)
+						continue;
+					float Area, MaxEdge;
+					if (!GetSCDAWedgeTriangleMetrics(Points, Wedges, A, B, C, Area, MaxEdge) || !IsSaneSCDATriangleArea(Area))
+					{
+						if (!Strip)
+							break;
+						continue;
+					}
+					AreaScore += min(Area, 1000000.0f);
+					SumMaxEdge += MaxEdge;
+					if (MaxEdge > 35.0f)
+						LongEdges++;
+					TriangleCount++;
+					if (IndexCount > 200000)
+						break;
+				}
+				if (TriangleCount < 100)
+					continue;
+				const float AvgMaxEdge = SumMaxEdge / TriangleCount;
+				if (AvgMaxEdge > 25.0f || LongEdges * 5 >= TriangleCount)
+					continue;
+				if (TriangleCount > BestTriangleCount || (TriangleCount == BestTriangleCount && AvgMaxEdge < BestAvgMaxEdge) ||
+					(TriangleCount == BestTriangleCount && AvgMaxEdge == BestAvgMaxEdge && AreaScore > BestArea))
+				{
+					BestPos = Pos;
+					BestTriangleCount = TriangleCount;
+					BestArea = AreaScore;
+					BestAvgMaxEdge = AvgMaxEdge;
+					BestLongEdges = LongEdges;
+					BestBigEndian = BigEndian;
+					BestStrip = Strip;
+				}
+				if (!Strip)
+					Pos += max(0, TriangleCount * 6 - 2);
+				else
+					Pos += max(0, (TriangleCount + 2) * 2 - 2);
+			}
+		}
+	}
+	if (!BestTriangleCount)
+		return false;
+
+	OutTriangles.Empty(BestTriangleCount);
+	OutTriangles.AddZeroed(BestTriangleCount);
+	int OutIndex = 0;
+	uint16 Prev2 = 0, Prev1 = 0;
+	int IndexCount = 0;
+	for (int P = BestPos; P <= Stop - 2 && OutIndex < BestTriangleCount; P += 2)
+	{
+		const uint16 I = ReadSCDAUInt16At(Ar, P, BestBigEndian);
+		if (I >= WedgeCount)
+			break;
+		IndexCount++;
+		uint16 A, B, C;
+		if (!BestStrip)
+		{
+			if ((IndexCount % 3) != 0)
+				continue;
+			A = ReadSCDAUInt16At(Ar, P - 4, BestBigEndian);
+			B = ReadSCDAUInt16At(Ar, P - 2, BestBigEndian);
+			C = I;
+		}
+		else
+		{
+			if (IndexCount < 3)
+			{
+				Prev2 = Prev1;
+				Prev1 = I;
+				continue;
+			}
+			if (IndexCount & 1)
+			{
+				A = Prev2; B = Prev1; C = I;
+			}
+			else
+			{
+				A = Prev1; B = Prev2; C = I;
+			}
+			Prev2 = Prev1;
+			Prev1 = I;
+		}
+		if (A == B || A == C || B == C)
+			continue;
+		float Area;
+		if (!GetSCDAWedgeTriangleAreaSq(Points, Wedges, A, B, C, Area) || !IsSaneSCDATriangleArea(Area))
+			continue;
+		OutTriangles[OutIndex].WedgeIndex[0] = A;
+		OutTriangles[OutIndex].WedgeIndex[1] = B;
+		OutTriangles[OutIndex].WedgeIndex[2] = C;
+		OutIndex++;
+	}
+	OutTriangles.RemoveAt(OutIndex, OutTriangles.Num() - OutIndex);
+	OutPos = BestPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA raw wedge index block: pos=%08X triangles=%d wedges=%d endian=%s mode=%s avgMaxEdge=%g long=%d\n",
+			BestPos, OutTriangles.Num(), WedgeCount, BestBigEndian ? "BE" : "LE", BestStrip ? "strip" : "list", BestAvgMaxEdge, BestLongEdges);
+	return OutTriangles.Num() >= 100;
+	unguard;
+}
+
+static void DumpSCDADenseIndexStreams(FArchive &Ar, int Start, int Stop, int PointCount)
+{
+	guard(DumpSCDADenseIndexStreams);
+	if (!getenv("SC4_DEBUG_MESH") || PointCount <= 0)
+		return;
+
+	struct FDenseIndexRun
+	{
+		int Pos;
+		int Count;
+		int MaxIndex;
+		int OverPointCount;
+		int Over4096;
+	};
+	TArray<FDenseIndexRun> Runs;
+	const int MaxAllowed = 5000;
+	for (int Pos = Start; Pos <= Stop - 16; Pos += 2)
+	{
+		int Count = 0;
+		int MaxIndex = 0;
+		int OverPointCount = 0;
+		int Over4096 = 0;
+		for (int P = Pos; P <= Stop - 2; P += 2)
+		{
+			const int Value = ReadSCDAUInt16At(Ar, P, false);
+			if (Value > MaxAllowed && Value != 0xFFFF)
+				break;
+			if (Value != 0xFFFF)
+			{
+				MaxIndex = max(MaxIndex, Value);
+				if (Value >= PointCount)
+					OverPointCount++;
+				if (Value >= 4096)
+					Over4096++;
+			}
+			Count++;
+			if (Count > 20000)
+				break;
+		}
+		if (Count >= 512 && MaxIndex >= 512)
+		{
+			FDenseIndexRun& Run = Runs[Runs.AddDefaulted()];
+			Run.Pos = Pos;
+			Run.Count = Count;
+			Run.MaxIndex = MaxIndex;
+			Run.OverPointCount = OverPointCount;
+			Run.Over4096 = Over4096;
+			Pos += max(0, Count * 2 - 2);
+		}
+	}
+	if (!Runs.Num())
+		return;
+	appPrintf("SCDA dense index-like streams for pointCount=%d:\n", PointCount);
+	for (int i = 0; i < Runs.Num() && i < 12; i++)
+	{
+		const FDenseIndexRun& Run = Runs[i];
+		appPrintf("  stream pos=%08X count=%d end=%08X max=%d overPoints=%d over4096=%d\n",
+			Run.Pos, Run.Count, Run.Pos + Run.Count * 2, Run.MaxIndex, Run.OverPointCount, Run.Over4096);
+	}
+	unguard;
+}
+
+static bool HasSCDAPlainRemap16(FArchive &Ar, int Pos, int Count, int PointCount)
+{
+	guard(HasSCDAPlainRemap16);
+	int Bad = 0;
+	int MaxValue = 0;
+	for (int i = 0; i < Count; i++)
+	{
+		const int Value = ReadSCDAUInt16At(Ar, Pos + i * 2, false);
+		MaxValue = max(MaxValue, Value);
+		if (Value >= PointCount)
+		{
+			if (++Bad > 32)
+				return false;
+		}
+	}
+	return MaxValue >= min(PointCount - 1, 512);
+	unguard;
+}
+
+static bool HasSCDAPlainRemap32(FArchive &Ar, int Pos, int Count, int PointCount)
+{
+	guard(HasSCDAPlainRemap32);
+	int Bad = 0;
+	int MaxValue = 0;
+	for (int i = 0; i < Count; i++)
+	{
+		const unsigned Value = ReadSCDAUInt32At(Ar, Pos + i * 4, false);
+		if (Value < (unsigned)PointCount)
+			MaxValue = max(MaxValue, (int)Value);
+		else if (++Bad > 32)
+			return false;
+	}
+	return MaxValue >= min(PointCount - 1, 512);
+	unguard;
+}
+
+static void DumpSCDALodLikeBuffers(FArchive &Ar, int Start, int Stop, int PointCount, int PointsPos)
+{
+	guard(DumpSCDALodLikeBuffers);
+	if (!getenv("SC4_DEBUG_MESH") || PointCount <= 0 || PointsPos <= Start)
+	{
+		if (getenv("SCDA_DEBUG_LOD_SCAN"))
+			appPrintf("SCDA lod-like scan skipped: start=%08X stop=%08X pointsPos=%08X pointCount=%d\n", Start, Stop, PointsPos, PointCount);
+		return;
+	}
+	if (getenv("SCDA_DEBUG_LOD_SCAN"))
+		appPrintf("SCDA lod-like scan: start=%08X stop=%08X pointsPos=%08X pointCount=%d\n", Start, Stop, PointsPos, PointCount);
+
+	int Printed = 0;
+	for (int Header = Start; Header + 0x38 <= min(Stop, PointsPos); Header++)
+	{
+		const unsigned SectionCount = ReadSCDAUInt32At(Ar, Header + 0x00, false);
+		const unsigned Count = ReadSCDAUInt32At(Ar, Header + 0x04, false);
+		const unsigned ByteSize = ReadSCDAUInt32At(Ar, Header + 0x34, false);
+		if (getenv("SCDA_DEBUG_LOD_SCAN") && Count == 8072)
+			appPrintf("SCDA lod-like count probe: header=%08X sections=%u count=%u byteSize=%u dataEnd=%08X pointsPos=%08X\n",
+				Header, SectionCount, Count, ByteSize, Header + 0x38 + ByteSize, PointsPos);
+		if (SectionCount < 1 || SectionCount > 16 || Count < 512 || Count > 20000)
+			continue;
+		const unsigned Extra2 = (ByteSize >= Count * 2) ? ByteSize - Count * 2 : 0xFFFFFFFF;
+		const unsigned Extra4 = (ByteSize >= Count * 4) ? ByteSize - Count * 4 : 0xFFFFFFFF;
+		const unsigned Extra8 = (ByteSize >= Count * 8) ? ByteSize - Count * 8 : 0xFFFFFFFF;
+		if (Extra2 > 0x80 && Extra4 > 0x80 && Extra8 > 0x80)
+			continue;
+		const int DataPos = Header + 0x38;
+		const int DataEnd = DataPos + ByteSize;
+		if (DataEnd > Stop || DataEnd > PointsPos)
+			continue;
+
+		int MaxRaw = 0;
+		int Max13 = 0;
+		int OverPointsRaw = 0;
+		int OverPoints13 = 0;
+		int HighFlagWords = 0;
+		const int WordCount = ByteSize / 2;
+		for (int i = 0; i < WordCount; i++)
+		{
+			const int Value = ReadSCDAUInt16At(Ar, DataPos + i * 2, false);
+			const int Value13 = Value & 0x1FFF;
+			MaxRaw = max(MaxRaw, Value);
+			Max13 = max(Max13, Value13);
+			if (Value >= PointCount)
+				OverPointsRaw++;
+			if (Value13 >= PointCount)
+				OverPoints13++;
+			if (Value & 0xE000)
+				HighFlagWords++;
+		}
+
+		int Remap16Pos = 0;
+		int Remap32Pos = 0;
+		for (int Pos = DataEnd; Pos + (int)Count * 2 <= PointsPos && !Remap16Pos; Pos += 2)
+		{
+			if (HasSCDAPlainRemap16(Ar, Pos, Count, PointCount))
+				Remap16Pos = Pos;
+		}
+		for (int Pos = DataEnd; Pos + (int)Count * 4 <= PointsPos && !Remap32Pos; Pos += 4)
+		{
+			if (HasSCDAPlainRemap32(Ar, Pos, Count, PointCount))
+				Remap32Pos = Pos;
+		}
+
+		const unsigned BestExtra = min(Extra2, min(Extra4, Extra8));
+		appPrintf("SCDA lod-like buffer: header=%08X sections=%u count=%u byteSize=%u extra=%u data=%08X-%08X words=%d maxRaw=%d max13=%d overPointsRaw=%d overPoints13=%d highFlags=%d remap16=%08X remap32=%08X\n",
+			Header, SectionCount, Count, ByteSize, BestExtra, DataPos, DataEnd, WordCount, MaxRaw, Max13, OverPointsRaw, OverPoints13, HighFlagWords, Remap16Pos, Remap32Pos);
+		if (++Printed >= 8)
+			break;
+	}
+	unguard;
+}
+
+static bool ReadSCDALodLikeTopology(FArchive &Ar, int Start, int Stop, const TArray<FVector>& Points, TArray<VTriangle>& OutTriangles, int& OutPos)
+{
+	guard(ReadSCDALodLikeTopology);
+	const int PointCount = Points.Num();
+	if (PointCount <= 0)
+		return false;
+
+	for (int Header = Start; Header + 0x38 <= Stop; Header++)
+	{
+		const unsigned SectionCount = ReadSCDAUInt32At(Ar, Header + 0x00, false);
+		const unsigned Count = ReadSCDAUInt32At(Ar, Header + 0x04, false);
+		const unsigned ByteSize = ReadSCDAUInt32At(Ar, Header + 0x34, false);
+		if (SectionCount < 1 || SectionCount > 16 || Count < 512 || Count > 20000)
+			continue;
+		if (ByteSize < Count * 3 || ByteSize > Count * 5 || ByteSize > 0x40000)
+			continue;
+		const int DataPos = Header + 0x38;
+		const int DataEnd = DataPos + ByteSize;
+		if (DataEnd > Stop)
+			continue;
+
+		int Max13 = 0;
+		for (int Pos = DataPos; Pos < DataEnd; Pos += 2)
+			Max13 = max(Max13, (int)(ReadSCDAUInt16At(Ar, Pos, false) & 0x1FFF));
+		const int Divisor = (Max13 >= PointCount * 2 && Max13 < PointCount * 4) ? 3 : 1;
+
+		TArray<VTriangle> TestTriangles;
+		TestTriangles.Empty(ByteSize / 6);
+		TArray<FMeshWedge> TempWedges;
+		TempWedges.Empty(PointCount);
+		TempWedges.AddZeroed(PointCount);
+		for (int i = 0; i < PointCount; i++)
+			TempWedges[i].iVertex = i;
+		int LongEdges = 0;
+		float SumMaxEdge = 0;
+		for (int Pos = DataPos; Pos + 5 < DataEnd; Pos += 6)
+		{
+			const int A = (ReadSCDAUInt16At(Ar, Pos + 0, false) & 0x1FFF) / Divisor;
+			const int B = (ReadSCDAUInt16At(Ar, Pos + 2, false) & 0x1FFF) / Divisor;
+			const int C = (ReadSCDAUInt16At(Ar, Pos + 4, false) & 0x1FFF) / Divisor;
+			if (A >= PointCount || B >= PointCount || C >= PointCount || A == B || A == C || B == C)
+				continue;
+			float Area, MaxEdge;
+			if (!GetSCDAWedgeTriangleMetrics(Points, TempWedges, A, B, C, Area, MaxEdge) || !IsSaneSCDATriangleArea(Area))
+				continue;
+			int OutIndex = TestTriangles.AddZeroed(1);
+			VTriangle& T = TestTriangles[OutIndex];
+			T.WedgeIndex[0] = A;
+			T.WedgeIndex[1] = B;
+			T.WedgeIndex[2] = C;
+			T.MatIndex = 0;
+			T.AuxMatIndex = 0;
+			T.SmoothingGroups = 0;
+			SumMaxEdge += MaxEdge;
+			if (MaxEdge > 35.0f)
+				LongEdges++;
+		}
+		if (TestTriangles.Num() < 300)
+			continue;
+		CopyArray(OutTriangles, TestTriangles);
+		OutPos = DataPos;
+		if (getenv("SC4_DEBUG_MESH"))
+			appPrintf("SCDA lod-like topology: header=%08X indices=%08X-%08X triangles=%d sections=%u count=%u mask=1FFF divisor=%d avgMaxEdge=%g long=%d\n",
+				Header, DataPos, DataEnd, OutTriangles.Num(), SectionCount, Count, Divisor,
+				SumMaxEdge / max(1, OutTriangles.Num()), LongEdges);
+		return true;
+	}
+	return false;
+	unguard;
+}
+
+static bool FindSCDABestWedge8Stream(FArchive &Ar, int Start, int Stop, int PointCount, TArray<FMeshWedge>& OutWedges, int& OutPos, int& OutEnd);
+
+static bool FindSCDAPackedFloatMeshBlock(FArchive &Ar, int Start, int Stop,
+	TArray<FVector>& OutPoints, TArray<FMeshWedge>& OutWedges, TArray<VTriangle>& OutTriangles, int& OutPointsPos, int& OutIndicesPos,
+	const TArray<FMeshWedge> *KnownWedges = NULL, int KnownWedgesEnd = 0, int ExpectedPointCount = 0, bool ScanTopology = true)
+{
+	guard(FindSCDAPackedFloatMeshBlock);
+	int BestPointsPos = 0;
+	int BestIndicesPos = 0;
+	int BestPointCount = 0;
+	int BestStride = 0;
+	int BestPosOffset = 0;
+	int BestUvOffset = -1;
+	int BestLayoutIndex = -1;
+	int BestTailBytes = 0x7FFFFFFF;
+	float BestScore = -3.4e38f;
+	TArray<FVector> BestPoints;
+	TArray<FMeshWedge> BestWedges;
+	TArray<VTriangle> BestTriangles;
+
+	struct FScdaPcVertexLayout
+	{
+		int Stride;
+		int PosOffset;
+		int UvOffset;
+		int Align;
+		int SearchStart;
+		int SearchStop;
+		int MinCount;
+		float MinExtent;
+		float MaxExtent;
+	};
+	FScdaPcVertexLayout Layouts[2];
+	Layouts[0].Stride = 36;
+	Layouts[0].PosOffset = 13;
+	Layouts[0].UvOffset = 25;
+	Layouts[0].Align = 0;
+	Layouts[0].SearchStart = Start;
+	Layouts[0].SearchStop = Stop;
+	Layouts[0].MinCount = 1024;
+	Layouts[0].MinExtent = 10.0f;
+	Layouts[0].MaxExtent = 5000.0f;
+	Layouts[1].Stride = 16;
+	Layouts[1].PosOffset = 2;
+	Layouts[1].UvOffset = -1;
+	Layouts[1].Align = 16;
+	Layouts[1].SearchStart = max(Start, Stop - 0x20000);
+	Layouts[1].SearchStop = Stop;
+	Layouts[1].MinCount = 512;
+	Layouts[1].MinExtent = 10.0f;
+	Layouts[1].MaxExtent = 10000.0f;
+
+	const int LayoutCount = ARRAY_COUNT(Layouts);
+	for (int LayoutIndex = 0; LayoutIndex < LayoutCount; LayoutIndex++)
+	{
+		const FScdaPcVertexLayout& Layout = Layouts[LayoutIndex];
+		for (int Base = Layout.SearchStart; Base < Layout.SearchStop && Base + Layout.PosOffset + 12 <= Stop; Base++)
+		{
+			if (Layout.UvOffset >= 0 && Base + Layout.UvOffset + 4 > Stop)
+				continue;
+			if (Layout.Align && ((Base - Start) % Layout.Align) != 0)
+				continue;
+			int Count = 0;
+			FVector Min, Max;
+			Min.Set(3.4e38f, 3.4e38f, 3.4e38f);
+			Max.Set(-3.4e38f, -3.4e38f, -3.4e38f);
+			for (int Pos = Base; Pos + Layout.PosOffset + 12 <= Stop; Pos += Layout.Stride)
+			{
+				if (Layout.UvOffset >= 0 && Pos + Layout.UvOffset + 4 > Stop)
+					break;
+				const float X = ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 0, false);
+				const float Y = ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 4, false);
+				const float Z = ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 8, false);
+				if (!IsSaneSCDAFloat(X) || !IsSaneSCDAFloat(Y) || !IsSaneSCDAFloat(Z))
+					break;
+				if (Layout.Stride == 16 && Count == 0 &&
+					fabs(X) < 0.000001f && fabs(Y) < 0.000001f && fabs(Z) < 0.000001f)
+					break;
+				Min.X = min(Min.X, X); Min.Y = min(Min.Y, Y); Min.Z = min(Min.Z, Z);
+				Max.X = max(Max.X, X); Max.Y = max(Max.Y, Y); Max.Z = max(Max.Z, Z);
+				Count++;
+				if (ExpectedPointCount > 0 && Count >= ExpectedPointCount)
+					break;
+				if (Count > 65535)
+					break;
+			}
+			if (Count < Layout.MinCount)
+				continue;
+			const float Extent = (Max.X - Min.X) + (Max.Y - Min.Y) + (Max.Z - Min.Z);
+			if (Extent < Layout.MinExtent || Extent > Layout.MaxExtent)
+				continue;
+			const float DimX = Max.X - Min.X;
+			const float DimY = Max.Y - Min.Y;
+			const float DimZ = Max.Z - Min.Z;
+			const float MinDim = min(DimX, min(DimY, DimZ));
+			const float MaxDim = max(DimX, max(DimY, DimZ));
+			const float MidDim = DimX + DimY + DimZ - MinDim - MaxDim;
+			if (Layout.Stride == 36 && (MinDim < 5.0f || MaxDim / MinDim > 12.0f))
+				continue;
+			if (Layout.Stride == 36 && Count > 5000 && MidDim / MaxDim < 0.5f)
+				continue;
+			bool bLargeBodyOriented = false;
+			if (Layout.Stride == 36 && ExpectedPointCount == 0 && Count > 1500 && Base != Start)
+			{
+				if (DimX < 50.0f || DimZ < 50.0f || DimY > max(DimX, DimZ) * 0.5f)
+					continue;
+				bLargeBodyOriented = true;
+			}
+			else if (Layout.Stride == 36 && ExpectedPointCount == 0 && Base != Start && Count > 1024)
+			{
+				if (DimX < 50.0f || DimZ < 50.0f)
+					continue;
+			}
+			if (Layout.Stride == 36 && ExpectedPointCount > 0 && Count != ExpectedPointCount)
+				continue;
+			const int TailBytes = Stop - (Base + Count * Layout.Stride);
+			if (Layout.Stride == 16 && TailBytes > 0x40)
+				continue;
+			if (Layout.Stride == 16 && TailBytes < 0)
+				continue;
+
+			TArray<FVector> TestPoints;
+			TArray<FMeshWedge> TestWedges;
+			TestPoints.Empty(Count);
+			TestPoints.AddUninitialized(Count);
+			TestWedges.Empty(Count);
+			TestWedges.AddZeroed(Count);
+			for (int i = 0; i < Count; i++)
+			{
+				const int Pos = Base + i * Layout.Stride;
+				TestPoints[i].Set(
+					ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 0, false),
+					ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 4, false),
+					ReadSCDAFloatAt(Ar, Pos + Layout.PosOffset + 8, false)
+				);
+				TestWedges[i].iVertex = i;
+				if (Layout.UvOffset >= 0)
+				{
+					TestWedges[i].TexUV.U = ReadSCDAUInt16At(Ar, Pos + Layout.UvOffset + 0, false) / 2048.0f;
+					TestWedges[i].TexUV.V = ReadSCDAUInt16At(Ar, Pos + Layout.UvOffset + 2, false) / 2048.0f;
+				}
+			}
+
+			bool bBetter = false;
+			float Score = 0;
+			if (Layout.Stride == 36)
+			{
+				const float Balance = MinDim / max(1.0f, MaxDim) + MidDim / max(1.0f, MaxDim);
+				Score = Count * 1.0f + Balance * 250.0f;
+				if (ExpectedPointCount > 0)
+					Score += 100000.0f - abs(Count - ExpectedPointCount) * 1000.0f;
+			}
+			if (!BestPointCount)
+			{
+				bBetter = true;
+			}
+			else if (LayoutIndex == 0)
+			{
+				if (ExpectedPointCount == 0 && bLargeBodyOriented && BestPointsPos != Start)
+					bBetter = (Base > BestPointsPos + BestPointCount * BestStride);
+				else if (ExpectedPointCount < 0)
+					bBetter = (Count > BestPointCount);
+				else
+					bBetter = (Score > BestScore);
+			}
+			else
+			{
+				// The 16-byte Double Agent stream is a tail block; prefer the candidate
+				// which lands closest to the export end, then the longest stream.
+				bBetter = (TailBytes < BestTailBytes) || (TailBytes == BestTailBytes && Count > BestPointCount);
+			}
+
+			if (bBetter)
+			{
+				CopyArray(BestPoints, TestPoints);
+				CopyArray(BestWedges, TestWedges);
+				BestTriangles.Empty();
+				BestPointsPos = Base;
+				BestIndicesPos = 0;
+				BestPointCount = Count;
+				BestStride = Layout.Stride;
+				BestPosOffset = Layout.PosOffset;
+				BestUvOffset = Layout.UvOffset;
+				BestLayoutIndex = LayoutIndex;
+				BestTailBytes = TailBytes;
+				BestScore = Score;
+			}
+			if (Layout.Stride == 36)
+				Base += max(0, Count * Layout.Stride - 1);
+		}
+		if (BestPointCount && LayoutIndex == 0)
+			break;
+	}
+
+	if (!BestPointCount)
+		return false;
+	const bool bScanFaceBuffer = ScanTopology && getenv("SCDA_DISABLE_FACE_BUFFER") == NULL;
+	const bool bApplyFaceBuffer = !getenv("SCDA_PROBE_FACE_BUFFER_ONLY");
+	bool bHaveExternalWedges = false;
+	TArray<FMeshWedge> ProbeWedges;
+	if (KnownWedges && KnownWedges->Num())
+	{
+		CopyArray(ProbeWedges, *KnownWedges);
+		if (bApplyFaceBuffer)
+			CopyArray(BestWedges, ProbeWedges);
+		bHaveExternalWedges = true;
+	}
+	else if (bScanFaceBuffer)
+	{
+		TArray<FMeshWedge> FoundWedges;
+		int FoundWedgesPos = 0;
+		int FoundWedgesEnd = 0;
+		if (FindSCDABestWedge8Stream(Ar, Start, BestPointsPos, BestPoints.Num(), FoundWedges, FoundWedgesPos, FoundWedgesEnd) &&
+			FoundWedges.Num() >= BestPoints.Num())
+		{
+			CopyArray(ProbeWedges, FoundWedges);
+			if (bApplyFaceBuffer)
+				CopyArray(BestWedges, ProbeWedges);
+			KnownWedgesEnd = FoundWedgesEnd;
+			bHaveExternalWedges = true;
+		}
+	}
+	if (bScanFaceBuffer)
+	{
+		DumpSCDADenseIndexStreams(Ar, Start, Stop, BestPoints.Num());
+		DumpSCDALodLikeBuffers(Ar, Start, Stop, BestPoints.Num(), BestPointsPos);
+		if (bApplyFaceBuffer && ReadSCDALodLikeTopology(Ar, Start, BestPointsPos ? BestPointsPos : Stop, BestPoints, BestTriangles, BestIndicesPos))
+		{
+			BestWedges.Empty(BestPoints.Num());
+			BestWedges.AddZeroed(BestPoints.Num());
+			for (int i = 0; i < BestWedges.Num(); i++)
+				BestWedges[i].iVertex = i;
+			bHaveExternalWedges = false;
+		}
+		if (!BestTriangles.Num() && bHaveExternalWedges)
+			FindSCDARawWedgeIndexBlock(Ar, KnownWedgesEnd, Stop, BestPoints, bApplyFaceBuffer ? BestWedges : ProbeWedges,
+				BestTriangles, BestIndicesPos);
+		if (!BestTriangles.Num() && bHaveExternalWedges)
+		{
+			BestWedges.Empty(BestPoints.Num());
+			BestWedges.AddZeroed(BestPoints.Num());
+			for (int i = 0; i < BestWedges.Num(); i++)
+				BestWedges[i].iVertex = i;
+			bHaveExternalWedges = false;
+		}
+		if (!BestTriangles.Num())
+			FindSCDACoherentStripBlocks(Ar, Start, Stop, BestPoints, BestPointsPos, BestStride, BestTriangles, BestIndicesPos) ||
+				FindSCDARawIndexBlock(Ar, Start, Stop, BestPoints, BestPointsPos, BestTriangles, BestIndicesPos);
+		if (!bApplyFaceBuffer)
+		{
+			BestTriangles.Empty();
+			BestIndicesPos = 0;
+			BestWedges.Empty(BestPoints.Num());
+			BestWedges.AddZeroed(BestPoints.Num());
+			for (int i = 0; i < BestWedges.Num(); i++)
+				BestWedges[i].iVertex = i;
+			if (getenv("SC4_DEBUG_MESH"))
+				appPrintf("SCDA face buffer scan is probe-only; set SCDA_APPLY_FACE_BUFFER=1 to use candidate topology\n");
+		}
+	}
+	if (!BestTriangles.Num() && BestPoints.Num() >= 3)
+	{
+		const int TriangleCount = BestPoints.Num() / 3;
+		BestTriangles.Empty(TriangleCount);
+		BestTriangles.AddZeroed(TriangleCount);
+		for (int i = 0; i < TriangleCount; i++)
+		{
+			BestTriangles[i].WedgeIndex[0] = i * 3 + 0;
+			BestTriangles[i].WedgeIndex[1] = i * 3 + 1;
+			BestTriangles[i].WedgeIndex[2] = i * 3 + 2;
+		}
+		if (getenv("SC4_DEBUG_MESH"))
+			appPrintf("SCDA packed float mesh has no verified face buffer; using diagnostic sequential triangles\n");
+	}
+	CopyArray(OutPoints, BestPoints);
+	CopyArray(OutWedges, BestWedges);
+	CopyArray(OutTriangles, BestTriangles);
+	OutPointsPos = BestPointsPos;
+	OutIndicesPos = BestIndicesPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA packed float mesh block: layout=%d points=%d triangles=%d stride=%d posOff=%d uvOff=%d recordPos=%08X dataPos=%08X indicesPos=%08X tail=%d first=(%g,%g,%g) uv=(%g,%g)\n",
+			BestLayoutIndex, OutPoints.Num(), OutTriangles.Num(), BestStride, BestPosOffset, BestUvOffset, OutPointsPos, OutPointsPos + BestPosOffset, OutIndicesPos, BestTailBytes,
+			OutPoints[0].X, OutPoints[0].Y, OutPoints[0].Z, OutWedges[0].TexUV.U, OutWedges[0].TexUV.V);
+	return true;
+	unguard;
+}
+
+static bool FindSCDATopWedge8Stream(FArchive &Ar, int Start, int Stop, int& OutWedgeCount, int& OutMaxVertex)
+{
+	guard(FindSCDATopWedge8Stream);
+	OutWedgeCount = 0;
+	OutMaxVertex = 0;
+	if (Start + 8 > Stop)
+		return false;
+
+	int Count = 0;
+	int MaxVertex = 0;
+	int MinU = 0xFFFF, MinV = 0xFFFF, MaxU = 0, MaxV = 0;
+	int NonZeroExtra = 0;
+	int ZeroRun = 0;
+	for (int Pos = Start; Pos + 8 <= Stop; Pos += 8)
+	{
+		uint16 U = ReadSCDAUInt16At(Ar, Pos + 0, false);
+		uint16 V = ReadSCDAUInt16At(Ar, Pos + 2, false);
+		uint16 Vertex = ReadSCDAUInt16At(Ar, Pos + 4, false);
+		uint16 Extra = ReadSCDAUInt16At(Ar, Pos + 6, false);
+		if (!U && !V && !Vertex && !Extra)
+		{
+			ZeroRun++;
+			if (ZeroRun >= 16)
+			{
+				Count -= ZeroRun - 1;
+				break;
+			}
+			Count++;
+			continue;
+		}
+		ZeroRun = 0;
+		MinU = min(MinU, (int)U); MaxU = max(MaxU, (int)U);
+		MinV = min(MinV, (int)V); MaxV = max(MaxV, (int)V);
+		MaxVertex = max(MaxVertex, (int)Vertex);
+		if (Extra)
+			NonZeroExtra++;
+		Count++;
+	}
+	if (Count >= 128 && Count <= 20000 && MaxVertex < Count && MaxVertex >= 512 && MaxVertex <= 20000)
+	{
+		OutWedgeCount = Count;
+		OutMaxVertex = MaxVertex;
+	}
+	if (Count < 128 || Count > 20000 || MaxVertex >= Count || MaxVertex < 512 || MaxVertex > 20000)
+		return false;
+	if ((MaxU > 65000 && MaxV > 65000) || (MinU == 0 && MinV == 0 && MaxU > 60000 && MaxV > 60000))
+		return false;
+	OutWedgeCount = Count;
+	OutMaxVertex = MaxVertex;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA top wedge8 stream: pos=%08X wedges=%d maxVertex=%d uvRange=(%d,%d)-(%d,%d) extraNonZero=%d next=%08X\n",
+			Start, Count, MaxVertex, MinU, MinV, MaxU, MaxV, NonZeroExtra, Start + Count * 8);
+	return true;
+	unguard;
+}
+
+static bool ReadSCDATopWedge8Stream(FArchive &Ar, int Start, int Stop, int WedgeCount, int PointCount, TArray<FMeshWedge>& OutWedges, int& OutEnd)
+{
+	guard(ReadSCDATopWedge8Stream);
+	if (WedgeCount < 3 || PointCount <= 0 || Start < 0 || Start + WedgeCount * 8 > Stop)
+		return false;
+	OutWedges.Empty(WedgeCount);
+	OutWedges.AddZeroed(WedgeCount);
+	int ValidWedges = 0;
+	for (int i = 0; i < WedgeCount; i++)
+	{
+		const int Pos = Start + i * 8;
+		const uint16 U = ReadSCDAUInt16At(Ar, Pos + 0, false);
+		const uint16 V = ReadSCDAUInt16At(Ar, Pos + 2, false);
+		const uint16 Vertex = ReadSCDAUInt16At(Ar, Pos + 4, false);
+		if (Vertex >= PointCount)
+		{
+			OutWedges.Empty();
+			return false;
+		}
+		OutWedges[i].iVertex = Vertex;
+		OutWedges[i].TexUV.U = U / 2048.0f;
+		OutWedges[i].TexUV.V = V / 2048.0f;
+		if (U || V || Vertex)
+			ValidWedges++;
+	}
+	if (ValidWedges < 3)
+	{
+		OutWedges.Empty();
+		return false;
+	}
+	OutEnd = Start + WedgeCount * 8;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA top wedge8 parsed: pos=%08X wedges=%d end=%08X firstVertex=%d firstUV=(%g,%g)\n",
+			Start, OutWedges.Num(), OutEnd, OutWedges[0].iVertex, OutWedges[0].TexUV.U, OutWedges[0].TexUV.V);
+	return true;
+	unguard;
+}
+
+static bool FindSCDABestWedge8Stream(FArchive &Ar, int Start, int Stop, int PointCount, TArray<FMeshWedge>& OutWedges, int& OutPos, int& OutEnd)
+{
+	guard(FindSCDABestWedge8Stream);
+	if (PointCount <= 0 || Start < 0 || Start + 8 > Stop)
+		return false;
+
+	int BestPos = 0;
+	int BestCount = 0;
+	int BestMaxVertex = 0;
+	int BestUvSpan = 0;
+	for (int Pos = Start; Pos <= Stop - 8; Pos += 2)
+	{
+		int Count = 0;
+		int MaxVertex = 0;
+		int MinU = 0xFFFF, MinV = 0xFFFF, MaxU = 0, MaxV = 0;
+		int ZeroRun = 0;
+		for (int P = Pos; P + 8 <= Stop; P += 8)
+		{
+			const uint16 U = ReadSCDAUInt16At(Ar, P + 0, false);
+			const uint16 V = ReadSCDAUInt16At(Ar, P + 2, false);
+			const uint16 Vertex = ReadSCDAUInt16At(Ar, P + 4, false);
+			const uint16 Extra = ReadSCDAUInt16At(Ar, P + 6, false);
+			if (!U && !V && !Vertex && !Extra)
+			{
+				ZeroRun++;
+				if (ZeroRun >= 16)
+				{
+					Count -= ZeroRun - 1;
+					break;
+				}
+				Count++;
+				continue;
+			}
+			ZeroRun = 0;
+			if (Vertex >= PointCount)
+				break;
+			MinU = min(MinU, (int)U); MaxU = max(MaxU, (int)U);
+			MinV = min(MinV, (int)V); MaxV = max(MaxV, (int)V);
+			MaxVertex = max(MaxVertex, (int)Vertex);
+			Count++;
+			if (Count > 20000)
+				break;
+		}
+		if (Count < 300 || Count > 20000 || MaxVertex < min(PointCount - 1, 256))
+			continue;
+		if (PointCount >= 1024 && MaxVertex < PointCount * 3 / 4)
+			continue;
+		const int UvSpan = (MaxU - MinU) + (MaxV - MinV);
+		if (UvSpan < 64)
+			continue;
+		if (MaxVertex > BestMaxVertex || (MaxVertex == BestMaxVertex && Count > BestCount) || (MaxVertex == BestMaxVertex && Count == BestCount && UvSpan > BestUvSpan))
+		{
+			BestPos = Pos;
+			BestCount = Count;
+			BestMaxVertex = MaxVertex;
+			BestUvSpan = UvSpan;
+		}
+	}
+	if (!BestCount)
+		return false;
+	if (!ReadSCDATopWedge8Stream(Ar, BestPos, Stop, BestCount, PointCount, OutWedges, OutEnd))
+		return false;
+	OutPos = BestPos;
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA wedge8 stream: pos=%08X wedges=%d maxVertex=%d uvSpan=%d end=%08X\n",
+			OutPos, BestCount, BestMaxVertex, BestUvSpan, OutEnd);
 	return true;
 	unguard;
 }
@@ -1529,6 +3722,124 @@ static bool FindSC4RefSkeleton(FArchive &Ar, UnPackage *Package, int Start, int 
 
 	CopyArray(OutBones, BestBones);
 	appPrintf("SC4 mesh RefSkeleton block: %08X bones=%d score=%d\n", BestPos, OutBones.Num(), BestScore);
+	return true;
+	unguard;
+}
+
+static int ReadSCDARefSkeleton(FArchive &Ar, UnPackage *Package, int Pos, int Stop, TArray<FMeshBone> &OutBones)
+{
+	guard(ReadSCDARefSkeleton);
+	int SavePos = Ar.Tell();
+	Ar.Seek(Pos);
+
+	int BoneCount;
+	Ar << AR_INDEX(BoneCount);
+	if (BoneCount < 2 || BoneCount > 256)
+	{
+		Ar.Seek(SavePos);
+		return 0;
+	}
+
+	TArray<FMeshBone> Bones;
+	Bones.AddZeroed(BoneCount);
+	int ParentCounts[256];
+	memset(ParentCounts, 0, sizeof(ParentCounts));
+	int ValidQuats = 0;
+	int MatchingPrefixes = 0;
+	for (int i = 0; i < BoneCount; i++)
+	{
+		int NameIndex;
+		unsigned Flags;
+		FQuat Orientation;
+		FVector Position;
+		float Length;
+		FVector Size;
+		int NumChildren, ParentIndex;
+
+		Ar << AR_INDEX(NameIndex);
+		if (Ar.Tell() + 56 > Stop)
+		{
+			Ar.Seek(SavePos);
+			return 0;
+		}
+		Ar << Flags << Orientation << Position << Length << Size << NumChildren << ParentIndex;
+
+		float QuatLen = Orientation.X * Orientation.X + Orientation.Y * Orientation.Y +
+			Orientation.Z * Orientation.Z + Orientation.W * Orientation.W;
+		if (ParentIndex < 0 || ParentIndex >= BoneCount || (i > 0 && ParentIndex >= i) ||
+			QuatLen < 0.5f || QuatLen > 1.5f ||
+			Position.X != Position.X || Position.Y != Position.Y || Position.Z != Position.Z ||
+			fabs(Position.X) > 10000 || fabs(Position.Y) > 10000 || fabs(Position.Z) > 10000 ||
+			Length != Length || Size.X != Size.X || Size.Y != Size.Y || Size.Z != Size.Z)
+		{
+			Ar.Seek(SavePos);
+			return 0;
+		}
+		if (Flags == 0 && NameIndex >= 0 && (!Package || unsigned(NameIndex) < Package->Summary.NameCount))
+			MatchingPrefixes++;
+		if (QuatLen > 0.8f && QuatLen < 1.2f)
+			ValidQuats++;
+		if (i > 0)
+			ParentCounts[ParentIndex]++;
+
+		FMeshBone &B = Bones[i];
+		B.Name = (Package && unsigned(NameIndex) < Package->Summary.NameCount)
+			? Package->GetName(NameIndex) : "None";
+		B.Flags = Flags;
+		B.BonePos.Orientation = Orientation;
+		B.BonePos.Position = Position;
+		B.BonePos.Length = Length;
+		B.BonePos.Size = Size;
+		B.NumChildren = NumChildren;
+		B.ParentIndex = ParentIndex;
+	}
+
+	int MatchingChildren = 0;
+	for (int i = 0; i < BoneCount; i++)
+	{
+		if (Bones[i].NumChildren == ParentCounts[i])
+			MatchingChildren++;
+		Bones[i].NumChildren = ParentCounts[i];
+	}
+
+	CopyArray(OutBones, Bones);
+	Ar.Seek(SavePos);
+	return BoneCount * 100 + MatchingChildren * 25 + ValidQuats * 5 + MatchingPrefixes;
+	unguard;
+}
+
+static bool FindSCDARefSkeleton(FArchive &Ar, UnPackage *Package, int Start, int Stop, TArray<FMeshBone> &OutBones)
+{
+	guard(FindSCDARefSkeleton);
+	int BestPos = 0;
+	int BestScore = 0;
+	TArray<FMeshBone> BestBones;
+	for (int Pos = Start; Pos < Stop - 128; Pos++)
+	{
+		TArray<FMeshBone> Bones;
+		int Score = ReadSCDARefSkeleton(Ar, Package, Pos, Stop, Bones);
+		if (Score <= BestScore)
+			continue;
+		BestScore = Score;
+		BestPos = Pos;
+		CopyArray(BestBones, Bones);
+		int PerfectScore = Bones.Num() * (100 + 25 + 5 + 1);
+		if (Bones.Num() && BestScore >= PerfectScore)
+			break;
+	}
+	if (!BestScore)
+	{
+		OutBones.Empty();
+		return false;
+	}
+
+	CopyArray(OutBones, BestBones);
+	if (getenv("SC4_DEBUG_MESH"))
+		appPrintf("SCDA mesh RefSkeleton block: %08X bones=%d score=%d firstPos=(%g,%g,%g)\n",
+			BestPos, OutBones.Num(), BestScore,
+			OutBones.Num() ? OutBones[0].BonePos.Position.X : 0,
+			OutBones.Num() ? OutBones[0].BonePos.Position.Y : 0,
+			OutBones.Num() ? OutBones[0].BonePos.Position.Z : 0);
 	return true;
 	unguard;
 }
@@ -2978,6 +5289,9 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 	if (debugDoubleAgent)
 	{
 		appPrintf("SC4 SerializeSCell start %s pos=%08X version=%d\n", Name, Ar.Tell(), Version);
+		appPrintf("SC4 pre-skel fields vertexCount=%d meshScale=(%g,%g,%g) meshOrigin=(%g,%g,%g) rot=(%d,%d,%d) faceLevel=%d faces=%d wedges=%d materials=%d textures=%d\n",
+			VertexCount, VECTOR_ARG(MeshScale), VECTOR_ARG(MeshOrigin), FROTATOR_ARG(RotOrigin),
+			FaceLevel.Num(), Faces.Num(), Wedges.Num(), Materials.Num(), Textures.Num());
 		int SavePos = Ar.Tell();
 		byte Bytes[64];
 		int Count = min(ARRAY_COUNT(Bytes), Ar.GetStopper() - SavePos);
@@ -3013,8 +5327,11 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 	{
 		int ScanStart = Ar.Tell();
 		int Stop = Ar.GetStopper();
-		DumpSCDAMeshCompactNames(Ar, Package, ScanStart, Stop);
-		DumpSCDAPackedVertexCandidates(Ar, ScanStart, Stop);
+		if (debugDoubleAgent)
+		{
+			DumpSCDAMeshCompactNames(Ar, Package, ScanStart, Stop);
+			DumpSCDAPackedVertexCandidates(Ar, ScanStart, Stop);
+		}
 
 		int FacesPos = FindPandoraLazyArray(Ar, ScanStart, Stop, sizeof(FMeshFace), FaceLevel.Num(), 1);
 		if (getenv("SCDA_FORCE_RAW_MESH"))
@@ -3027,29 +5344,71 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 			int RawPointsPos = 0;
 			int RawIndicesPos = 0;
 			TArray<FVector> RawPoints;
+			TArray<FMeshWedge> RawWedges;
 			TArray<VTriangle> RawTriangles;
+			TArray<FVertInfluence> NativeInfluences;
+			TArray<FMeshBone> NativeBones;
+			int NativeBoneCount = 0;
 			bool bHaveRawMesh = false;
 			TArray<byte> RawExportData;
 			FArchive *RawScanAr = &Ar;
 			int RawScanStart = ScanStart;
 			int RawScanStop = Stop;
 			FMemReader *RawMemReader = NULL;
-			if (getenv("SCDA_FORCE_RAW_MESH"))
+			int SavePos = Ar.Tell();
+			Ar.Seek(ScanStart);
+			RawExportData.AddUninitialized(Stop - ScanStart);
+			Ar.Serialize(RawExportData.GetData(), RawExportData.Num());
+			Ar.Seek(SavePos);
+			RawMemReader = new FMemReader(RawExportData.GetData(), RawExportData.Num());
+			RawScanAr = RawMemReader;
+			RawScanStart = 0;
+			RawScanStop = RawExportData.Num();
+			FSCDANativeMeshHeader NativeHeader;
+			TArray<int> NativeMaterialRefs;
+			const bool bHaveNativeHeader = ReadSCDANativeMeshHeader(*RawScanAr, RawScanStart, RawScanStop, NativeHeader, &NativeMaterialRefs);
+			int TopWedgeCount = 0;
+			int TopMaxVertex = 0;
+			const bool bHaveTopWedges = !bHaveNativeHeader && FindSCDATopWedge8Stream(*RawScanAr, RawScanStart, RawScanStop, TopWedgeCount, TopMaxVertex);
+			const int ExpectedPointCount = bHaveNativeHeader ? NativeHeader.MaxFaceIndex + 1 :
+				(bHaveTopWedges ? TopMaxVertex + 1 : (TopWedgeCount > 0 ? -1 : 0));
+			TArray<FMeshWedge> TopWedges;
+			int TopWedgesEnd = 0;
+			if (TopWedgeCount > 0 && TopMaxVertex >= 0)
+				ReadSCDATopWedge8Stream(*RawScanAr, RawScanStart, RawScanStop, TopWedgeCount, TopMaxVertex + 1, TopWedges, TopWedgesEnd);
+			if (bHaveNativeHeader)
 			{
-				int SavePos = Ar.Tell();
-				Ar.Seek(ScanStart);
-				RawExportData.AddUninitialized(Stop - ScanStart);
-				Ar.Serialize(RawExportData.GetData(), RawExportData.Num());
-				Ar.Seek(SavePos);
-				RawMemReader = new FMemReader(RawExportData.GetData(), RawExportData.Num());
-				RawScanAr = RawMemReader;
-				RawScanStart = 0;
-				RawScanStop = RawExportData.Num();
+				const int VertexSearchStart = NativeHeader.FacePos + NativeHeader.FaceCount * 8;
+				bHaveRawMesh = ReadSCDANativeVertexStream(*RawScanAr, VertexSearchStart, RawScanStop,
+					ExpectedPointCount, RawPoints, RawWedges, NativeInfluences, RawPointsPos, NativeBoneCount);
 			}
-			if (FindSCDARawVectorBlock(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawPointsPos))
+			else
+			{
+				bHaveRawMesh = FindSCDAPackedFloatMeshBlock(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawWedges, RawTriangles, RawPointsPos, RawIndicesPos,
+					TopWedges.Num() ? &TopWedges : NULL, TopWedgesEnd, ExpectedPointCount, true);
+			}
+			if (bHaveRawMesh && bHaveNativeHeader)
+			{
+				if (NativeHeader.MaxFaceIndex >= RawPoints.Num() ||
+					!ReadSCDARawFaceRecords(*RawScanAr, NativeHeader.FacePos, RawScanStop, NativeHeader.FaceCount, RawPoints.Num(), false, RawTriangles))
+				{
+					bHaveRawMesh = false;
+					RawTriangles.Empty();
+				}
+				else
+				{
+					RawIndicesPos = NativeHeader.FacePos;
+					if (debugDoubleAgent)
+						appPrintf("SCDA native face stream accepted: points=%d faces=%d materials=%d\n",
+							RawPoints.Num(), RawTriangles.Num(), NativeHeader.MaterialCount);
+				}
+			}
+			if (bHaveRawMesh && bHaveNativeHeader)
+				FindSCDARefSkeleton(*RawScanAr, Package, RawScanStart, RawScanStop, NativeBones);
+			if (!bHaveRawMesh && FindSCDARawVectorBlock(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawPointsPos))
 			{
 				bHaveRawMesh = FindSCDARawIndexBlock(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawPointsPos, RawTriangles, RawIndicesPos);
-				if (!bHaveRawMesh && RawPoints.Num() >= 96)
+				if (!bHaveRawMesh && getenv("SCDA_ALLOW_TRIANGLE_SOUP") && RawPoints.Num() >= 96)
 				{
 					int PointCount = RawPoints.Num() - RawPoints.Num() % 3;
 					RawPoints.RemoveAt(PointCount, RawPoints.Num() - PointCount);
@@ -3065,37 +5424,163 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 					bHaveRawMesh = true;
 				}
 			}
-			if (!bHaveRawMesh)
+			if (!bHaveRawMesh && getenv("SCDA_ALLOW_PACKED_INT_MESH"))
+				bHaveRawMesh = FindSCDAPackedMeshBlock(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawTriangles, RawPointsPos, RawIndicesPos);
+			if (!bHaveRawMesh && getenv("SCDA_ALLOW_TRIANGLE_SOUP"))
 				bHaveRawMesh = FindSCDAPacked17TriangleSoup(*RawScanAr, RawScanStart, RawScanStop, RawPoints, RawTriangles, RawPointsPos);
-			delete RawMemReader;
+			if (!bHaveRawMesh)
+			{
+				RawWedges.Empty();
+				bHaveRawMesh = FindSCDAInlineTriangleStream(*RawScanAr, RawScanStart, RawScanStop,
+					RawPoints, RawWedges, RawTriangles, RawPointsPos);
+				if (bHaveRawMesh)
+					RawIndicesPos = RawPointsPos;
+			}
 			if (bHaveRawMesh)
 			{
+				if (bHaveNativeHeader)
+				{
+					Textures.Empty(NativeMaterialRefs.Num());
+					Textures.AddZeroed(NativeMaterialRefs.Num());
+					Materials.Empty(NativeMaterialRefs.Num());
+					Materials.AddZeroed(NativeMaterialRefs.Num());
+					for (int i = 0; i < NativeMaterialRefs.Num(); i++)
+					{
+						const int Ref = NativeMaterialRefs[i];
+						UObject *Material = NULL;
+						if (Package)
+						{
+							if (Ref < 0 && unsigned(-Ref - 1) < Package->Summary.ImportCount)
+								Material = Package->CreateImport(-Ref - 1);
+							else if (Ref > 0 && unsigned(Ref - 1) < Package->Summary.ExportCount)
+								Material = Package->CreateExport(Ref - 1);
+						}
+						Textures[i] = static_cast<UMaterial*>(Material);
+						Materials[i].TextureIndex = i;
+					}
+				}
 				CopyArray(Points, RawPoints);
 				CopyArray(Triangles, RawTriangles);
-				Wedges.Empty(Points.Num());
-				Wedges.AddZeroed(Points.Num());
-				for (int i = 0; i < Wedges.Num(); i++)
-					Wedges[i].iVertex = i;
-				RefSkeleton.Empty(1);
-				RefSkeleton.AddZeroed(1);
-				RefSkeleton[0].Name = "B";
-				RefSkeleton[0].BonePos.Orientation.W = 1.0f;
-				RefSkeleton[0].BonePos.Size.Set(1.0f, 1.0f, 1.0f);
-				VertInfluences.Empty(Points.Num());
-				VertInfluences.AddZeroed(Points.Num());
-				for (int i = 0; i < VertInfluences.Num(); i++)
+				if (RawWedges.Num())
 				{
-					VertInfluences[i].Weight = 1.0f;
-					VertInfluences[i].PointIndex = i;
-					VertInfluences[i].BoneIndex = 0;
+					CopyArray(Wedges, RawWedges);
+				}
+				else
+				{
+					Wedges.Empty(Points.Num());
+					Wedges.AddZeroed(Points.Num());
+					for (int i = 0; i < Wedges.Num(); i++)
+						Wedges[i].iVertex = i;
+				}
+				TArray<FString> ManifestBoneNames;
+				TArray<int> ManifestBoneParents;
+				const bool bHaveManifestSkeleton = Package &&
+					GetScdaV2ManifestSkeleton(*Package->GetFilename(),
+						ManifestBoneNames, ManifestBoneParents) &&
+					ManifestBoneNames.Num() >= NativeBoneCount;
+				if (NativeBones.Num())
+				{
+					if (debugDoubleAgent && getenv("SCDA_DEBUG_PALETTE"))
+					{
+						appPrintf("SCDA native skeleton names:");
+						for (int i = 0; i < NativeBones.Num() && i < 16; i++)
+							appPrintf(" %d=%s", i, *NativeBones[i].Name);
+						appPrintf("\n");
+					}
+					CopyArray(RefSkeleton, NativeBones);
+					if (bHaveManifestSkeleton && ManifestBoneNames.Num() == RefSkeleton.Num())
+					{
+						for (int i = 0; i < RefSkeleton.Num(); i++)
+						{
+							RefSkeleton[i].Name = *ManifestBoneNames[i];
+							RefSkeleton[i].ParentIndex = ManifestBoneParents[i];
+							RefSkeleton[i].NumChildren = 0;
+						}
+						for (int i = 1; i < RefSkeleton.Num(); i++)
+						{
+							int Parent = RefSkeleton[i].ParentIndex;
+							if (Parent >= 0 && Parent < RefSkeleton.Num())
+								RefSkeleton[Parent].NumChildren++;
+						}
+					}
+					if (debugDoubleAgent)
+						appPrintf("SCDA native skeleton: bones=%d skinPalette=%d manifest=%d root=%s pos=(%g,%g,%g)\n",
+							RefSkeleton.Num(), NativeBoneCount, bHaveManifestSkeleton ? 1 : 0,
+							RefSkeleton.Num() ? *RefSkeleton[0].Name : "",
+							RefSkeleton.Num() ? RefSkeleton[0].BonePos.Position.X : 0,
+							RefSkeleton.Num() ? RefSkeleton[0].BonePos.Position.Y : 0,
+							RefSkeleton.Num() ? RefSkeleton[0].BonePos.Position.Z : 0);
+				}
+				else
+				{
+					const int BoneCount = bHaveManifestSkeleton
+						? ManifestBoneNames.Num() : max(1, NativeBoneCount);
+					RefSkeleton.Empty(BoneCount);
+					RefSkeleton.AddZeroed(BoneCount);
+					for (int i = 0; i < BoneCount; i++)
+					{
+						if (bHaveManifestSkeleton)
+							RefSkeleton[i].Name = *ManifestBoneNames[i];
+						else
+						{
+							char BoneName[32];
+							appSprintf(ARRAY_ARG(BoneName), "SCDA_Bone_%02d", i);
+							RefSkeleton[i].Name = BoneName;
+						}
+						RefSkeleton[i].ParentIndex = bHaveManifestSkeleton
+							? ManifestBoneParents[i] : (i ? 0 : 0);
+						RefSkeleton[i].BonePos.Orientation.W = 1.0f;
+						RefSkeleton[i].BonePos.Size.Set(1.0f, 1.0f, 1.0f);
+					}
+					for (int i = 1; i < BoneCount; i++)
+					{
+						int Parent = RefSkeleton[i].ParentIndex;
+						if (Parent >= 0 && Parent < BoneCount)
+							RefSkeleton[Parent].NumChildren++;
+					}
+					if (debugDoubleAgent && bHaveManifestSkeleton)
+						appPrintf("SCDA manifest skeleton: bones=%d skinPalette=%d root=%s\n",
+							BoneCount, NativeBoneCount, *ManifestBoneNames[0]);
+				}
+				if (bHaveNativeHeader && NativeInfluences.Num() && RefSkeleton.Num())
+				{
+					TArray<FSCDANativeBonePalette> NativeBonePalettes;
+					if (FindSCDANativeBonePalettes(*RawScanAr,
+						NativeHeader.FacePos + NativeHeader.FaceCount * 8,
+						RawPointsPos > 0 ? RawPointsPos : RawScanStop,
+						RawTriangles, NativeBoneCount, RefSkeleton.Num(), NativeBonePalettes))
+					{
+						ApplySCDANativeBonePalettes(RawTriangles, RawPoints.Num(),
+							NativeBonePalettes, NativeInfluences);
+					}
+					else if (debugDoubleAgent)
+					{
+						appPrintf("WARNING: Unable to locate SCDA native bone palettes for %s, using local bone indices\n", Name);
+					}
+				}
+				if (NativeInfluences.Num())
+					CopyArray(VertInfluences, NativeInfluences);
+				else
+				{
+					VertInfluences.Empty(Points.Num());
+					VertInfluences.AddZeroed(Points.Num());
+					for (int i = 0; i < VertInfluences.Num(); i++)
+					{
+						VertInfluences[i].Weight = 1.0f;
+						VertInfluences[i].PointIndex = i;
+						VertInfluences[i].BoneIndex = 0;
+					}
 				}
 				if (debugDoubleAgent)
 					appPrintf("SCDA raw mesh fallback: points=%d triangles=%d pointsPos=%08X indicesPos=%08X\n",
 						Points.Num(), Triangles.Num(), RawPointsPos, RawIndicesPos);
+				delete RawMemReader;
+				PrepareSCDASkeletalMeshForView(*this);
 				DROP_REMAINING_DATA(Ar);
 				ConvertMesh();
 				return;
 			}
+			delete RawMemReader;
 
 			int PointsPos = FindPandoraLazyArray(Ar, ScanStart, Stop, sizeof(FVector), VertexCount, 1);
 			if (PointsPos)
@@ -3113,7 +5598,38 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 				return;
 			}
 
-			appError("Unable to locate Double Agent skeletal mesh face buffer");
+			appPrintf("WARNING: unable to locate Double Agent skeletal mesh face buffer for %s; loaded placeholder triangle\n", Name);
+			Points.Empty(3);
+			Points.AddZeroed(3);
+			Points[1].Set(1.0f, 0.0f, 0.0f);
+			Points[2].Set(0.0f, 1.0f, 0.0f);
+			Wedges.Empty(3);
+			Wedges.AddZeroed(3);
+			for (int i = 0; i < Wedges.Num(); i++)
+				Wedges[i].iVertex = i;
+			Triangles.Empty(1);
+			Triangles.AddZeroed(1);
+			Triangles[0].WedgeIndex[0] = 0;
+			Triangles[0].WedgeIndex[1] = 1;
+			Triangles[0].WedgeIndex[2] = 2;
+			RefSkeleton.Empty(1);
+			RefSkeleton.AddZeroed(1);
+			RefSkeleton[0].Name = "B";
+			RefSkeleton[0].ParentIndex = -1;
+			RefSkeleton[0].BonePos.Orientation.W = 1.0f;
+			RefSkeleton[0].BonePos.Size.Set(1.0f, 1.0f, 1.0f);
+			VertInfluences.Empty(3);
+			VertInfluences.AddZeroed(3);
+			for (int i = 0; i < VertInfluences.Num(); i++)
+			{
+				VertInfluences[i].Weight = 1.0f;
+				VertInfluences[i].PointIndex = i;
+				VertInfluences[i].BoneIndex = 0;
+			}
+			PrepareSCDASkeletalMeshForView(*this);
+			DROP_REMAINING_DATA(Ar);
+			ConvertMesh();
+			return;
 		}
 
 		TLazyArray<FMeshFace> RawFaces;
@@ -3616,6 +6132,11 @@ static uint16 ReadSCDAStaticLE16(const byte* Data, int Pos)
 	return (uint16)(Data[Pos] | (Data[Pos + 1] << 8));
 }
 
+static uint32 ReadSCDAStaticLE32(const byte* Data, int Pos)
+{
+	return (uint32)(Data[Pos] | (Data[Pos + 1] << 8) | (Data[Pos + 2] << 16) | (Data[Pos + 3] << 24));
+}
+
 static FMeshUVFloat ReadSCDAStaticHalfUV(const byte* Data, int Pos)
 {
 	FMeshUVHalf Half;
@@ -3677,6 +6198,194 @@ static bool SCDAStaticDebugEnabled()
 {
 	const char* DebugStatic = getenv("SC4_DEBUG_STATIC");
 	return DebugStatic && strcmp(DebugStatic, "0") != 0;
+}
+
+static void DumpSCDAInlineStaticPacketSummary(const char* MeshName, const byte* Data, int DataSize)
+{
+	guard(DumpSCDAInlineStaticPacketSummary);
+	const char* DebugPackets = getenv("SCDA_STATIC_PACKET_DEBUG");
+	if (!DebugPackets || !strcmp(DebugPackets, "0") || !Data || DataSize <= 0)
+		return;
+
+	int Printable = 0;
+	int Zeroes = 0;
+	for (int i = 0; i < DataSize; i++)
+	{
+		if ((Data[i] >= 32 && Data[i] < 127) || Data[i] == '\n' || Data[i] == '\r' || Data[i] == '\t')
+			Printable++;
+		if (!Data[i])
+			Zeroes++;
+	}
+
+	int PositionOpcodeCount = 0;
+	int SanePositionOpcodeCount = 0;
+	int VertexAssemblyCount = 0;
+	for (int Pos = 0; Pos + 16 <= DataSize; Pos++)
+	{
+		if (Data[Pos] == 0x11 && Data[Pos + 1] == 0x3A && Data[Pos + 2] == 0x01)
+		{
+			PositionOpcodeCount++;
+			float X = ReadSCDAStaticFloat(Data, Pos + 3);
+			float Y = ReadSCDAStaticFloat(Data, Pos + 7);
+			float Z = ReadSCDAStaticFloat(Data, Pos + 11);
+			if (X == X && Y == Y && Z == Z &&
+				fabs(X) < 100000.0f && fabs(Y) < 100000.0f && fabs(Z) < 100000.0f &&
+				fabs(X) + fabs(Y) + fabs(Z) > 1.0f)
+			{
+				SanePositionOpcodeCount++;
+			}
+		}
+		if (Data[Pos] == 0x30 && Data[Pos + 1] == 0x22 &&
+			Data[Pos + 6] == 0x10 && Data[Pos + 7] == 0x22 &&
+			Data[Pos + 12] == 0x2F && Data[Pos + 13] == 0x59)
+		{
+			const int ExtraCount = Data[Pos + 15];
+			if (ExtraCount >= 1 && ExtraCount <= 8 && Data[Pos + 14] == ExtraCount * 4 + 1 &&
+				Pos + 16 + ExtraCount * 4 <= DataSize)
+			{
+				VertexAssemblyCount++;
+			}
+		}
+	}
+
+	const char* Shape = "unknown";
+	if (Printable * 100 / DataSize >= 65 && SanePositionOpcodeCount < 4 && VertexAssemblyCount < 4)
+		Shape = "metadata/ascii";
+	else if (SanePositionOpcodeCount >= 16 && VertexAssemblyCount >= 4)
+		Shape = "command-packet";
+	else if (Printable * 100 / DataSize < 45)
+		Shape = "dense-packed";
+
+	appPrintf("SCDA inline static packet %s size=%X shape=%s printable=%d%% zero=%d%% posOps=%d sanePos=%d asmOps=%d first32=",
+		MeshName, DataSize, Shape, Printable * 100 / DataSize, Zeroes * 100 / DataSize,
+		PositionOpcodeCount, SanePositionOpcodeCount, VertexAssemblyCount);
+	for (int i = 0; i < min(DataSize, 32); i++)
+		appPrintf("%s%02X", i ? " " : "", Data[i]);
+	appPrintf("\n");
+
+	if (SanePositionOpcodeCount >= 4)
+	{
+		int Printed = 0;
+		for (int Pos = 0; Pos + 16 <= DataSize && Printed < 12; Pos++)
+		{
+			if (Data[Pos] != 0x11 || Data[Pos + 1] != 0x3A || Data[Pos + 2] != 0x01)
+				continue;
+			float X = ReadSCDAStaticFloat(Data, Pos + 3);
+			float Y = ReadSCDAStaticFloat(Data, Pos + 7);
+			float Z = ReadSCDAStaticFloat(Data, Pos + 11);
+			if (!(X == X && Y == Y && Z == Z) ||
+				fabs(X) >= 100000.0f || fabs(Y) >= 100000.0f || fabs(Z) >= 100000.0f ||
+				fabs(X) + fabs(Y) + fabs(Z) <= 1.0f)
+				continue;
+
+			int AttrA = -1;
+			int AttrB = -1;
+			int AttrC = -1;
+			if (Pos >= 10 && Data[Pos - 10] == 0x15 && Data[Pos - 9] == 0x22)
+				AttrB = (int)ReadSCDAStaticLE32(Data, Pos - 8);
+			if (Pos >= 13 && Data[Pos - 13] == 0x10 && Data[Pos - 12] == 0x05)
+				AttrA = Data[Pos - 11];
+			if (Pos >= 4 && Data[Pos - 4] == 0x13 && Data[Pos - 3] == 0x01)
+				AttrC = ReadSCDAStaticLE16(Data, Pos - 2);
+			appPrintf("  pos-op @%X attrA=%d attrB=%d attrC=%d xyz=(%g,%g,%g) after=%02X %02X %02X %02X\n",
+				Pos, AttrA, AttrB, AttrC, X, Y, Z,
+				(Pos + 15 < DataSize) ? Data[Pos + 15] : 0,
+				(Pos + 16 < DataSize) ? Data[Pos + 16] : 0,
+				(Pos + 17 < DataSize) ? Data[Pos + 17] : 0,
+				(Pos + 18 < DataSize) ? Data[Pos + 18] : 0);
+			Printed++;
+		}
+	}
+
+	if (VertexAssemblyCount >= 4)
+	{
+		int Printed = 0;
+		for (int Pos = 0; Pos + 16 <= DataSize && Printed < 16; Pos++)
+		{
+			if (Data[Pos] != 0x30 || Data[Pos + 1] != 0x22 ||
+				Data[Pos + 6] != 0x10 || Data[Pos + 7] != 0x22 ||
+				Data[Pos + 12] != 0x2F || Data[Pos + 13] != 0x59)
+				continue;
+			const int ExtraCount = Data[Pos + 15];
+			if (ExtraCount < 1 || ExtraCount > 8 || Data[Pos + 14] != ExtraCount * 4 + 1 ||
+				Pos + 16 + ExtraCount * 4 > DataSize)
+				continue;
+			appPrintf("  asm-op @%X refs=%u,%u",
+				Pos, ReadSCDAStaticLE32(Data, Pos + 2), ReadSCDAStaticLE32(Data, Pos + 8));
+			for (int i = 0; i < ExtraCount; i++)
+				appPrintf(",%u", ReadSCDAStaticLE32(Data, Pos + 16 + i * 4));
+			appPrintf("\n");
+			Printed++;
+		}
+	}
+
+	struct FMarker
+	{
+		int Pos;
+		byte Kind;
+	};
+	TArray<FMarker> Markers;
+	for (int Pos = 0; Pos + 4 <= DataSize; Pos++)
+	{
+		if (Data[Pos + 1] == 0x41 && Data[Pos + 2] == 0x50 && Data[Pos + 3] == 0x00 &&
+			(Data[Pos] == 0x70 || Data[Pos] == 0xF0))
+		{
+			FMarker& M = Markers[Markers.AddDefaulted()];
+			M.Pos = Pos;
+			M.Kind = Data[Pos];
+		}
+	}
+
+	for (int i = 0; i < Markers.Num(); )
+	{
+		const int RunStart = Markers[i].Pos;
+		const byte Kind = Markers[i].Kind;
+		int RunEnd = RunStart;
+		int Count = 0;
+		while (i < Markers.Num() && Markers[i].Kind == Kind &&
+			(Count == 0 || Markers[i].Pos - RunEnd >= 0x10 && Markers[i].Pos - RunEnd <= 0x40))
+		{
+			RunEnd = Markers[i].Pos;
+			Count++;
+			i++;
+		}
+		appPrintf("  AP-run kind=%02X first=%X last=%X count=%d\n", Kind, RunStart, RunEnd, Count);
+	}
+
+	for (int Pos = 0; Pos + 3 <= DataSize; )
+	{
+		int Count = 0;
+		int MaxValue = 0;
+		int Zeroes = 0;
+		for (int P = Pos; P + 3 <= DataSize; P += 3)
+		{
+			const int Value = (Data[P] << 16) | (Data[P + 1] << 8) | Data[P + 2];
+			if (Value >= 5000)
+				break;
+			MaxValue = max(MaxValue, Value);
+			if (!Value)
+				Zeroes++;
+			Count++;
+			if (Count >= 4096)
+				break;
+		}
+		if (Count >= 32)
+		{
+			appPrintf("  be24-island pos=%X count=%d max=%d zeroes=%d first=",
+				Pos, Count, MaxValue, Zeroes);
+			for (int i = 0; i < min(Count, 12); i++)
+			{
+				const int P = Pos + i * 3;
+				const int Value = (Data[P] << 16) | (Data[P + 1] << 8) | Data[P + 2];
+				appPrintf("%s%d", i ? "," : "", Value);
+			}
+			appPrintf("\n");
+			Pos += Count * 3;
+			continue;
+		}
+		Pos++;
+	}
+	unguard;
 }
 
 static bool ScoreSCDAStaticVertexLayout(const byte* Data, int DataSize, int Start, int Count, int Stride, FSCDAStaticVertexLayout& Best)
@@ -4093,6 +6802,367 @@ static bool FindSCDAStaticUVBlock(const byte* Data, int DataSize, int Start, int
 	return true;
 }
 
+static int SCDAStaticSignExtend(int Value, int Bits)
+{
+	const int Sign = 1 << (Bits - 1);
+	const int Mask = (1 << Bits) - 1;
+	Value &= Mask;
+	return (Value & Sign) ? Value - (1 << Bits) : Value;
+}
+
+static FVector ReadSCDAStaticPacked10Vector(const byte* Data, int Pos)
+{
+	unsigned W = Data[Pos + 0] | (Data[Pos + 1] << 8) | (Data[Pos + 2] << 16) | (Data[Pos + 3] << 24);
+	FVector V;
+	V.X = (float)SCDAStaticSignExtend((int)(W >> 0), 10);
+	V.Y = (float)SCDAStaticSignExtend((int)(W >> 10), 10);
+	V.Z = (float)SCDAStaticSignExtend((int)(W >> 20), 10);
+	return V;
+}
+
+static bool FindSCDAInlineStaticDescriptorSpan(const byte* Data, int DataSize, int& OutStart, int& OutEnd)
+{
+	guard(FindSCDAInlineStaticDescriptorSpan);
+	OutStart = DataSize;
+	OutEnd = 0;
+
+	int BestRunStart = -1;
+	int BestRunCount = 0;
+	for (int Pos = 0; Pos + 25 <= DataSize; Pos++)
+	{
+		int Count = 0;
+		while (Pos + Count * 25 + 20 <= DataSize)
+		{
+			const int Rec = Pos + Count * 25;
+			const unsigned Ptr = Data[Rec + 0] | (Data[Rec + 1] << 8) | (Data[Rec + 2] << 16) | (Data[Rec + 3] << 24);
+			const unsigned Type = (Data[Rec + 4] << 24) | (Data[Rec + 5] << 16) | (Data[Rec + 6] << 8) | Data[Rec + 7];
+			const unsigned Off = (Data[Rec + 8] << 24) | (Data[Rec + 9] << 16) | (Data[Rec + 10] << 8) | Data[Rec + 11];
+			const unsigned Size = (Data[Rec + 16] << 24) | (Data[Rec + 17] << 16) | (Data[Rec + 18] << 8) | Data[Rec + 19];
+			if (Ptr != 0x00504170 || Type != 2 || Off >= (unsigned)DataSize || Size == 0 || Off + Size > (unsigned)DataSize)
+				break;
+			Count++;
+		}
+		if (Count > BestRunCount)
+		{
+			BestRunStart = Pos;
+			BestRunCount = Count;
+		}
+	}
+
+	if (BestRunCount < 4)
+		return false;
+
+	for (int i = 0; i < BestRunCount; i++)
+	{
+		const int Rec = BestRunStart + i * 25;
+		const int Off = (Data[Rec + 8] << 24) | (Data[Rec + 9] << 16) | (Data[Rec + 10] << 8) | Data[Rec + 11];
+		const int Size = (Data[Rec + 16] << 24) | (Data[Rec + 17] << 16) | (Data[Rec + 18] << 8) | Data[Rec + 19];
+		OutStart = min(OutStart, Off);
+		OutEnd = max(OutEnd, Off + Size);
+	}
+
+	if (OutStart < 0 || OutEnd <= OutStart || OutEnd > DataSize)
+		return false;
+
+	if (SCDAStaticDebugEnabled())
+		appPrintf("SCDA inline descriptor span: table=%X count=%d data=%X-%X\n",
+			BestRunStart, BestRunCount, OutStart, OutEnd);
+	return true;
+	unguard;
+}
+
+static bool SerializeDoubleAgentInlineStaticMeshPacket(UStaticMesh* Mesh, const byte* Data, int DataSize)
+{
+	guard(SerializeDoubleAgentInlineStaticMeshPacket);
+	int DenseStart = 0;
+	int DenseEnd = 0;
+	if (!FindSCDAInlineStaticDescriptorSpan(Data, DataSize, DenseStart, DenseEnd))
+		return false;
+	if (!getenv("SCDA_INLINE_DESCRIPTOR_ONLY"))
+	{
+		DenseStart = 0;
+		DenseEnd = DataSize;
+	}
+
+	TArray<FVector> Points;
+	TArray<uint16> Indices;
+	TArray<FSCDAStaticSectionInfo> PacketSections;
+
+	for (int Pos = DenseStart; Pos < DenseEnd; Pos++)
+	{
+		if (Data[Pos] != 0 && Data[Pos] != 1)
+			continue;
+		int Run = 1;
+		while (Pos + Run < DenseEnd && Run < 255)
+		{
+			const int Prev = Data[Pos + Run - 1];
+			const int Next = Data[Pos + Run];
+			if (Next <= Prev || Next >= 128 || Next - Prev > 8)
+				break;
+			Run++;
+		}
+		if (Run < 8 || Pos + Run + Run * 4 > DenseEnd)
+			continue;
+
+		// Avoid consuming the same monotonically increasing index list from the
+		// middle.  These byte-local palettes may start at either 0 or 1, but a
+		// sub-run would have the previous byte equal to this run's predecessor.
+		if (Pos > DenseStart && Data[Pos - 1] < Data[Pos] && Data[Pos] - Data[Pos - 1] <= 8)
+			continue;
+
+		const int FirstPoint = Points.Num();
+		const int FirstIndex = Indices.Num();
+		for (int i = 0; i < Run; i++)
+		{
+			FVector V = ReadSCDAStaticPacked10Vector(Data, Pos + Run + i * 4);
+			// The packet positions are quantized.  Keep the scale conservative;
+			// exact object-space scale can be corrected once the surrounding
+			// transform packet is mapped.
+			V.Scale(1.0f / 16.0f);
+			new (Points) FVector(V);
+		}
+
+		for (int i = 2; i < Run; i++)
+		{
+			const uint16 A = (uint16)(FirstPoint + i - 2);
+			const uint16 B = (uint16)(FirstPoint + i - 1);
+			const uint16 C = (uint16)(FirstPoint + i);
+			if ((i & 1) == 0)
+			{
+				new (Indices) uint16(A);
+				new (Indices) uint16(B);
+				new (Indices) uint16(C);
+			}
+			else
+			{
+				new (Indices) uint16(B);
+				new (Indices) uint16(A);
+				new (Indices) uint16(C);
+			}
+		}
+
+		const int NumFaces = (Indices.Num() - FirstIndex) / 3;
+		if (NumFaces > 0)
+		{
+			FSCDAStaticSectionInfo& S = PacketSections[PacketSections.AddDefaulted()];
+			S.FirstIndex = FirstIndex;
+			S.FirstVertex = FirstPoint;
+			S.LastVertex = FirstPoint + Run - 1;
+			S.NumFaces = NumFaces;
+		}
+
+		Pos += Run + Run * 4 - 1;
+	}
+
+	if (Points.Num() < 16 || Indices.Num() < 48)
+		return false;
+
+	Mesh->VertexStream.Vert.Empty(Points.Num());
+	Mesh->VertexStream.Vert.AddZeroed(Points.Num());
+	FStaticMeshUVStream* UV = new (Mesh->UVStream) FStaticMeshUVStream;
+	UV->Data.Empty(Points.Num());
+	UV->Data.AddZeroed(Points.Num());
+
+	FVector MinV, MaxV;
+	MinV.Set( 1.0e30f,  1.0e30f,  1.0e30f);
+	MaxV.Set(-1.0e30f, -1.0e30f, -1.0e30f);
+	for (int i = 0; i < Points.Num(); i++)
+	{
+		MinV.X = min(MinV.X, Points[i].X); MinV.Y = min(MinV.Y, Points[i].Y); MinV.Z = min(MinV.Z, Points[i].Z);
+		MaxV.X = max(MaxV.X, Points[i].X); MaxV.Y = max(MaxV.Y, Points[i].Y); MaxV.Z = max(MaxV.Z, Points[i].Z);
+	}
+
+	const float SizeX = max(MaxV.X - MinV.X, 0.001f);
+	const float SizeY = max(MaxV.Y - MinV.Y, 0.001f);
+	for (int i = 0; i < Points.Num(); i++)
+	{
+		FStaticMeshVertex& Vtx = Mesh->VertexStream.Vert[i];
+		Vtx.Pos = Points[i];
+		Vtx.Normal.Set(0, 0, 0);
+		UV->Data[i].U = (Points[i].X - MinV.X) / SizeX;
+		UV->Data[i].V = (Points[i].Y - MinV.Y) / SizeY;
+	}
+
+	Mesh->IndexStream1.Indices.Empty(Indices.Num());
+	Mesh->IndexStream1.Indices.AddZeroed(Indices.Num());
+	for (int i = 0; i < Indices.Num(); i++)
+		Mesh->IndexStream1.Indices[i] = Indices[i];
+
+	for (int i = 0; i + 2 < Mesh->IndexStream1.Indices.Num(); i += 3)
+	{
+		const int A = Mesh->IndexStream1.Indices[i + 0];
+		const int B = Mesh->IndexStream1.Indices[i + 1];
+		const int C = Mesh->IndexStream1.Indices[i + 2];
+		if (A < 0 || A >= Points.Num() || B < 0 || B >= Points.Num() || C < 0 || C >= Points.Num())
+			continue;
+		FVector AB, AC;
+		AB.Set(Points[B].X - Points[A].X, Points[B].Y - Points[A].Y, Points[B].Z - Points[A].Z);
+		AC.Set(Points[C].X - Points[A].X, Points[C].Y - Points[A].Y, Points[C].Z - Points[A].Z);
+		const FVector N = SCDAStaticCross(AB, AC);
+		Mesh->VertexStream.Vert[A].Normal.Add(N);
+		Mesh->VertexStream.Vert[B].Normal.Add(N);
+		Mesh->VertexStream.Vert[C].Normal.Add(N);
+	}
+	for (int i = 0; i < Points.Num(); i++)
+		SCDAStaticNormalize(Mesh->VertexStream.Vert[i].Normal);
+
+	for (int i = 0; i < PacketSections.Num(); i++)
+	{
+		const FSCDAStaticSectionInfo& Src = PacketSections[i];
+		FStaticMeshSection* Section = new (Mesh->Sections) FStaticMeshSection;
+		memset(Section, 0, sizeof(FStaticMeshSection));
+		Section->FirstIndex  = Src.FirstIndex;
+		Section->FirstVertex = Src.FirstVertex;
+		Section->LastVertex  = Src.LastVertex;
+		Section->fE          = Src.NumFaces;
+		Section->NumFaces    = Src.NumFaces;
+	}
+
+	if (SCDAStaticDebugEnabled())
+		appPrintf("SCDA inline packet mesh %s: verts=%d tris=%d sections=%d bounds=(%g,%g,%g)-(%g,%g,%g)\n",
+			Mesh->Name, Points.Num(), Mesh->IndexStream1.Indices.Num() / 3, PacketSections.Num(),
+			MinV.X, MinV.Y, MinV.Z, MaxV.X, MaxV.Y, MaxV.Z);
+
+	Mesh->ConvertMesh();
+	return true;
+	unguard;
+}
+
+static bool SerializeDoubleAgentStaticMeshPackedTriangles(UStaticMesh* Mesh, const byte* Data, int DataSize)
+{
+	guard(SerializeDoubleAgentStaticMeshPackedTriangles);
+	if (DataSize < 16 * 3)
+		return false;
+
+	int BestBase = -1;
+	int BestVertexCount = 0;
+	int BestGoodUVs = 0;
+	int BestExtent[3] = {0, 0, 0};
+	float BestScore = -1.0e30f;
+	const int MaxBase = 0;
+	for (int Base = 0; Base <= MaxBase; Base++)
+	{
+		const int TestVertexCount = (DataSize - Base) / 16;
+		const int TestIndexCount = (TestVertexCount / 3) * 3;
+		if (TestIndexCount < 3)
+			continue;
+		const byte* TestData = Data + Base;
+	int MinX =  0x7FFFFFFF, MinY =  0x7FFFFFFF, MinZ =  0x7FFFFFFF;
+	int MaxX = -0x7FFFFFFF, MaxY = -0x7FFFFFFF, MaxZ = -0x7FFFFFFF;
+	int GoodUVs = 0;
+		for (int i = 0; i < TestVertexCount; i++)
+	{
+		const int Pos = i * 16;
+			const int X = (int16)ReadSCDAStaticLE16(TestData, Pos + 0);
+			const int Y = (int16)ReadSCDAStaticLE16(TestData, Pos + 2);
+			const int Z = (int16)ReadSCDAStaticLE16(TestData, Pos + 4);
+		if (X == -32768 || Y == -32768 || Z == -32768)
+				goto next_base;
+		MinX = min(MinX, X); MaxX = max(MaxX, X);
+		MinY = min(MinY, Y); MaxY = max(MaxY, Y);
+		MinZ = min(MinZ, Z); MaxZ = max(MaxZ, Z);
+			const int U = (int16)ReadSCDAStaticLE16(TestData, Pos + 8);
+			const int V = (int16)ReadSCDAStaticLE16(TestData, Pos + 10);
+		if (abs(U) < 32760 && abs(V) < 32760 && (abs(U) + abs(V)) > 0)
+			GoodUVs++;
+	}
+		const int ExtentX = MaxX - MinX;
+		const int ExtentY = MaxY - MinY;
+		const int ExtentZ = MaxZ - MinZ;
+		const int Extent = ExtentX + ExtentY + ExtentZ;
+		if (Extent < 32)
+			continue;
+		if (ExtentX > 30000 || ExtentY > 30000 || ExtentZ > 30000)
+			continue;
+		int SmallAxes = 0;
+		if (ExtentX < 32) SmallAxes++;
+		if (ExtentY < 32) SmallAxes++;
+		if (ExtentZ < 32) SmallAxes++;
+		if (SmallAxes >= 2)
+			continue;
+		const float HugePenalty = (ExtentX > 60000 || ExtentY > 60000 || ExtentZ > 60000) ? 1000.0f : 0.0f;
+		const float Score = GoodUVs * 10.0f + min(Extent, 120000) * 0.001f - Base * 0.02f - HugePenalty;
+		if (Score > BestScore)
+		{
+			BestScore = Score;
+			BestBase = Base;
+			BestVertexCount = TestVertexCount;
+			BestGoodUVs = GoodUVs;
+			BestExtent[0] = ExtentX;
+			BestExtent[1] = ExtentY;
+			BestExtent[2] = ExtentZ;
+		}
+next_base:
+		;
+	}
+	if (BestBase < 0)
+		return false;
+	Data += BestBase;
+	DataSize -= BestBase;
+	const int VertexCount = BestVertexCount;
+	const int IndexCount = (VertexCount / 3) * 3;
+	const int GoodUVs = BestGoodUVs;
+
+	Mesh->VertexStream.Vert.Empty(VertexCount);
+	Mesh->VertexStream.Vert.AddZeroed(VertexCount);
+	FStaticMeshUVStream* UV = new (Mesh->UVStream) FStaticMeshUVStream;
+	UV->Data.Empty(VertexCount);
+	UV->Data.AddZeroed(VertexCount);
+
+	for (int i = 0; i < VertexCount; i++)
+	{
+		const int Pos = i * 16;
+		FStaticMeshVertex& Vtx = Mesh->VertexStream.Vert[i];
+		Vtx.Pos.X = (int16)ReadSCDAStaticLE16(Data, Pos + 0) / 32.0f;
+		Vtx.Pos.Y = (int16)ReadSCDAStaticLE16(Data, Pos + 2) / 32.0f;
+		Vtx.Pos.Z = (int16)ReadSCDAStaticLE16(Data, Pos + 4) / 32.0f;
+		Vtx.Normal.Set(0, 0, 0);
+		UV->Data[i].U = (int16)ReadSCDAStaticLE16(Data, Pos + 8) / 2048.0f;
+		UV->Data[i].V = (int16)ReadSCDAStaticLE16(Data, Pos + 10) / 2048.0f;
+	}
+
+	Mesh->IndexStream1.Indices.Empty(IndexCount);
+	Mesh->IndexStream1.Indices.AddZeroed(IndexCount);
+	for (int i = 0; i < IndexCount; i++)
+		Mesh->IndexStream1.Indices[i] = i;
+
+	for (int i = 0; i + 2 < IndexCount; i += 3)
+	{
+		FStaticMeshVertex& A = Mesh->VertexStream.Vert[i + 0];
+		FStaticMeshVertex& B = Mesh->VertexStream.Vert[i + 1];
+		FStaticMeshVertex& C = Mesh->VertexStream.Vert[i + 2];
+		FVector AB, AC;
+		AB.Set(B.Pos.X - A.Pos.X, B.Pos.Y - A.Pos.Y, B.Pos.Z - A.Pos.Z);
+		AC.Set(C.Pos.X - A.Pos.X, C.Pos.Y - A.Pos.Y, C.Pos.Z - A.Pos.Z);
+		FVector N = SCDAStaticCross(AB, AC);
+		A.Normal.Add(N);
+		B.Normal.Add(N);
+		C.Normal.Add(N);
+	}
+	for (int i = 0; i < VertexCount; i++)
+		SCDAStaticNormalize(Mesh->VertexStream.Vert[i].Normal);
+
+	FStaticMeshSection* Section = new (Mesh->Sections) FStaticMeshSection;
+	memset(Section, 0, sizeof(FStaticMeshSection));
+	Section->FirstIndex  = 0;
+	Section->FirstVertex = 0;
+	Section->LastVertex  = VertexCount - 1;
+	Section->fE          = IndexCount / 3;
+	Section->NumFaces    = IndexCount / 3;
+
+	const char* DebugStatic = getenv("SC4_DEBUG_STATIC");
+	if (DebugStatic && strcmp(DebugStatic, "0") != 0)
+		appPrintf("SC4 StaticMesh %s packed16 base=%X vertices=%d tris=%d uvGood=%d extent=(%d,%d,%d) materials=%d first=(%g,%g,%g) uv=(%g,%g)\n",
+			Mesh->Name, BestBase, VertexCount, IndexCount / 3, GoodUVs,
+			BestExtent[0], BestExtent[1], BestExtent[2], Mesh->Materials.Num(),
+			Mesh->VertexStream.Vert[0].Pos.X, Mesh->VertexStream.Vert[0].Pos.Y, Mesh->VertexStream.Vert[0].Pos.Z,
+			UV->Data[0].U, UV->Data[0].V);
+
+	Mesh->ConvertMesh();
+	return true;
+	unguard;
+}
+
 static bool SerializeDoubleAgentStaticMesh(UStaticMesh* Mesh, FArchive& Ar)
 {
 	const int Start = Ar.Tell();
@@ -4105,14 +7175,60 @@ static bool SerializeDoubleAgentStaticMesh(UStaticMesh* Mesh, FArchive& Ar)
 	Ar.Serialize(Raw.GetData(), Size);
 	Ar.Seek(Start);
 
+	int PayloadBase = -1;
+	int BestIndexCount = 0;
+	float BestPayloadScore = -1.0e30f;
 	FSCDAStaticVertexLayout Layout;
-	if (!FindSCDAStaticVertexLayout(Raw.GetData(), Size, Layout))
-		return false;
+	memset(&Layout, 0, sizeof(Layout));
+	const int MaxPayloadBase = min(Size - 64, 0x1000);
+	for (int Base = 0; Base <= MaxPayloadBase; Base++)
+	{
+		FSCDAStaticVertexLayout TestLayout;
+		if (!FindSCDAStaticVertexLayout(Raw.GetData() + Base, Size - Base, TestLayout))
+			continue;
 
+		int TestSectionCount = 0;
+		memcpy(&TestSectionCount, Raw.GetData() + Base, 4);
+		TArray<FSCDAStaticSectionInfo> TestSections;
+		if (!ReadSCDAStaticSections(Raw.GetData() + Base, Size - Base, TestSectionCount, TestLayout.Count, TestSections))
+			continue;
+
+		int TestExpectedIndexCount = 0;
+		for (int i = 0; i < TestSections.Num(); i++)
+			TestExpectedIndexCount += TestSections[i].NumFaces * 3;
+
+		TArray<uint16> TestIndices;
+		int TestIndexPos = 0;
+		if (!FindSCDAStaticIndexBlock(Raw.GetData() + Base, Size - Base,
+			TestLayout.Start + TestLayout.Count * TestLayout.Stride, TestLayout,
+			TestExpectedIndexCount, TestIndices, TestIndexPos))
+			continue;
+
+		const float Score = TestLayout.Score + TestIndices.Num() * 0.05f - Base * 0.002f;
+		if (Score > BestPayloadScore)
+		{
+			PayloadBase = Base;
+			Layout = TestLayout;
+			BestIndexCount = TestIndices.Num();
+			BestPayloadScore = Score;
+		}
+	}
+	if (PayloadBase < 0)
+	{
+		if (SerializeDoubleAgentStaticMeshPackedTriangles(Mesh, Raw.GetData(), Size))
+		{
+			DROP_REMAINING_DATA(Ar);
+			return true;
+		}
+		return false;
+	}
+
+	const byte* Data = Raw.GetData() + PayloadBase;
+	const int DataSize = Size - PayloadBase;
 	int SectionCount = 0;
-	memcpy(&SectionCount, Raw.GetData(), 4);
+	memcpy(&SectionCount, Data, 4);
 	TArray<FSCDAStaticSectionInfo> SCDASections;
-	ReadSCDAStaticSections(Raw.GetData(), Size, SectionCount, Layout.Count, SCDASections);
+	ReadSCDAStaticSections(Data, DataSize, SectionCount, Layout.Count, SCDASections);
 	int ExpectedIndexCount = 0;
 	for (int i = 0; i < SCDASections.Num(); i++)
 		ExpectedIndexCount += SCDASections[i].NumFaces * 3;
@@ -4129,14 +7245,14 @@ static bool SerializeDoubleAgentStaticMesh(UStaticMesh* Mesh, FArchive& Ar)
 	{
 		const int Pos = Layout.Start + i * Layout.Stride;
 		FStaticMeshVertex& V = Mesh->VertexStream.Vert[i];
-		V.Pos.X = ReadSCDAStaticFloat(Raw.GetData(), Pos + 0);
-		V.Pos.Y = ReadSCDAStaticFloat(Raw.GetData(), Pos + 4);
-		V.Pos.Z = ReadSCDAStaticFloat(Raw.GetData(), Pos + 8);
+		V.Pos.X = ReadSCDAStaticFloat(Data, Pos + 0);
+		V.Pos.Y = ReadSCDAStaticFloat(Data, Pos + 4);
+		V.Pos.Z = ReadSCDAStaticFloat(Data, Pos + 8);
 		if (Layout.Stride >= 24)
 		{
-			V.Normal.X = ReadSCDAStaticFloat(Raw.GetData(), Pos + 12);
-			V.Normal.Y = ReadSCDAStaticFloat(Raw.GetData(), Pos + 16);
-			V.Normal.Z = ReadSCDAStaticFloat(Raw.GetData(), Pos + 20);
+			V.Normal.X = ReadSCDAStaticFloat(Data, Pos + 12);
+			V.Normal.Y = ReadSCDAStaticFloat(Data, Pos + 16);
+			V.Normal.Z = ReadSCDAStaticFloat(Data, Pos + 20);
 			const float LenSq = V.Normal.X * V.Normal.X + V.Normal.Y * V.Normal.Y + V.Normal.Z * V.Normal.Z;
 			if (LenSq > 0.25f && LenSq < 2.25f)
 				GoodNormals++;
@@ -4150,10 +7266,10 @@ static bool SerializeDoubleAgentStaticMesh(UStaticMesh* Mesh, FArchive& Ar)
 	}
 
 	int IndexPos = 0;
-	FindSCDAStaticIndexBlock(Raw.GetData(), Size, Layout.Start + Layout.Count * Layout.Stride, Layout, ExpectedIndexCount, Mesh->IndexStream1.Indices, IndexPos);
+	FindSCDAStaticIndexBlock(Data, DataSize, Layout.Start + Layout.Count * Layout.Stride, Layout, ExpectedIndexCount, Mesh->IndexStream1.Indices, IndexPos);
 	const int VertexEnd = Layout.Start + Layout.Count * Layout.Stride;
 	if (IndexPos > VertexEnd)
-		FindSCDAStaticUVBlock(Raw.GetData(), Size, VertexEnd, IndexPos, Layout, Mesh->IndexStream1.Indices, *UV, GoodUVs);
+		FindSCDAStaticUVBlock(Data, DataSize, VertexEnd, IndexPos, Layout, Mesh->IndexStream1.Indices, *UV, GoodUVs);
 
 	for (int s = 0; s < SCDASections.Num(); s++)
 	{
@@ -4211,8 +7327,9 @@ static bool SerializeDoubleAgentStaticMesh(UStaticMesh* Mesh, FArchive& Ar)
 
 	const char* DebugStatic = getenv("SC4_DEBUG_STATIC");
 	if (DebugStatic && strcmp(DebugStatic, "0") != 0)
-		appPrintf("SC4 StaticMesh %s layout start=%X count=%d stride=%d indices=%d score=%g normals=%d uvs=%d\n",
-			Mesh->Name, Layout.Start, Layout.Count, Layout.Stride, Mesh->IndexStream1.Indices.Num(), Layout.Score, GoodNormals, GoodUVs);
+		appPrintf("SC4 StaticMesh %s payloadBase=%X layout start=%X count=%d stride=%d indices=%d expected=%d probeIdx=%d score=%g normals=%d uvs=%d\n",
+			Mesh->Name, PayloadBase, Layout.Start, Layout.Count, Layout.Stride, Mesh->IndexStream1.Indices.Num(),
+			ExpectedIndexCount, BestIndexCount, BestPayloadScore, GoodNormals, GoodUVs);
 
 	if (Mesh->IndexStream1.Indices.Num() >= 3 && SCDASections.Num() > 0)
 	{
@@ -4292,10 +7409,96 @@ void UStaticMesh::Serialize(FArchive &Ar)
 	//!! separate BIOSHOCK and UC2 code paths to cpps
 	//!! separate specific data type declarations into cpps
 	//!! UC2 code: can integrate LoadExternalUC2Data() into serializer
+#if SPLINTER_CELL
+	const bool isScdaV2SyntheticStatic =
+		(Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 127 &&
+		Package && strstr(*Package->GetFilename(), "_sm.usx") && !strstr(*Package->GetFilename(), "_lin_sm_"));
+	const bool isScdaV2InlineStatic =
+		(Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 127 &&
+		Package && strstr(*Package->GetFilename(), "_lin_sm_"));
+	if (isScdaV2InlineStatic)
+	{
+		const int SavePos = Ar.Tell();
+		const int SaveStop = Ar.GetStopper();
+		const int RawSize = SaveStop - SavePos;
+		if (RawSize > 0)
+		{
+			TArray<byte> RawStatic;
+			RawStatic.AddUninitialized(RawSize);
+			Ar.Serialize(RawStatic.GetData(), RawSize);
+			Ar.Seek(SavePos);
+			if (getenv("SCDA_DUMP_STATIC_RAW"))
+			{
+				char Filename[256];
+				appSprintf(ARRAY_ARG(Filename), "scda_inline_static_%s_raw.bin", Name);
+				FILE *F = fopen(Filename, "wb");
+				if (F)
+				{
+					fwrite(RawStatic.GetData(), 1, RawSize, F);
+					fclose(F);
+					appPrintf("SCDA dumped inline static mesh export: %s size=%d\n", Filename, RawSize);
+				}
+			}
+			DumpSCDAInlineStaticPacketSummary(Name, RawStatic.GetData(), RawSize);
+			if (SerializeDoubleAgentInlineStaticMeshPacket(this, RawStatic.GetData(), RawSize))
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+			// Inline _lin_sm_ exports are native Xbox renderer packets.  A few
+			// probe targets looked superficially like 16-byte vertex records, but
+			// applying that interpretation globally creates convincing-looking
+			// garbage for objects such as Hovercraft.  Keep the old reader behind
+			// an explicit probe switch only; production decoding must walk the
+			// packet grammar from byte 0 instead of UV/stride anchoring.
+			const char* AllowPacked16 = getenv("SCDA_ALLOW_INLINE_STATIC_PACKED16");
+			if (AllowPacked16 && strcmp(AllowPacked16, "0") &&
+				RawSize >= 16 * 3 &&
+				SerializeDoubleAgentStaticMeshPackedTriangles(this, RawStatic.GetData(), RawSize))
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+		}
+		appNotify("Unable to decode SCDA V2 inline static mesh %s, skipping raw payload", Name);
+		DROP_REMAINING_DATA(Ar);
+		ConvertMesh();
+		return;
+	}
+	if (isScdaV2SyntheticStatic)
+	{
+		const char* DebugStaticEnv = getenv("SC4_DEBUG_STATIC");
+		if (DebugStaticEnv && strcmp(DebugStaticEnv, "0") != 0)
+		{
+			int SavePos = Ar.Tell();
+			int Stop = Ar.GetStopper();
+			byte Bytes[96];
+			int Count = min(ARRAY_COUNT(Bytes), Stop - SavePos);
+			appPrintf("SCDA V2 StaticMesh raw %s pos=%08X stopper=%08X size=%X\n", Name, SavePos, Stop, Stop - SavePos);
+			if (Count > 0)
+			{
+				Ar.Serialize(Bytes, Count);
+				appPrintf("SCDA V2 StaticMesh raw bytes:");
+				for (int i = 0; i < Count; i++)
+					appPrintf(" %02X", Bytes[i]);
+				appPrintf("\n");
+				Ar.Seek(SavePos);
+			}
+		}
+		if (SerializeDoubleAgentStaticMesh(this, Ar))
+			return;
+		appNotify("Unable to decode SCDA V2 static mesh %s, skipping raw payload", Name);
+		DROP_REMAINING_DATA(Ar);
+		ConvertMesh();
+		return;
+	}
+#endif
 	Super::Serialize(Ar);
 
 #if SPLINTER_CELL
-	const bool isDoubleAgentOnlineStatic = (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0);
+	const bool isDoubleAgentOnlineStatic =
+		(Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0) ||
+		(Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 127);
 	const char* DebugStaticEnv = getenv("SC4_DEBUG_STATIC");
 	const bool debugDoubleAgentStatic = isDoubleAgentOnlineStatic && DebugStaticEnv && strcmp(DebugStaticEnv, "0") != 0;
 	if (debugDoubleAgentStatic)
@@ -4349,7 +7552,8 @@ void UStaticMesh::Serialize(FArchive &Ar)
 		return;
 	}
 
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 120)
+	// if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 120)
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 120 && Ar.ArLicenseeVer != 124)
 	{
 		int NumVerts;
 		Ar << AR_INDEX(NumVerts);

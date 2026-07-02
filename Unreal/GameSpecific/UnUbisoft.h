@@ -4,9 +4,16 @@
 #if SPLINTER_CELL
 
 FVirtualFileSystem* CreateScdaLinVFS(const char *Filename);
+FVirtualFileSystem* CreateScdaV2ManifestVFS(const char *Filename);
+FVirtualFileSystem* CreateScdaPcLinVFS(const char *Filename);
 bool LoadScdaLinTextureStream(const char *TextureName, TArray<byte>& Data, int& GpuSize, int& TextureId,
-	int& USize, int& VSize, int& FormatCode);
-bool GetScdaLinTextureStreamInfo(const char *TextureName, int& USize, int& VSize, int& FormatCode);
+	int& USize, int& VSize, int& FormatCode, const char *PackageFilename = NULL);
+bool GetScdaLinTextureStreamInfo(const char *TextureName, int& USize, int& VSize, int& FormatCode,
+	const char *PackageFilename = NULL);
+bool GetScdaV2ManifestSkeleton(const char *PackageFilename, TArray<FString>& BoneNames,
+	TArray<int>& ParentIndices);
+bool GetScdaV2ManifestAnimationData(const char *PackageFilename, const char *ObjectName,
+	TArray<byte>& Data, int& SourceLogicalOffset);
 
 #endif // SPLINTER_CELL
 

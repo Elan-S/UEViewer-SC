@@ -290,6 +290,12 @@ public:
 	// Release data cached with GetTextureData().
 	virtual void ReleaseTextureData() const
 	{}
+	// Some game material types carry texture coordinate transforms which are
+	// applied by the renderer rather than baked into mesh UVs.
+	virtual bool ShouldFlipU() const
+	{
+		return false;
+	}
 
 	void GetMetadata(FArchive& Ar) const
 	{

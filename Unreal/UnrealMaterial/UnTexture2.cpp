@@ -484,16 +484,116 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 {
 	guard(USCX_basic_material::Serialize);
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 &&
-		Ar.GetStopper() - Ar.Tell() <= 0x20)
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
 	{
+		while (Ar.Tell() < Ar.GetStopper())
+		{
+			int NameIndex;
+			Ar << AR_INDEX(NameIndex);
+			if (!Package || NameIndex < 0 || unsigned(NameIndex) >= Package->Summary.NameCount)
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+			const char *PropertyName = Package->GetName(NameIndex);
+			if (!stricmp(PropertyName, "None"))
+				break;
+
+			byte Info;
+			Ar << Info;
+			const int Type = Info & 0xF;
+			const bool IsArray = (Info & 0x80) != 0;
+			if (Type == 10)
+			{
+				int StructName;
+				Ar << AR_INDEX(StructName);
+			}
+
+			int DataSize = 0;
+			switch ((Info >> 4) & 7)
+			{
+			case 0: DataSize = 1; break;
+			case 1: DataSize = 2; break;
+			case 2: DataSize = 4; break;
+			case 3: DataSize = 12; break;
+			case 4: DataSize = 16; break;
+			case 5: { byte Size; Ar << Size; DataSize = Size; break; }
+			case 6: { uint16 Size; Ar << Size; DataSize = Size; break; }
+			case 7: Ar << DataSize; break;
+			}
+			if (Type != 3 && IsArray)
+			{
+				byte Index;
+				Ar << Index;
+				if (Index >= 128)
+				{
+					byte Extra;
+					Ar << Extra;
+					if (Index & 0x40)
+					{
+						Ar << Extra;
+						Ar << Extra;
+					}
+				}
+			}
+			if (DataSize < 0 || Ar.Tell() > Ar.GetStopper() - DataSize)
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+
+			const int ValueStart = Ar.Tell();
+			if (Type == 5)
+			{
+				int ObjectRef;
+				Ar << AR_INDEX(ObjectRef);
+				const bool UseValue =
+					!stricmp(PropertyName, "Base") ||
+					!stricmp(PropertyName, "Normal") ||
+					!stricmp(PropertyName, "SpecularMask") ||
+					!stricmp(PropertyName, "Environment") ||
+					!stricmp(PropertyName, "HeightMap") ||
+					!stricmp(PropertyName, "HDRMask");
+				UObject *Value = NULL;
+				if (UseValue && Package)
+				{
+					if (ObjectRef < 0 && unsigned(-ObjectRef - 1) < Package->Summary.ImportCount)
+						Value = Package->CreateImport(-ObjectRef - 1);
+					else if (ObjectRef > 0 && unsigned(ObjectRef - 1) < Package->Summary.ExportCount)
+						Value = Package->CreateExport(ObjectRef - 1);
+				}
+				if (!stricmp(PropertyName, "Base"))
+					Base = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "Normal"))
+					Normal = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "SpecularMask"))
+					SpecularMask = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "Environment"))
+					Environment = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "HeightMap"))
+					HeightMap = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "HDRMask"))
+					HDRMask = static_cast<UTexture*>(Value);
+				else if (!stricmp(PropertyName, "BaseTransform") ||
+					!stricmp(PropertyName, "NormalTransform") ||
+					!stricmp(PropertyName, "SpecularTransform"))
+				{
+					// SCDA v2 mirrored actor materials reference TexTransformBasic
+					// exports. The referenced transform payloads contain
+					// ScalingU = -1.0 (property bytes: 0F 24 00 00 80 BF).
+					// Keep the UV stream intact and apply the mirror at draw time.
+					bFlipU = true;
+				}
+			}
+			Ar.Seek(ValueStart + DataSize);
+		}
 		DROP_REMAINING_DATA(Ar);
 		return;
 	}
 #endif
 	Super::Serialize(Ar);
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123)
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
 		DROP_REMAINING_DATA(Ar);
 #endif
 #if LEAD
@@ -571,10 +671,11 @@ void UTexture::Serialize(FArchive &Ar)
 #endif // AA2
 	Ar << Mips;
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Mips.Num() == 0)
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124 && Mips.Num() == 0)
 	{
 		int StreamUSize, StreamVSize, StreamFormatCode;
-		if (GetScdaLinTextureStreamInfo(Name, StreamUSize, StreamVSize, StreamFormatCode))
+		if (GetScdaLinTextureStreamInfo(Name, StreamUSize, StreamVSize, StreamFormatCode,
+			Package ? *Package->GetFilename() : NULL))
 		{
 			USize = StreamUSize;
 			VSize = StreamVSize;
@@ -588,7 +689,7 @@ void UTexture::Serialize(FArchive &Ar)
 				Format = TEXF_DXT1;
 		}
 	}
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && getenv("SCDA_LIN_DEBUG"))
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124 && getenv("SCDA_LIN_DEBUG"))
 	{
 		appPrintf("SCDA texture serialize: %s fmt=%d props=%dx%d mips=%d tell=%X stop=%X\n",
 			Name, Format, USize, VSize, Mips.Num(), Ar.Tell(), Ar.GetStopper());
@@ -633,7 +734,7 @@ void UTexture::Serialize(FArchive &Ar)
 	}
 #endif // EXTEEL
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123)
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
 		DROP_REMAINING_DATA(Ar);
 #endif
 	unguard;
@@ -1098,11 +1199,12 @@ bool UTexture::GetTextureData(CTextureData &TexData) const
 	// process external sources for some games
 #if SPLINTER_CELL
 	if (PackageAr && PackageAr->Game == GAME_SplinterCell && PackageAr->ArVer == 100 &&
-		PackageAr->ArLicenseeVer >= 123)
+		PackageAr->ArLicenseeVer >= 123 && PackageAr->ArLicenseeVer != 124)
 	{
 		TArray<byte> StreamData;
 		int GpuSize, TextureId, StreamUSize, StreamVSize, FormatCode;
-		if (LoadScdaLinTextureStream(Name, StreamData, GpuSize, TextureId, StreamUSize, StreamVSize, FormatCode) &&
+		if (LoadScdaLinTextureStream(Name, StreamData, GpuSize, TextureId, StreamUSize, StreamVSize, FormatCode,
+			Package ? *Package->GetFilename() : NULL) &&
 			StreamUSize > 0 && StreamVSize > 0)
 		{
 			ETexturePixelFormat StreamFormat = TPF_UNKNOWN;

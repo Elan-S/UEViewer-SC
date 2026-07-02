@@ -438,7 +438,8 @@ struct FMipmap
 #endif // TRIBES3
 		Ar << M.DataArray;
 #if SPLINTER_CELL
-		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123)
+		// if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123)
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
 		{
 			uint16 USize, VSize;
 			byte Unknown;
@@ -1382,8 +1383,24 @@ public:
 	UTexture		*HeightMap;
 	UTexture		*HDRMask;
 	SpecSrc			SpecularSource;
+	bool			bFlipU;
 
 	virtual void Serialize(FArchive &Ar);
+	virtual bool ShouldFlipU() const
+	{
+		return bFlipU;
+	}
+
+	USCX_basic_material()
+	:	Base(NULL)
+	,	Normal(NULL)
+	,	SpecularMask(NULL)
+	,	Environment(NULL)
+	,	HeightMap(NULL)
+	,	HDRMask(NULL)
+	,	SpecularSource(SpecSrc_SRed)
+	,	bFlipU(false)
+	{}
 
 	BEGIN_PROP_TABLE
 		PROP_OBJ(Base)
@@ -1438,7 +1455,10 @@ public:
 	REGISTER_CLASS_ALIAS(UUnreal3Material, EmissiveModernMaterial) \
 	REGISTER_CLASS_ALIAS(UUnreal3Material, TranspEmissiveModernMaterial) \
 	REGISTER_CLASS_ALIAS(UUnreal3Material, EvolvedModernMaterial) \
-	REGISTER_CLASS(USCX_basic_material)
+	REGISTER_CLASS(USCX_basic_material) \
+	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_glow_material) \
+	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_glass_material) \
+	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_refractiveglass_material)
 
 #define REGISTER_MATERIAL_ENUMS			\
 	REGISTER_ENUM(ETextureFormat)		\

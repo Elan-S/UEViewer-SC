@@ -1132,6 +1132,21 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 	}
 	byte *value = (byte*)ObjectData + Prop->Offset;
 
+#if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell &&
+		!strcmp(Name, "UTexture") &&
+		!strcmp(*Tag.Name, "InternalTime") &&
+		Tag.Type != NAME_IntProperty)
+	{
+		// SCDA V2 Xbox packages sometimes tag UTexture.InternalTime as a
+		// VectorProperty-sized payload instead of the usual int[2].  The field is
+		// engine bookkeeping and is irrelevant for decoding texture/material data,
+		// so skip only this known mismatch rather than aborting whole-package load.
+		Ar.Seek(StopPos);
+		return;
+	}
+#endif
+
 // If we'll put PropType namespace values into .cpp, we'll have identical constants, so we could
 // simply use (TypeField == Constant). However this breaks compile-time creation of CTypeInfo
 // property lists, they will be created at runtime. So, let's use strcmp at runtime instead.

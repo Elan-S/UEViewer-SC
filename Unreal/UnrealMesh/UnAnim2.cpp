@@ -4,6 +4,7 @@
 #include "UnrealPackage/UnPackage.h"
 #include "UnMesh2.h"
 #include "UnMeshTypes.h"
+#include "GameSpecific/UnUbisoft.h"
 
 #include "Mesh/SkeletalMesh.h"
 #include "TypeConvert.h"
@@ -555,9 +556,230 @@ void UMeshAnimation::SerializePandora(FArchive &Ar)
 	unguard;
 }
 
+static bool ReadSCDAV2StaticCompactIndex(const byte* Data, int DataSize, int& Pos, int& Value)
+{
+	if (Pos < 0 || Pos >= DataSize)
+		return false;
+	byte B = Data[Pos++];
+	bool Negative = (B & 0x80) != 0;
+	Value = B & 0x3F;
+	int Shift = 6;
+	if (B & 0x40)
+	{
+		for (int i = 0; i < 4; i++)
+		{
+			if (Pos >= DataSize)
+				return false;
+			B = Data[Pos++];
+			Value |= (B & 0x7F) << Shift;
+			Shift += 7;
+			if (!(B & 0x80))
+				break;
+		}
+	}
+	if (Negative)
+		Value = -Value;
+	return true;
+}
+
+static float ReadSCDAV2StaticFloatLE(const byte* Data, int Pos)
+{
+	float Value;
+	memcpy(&Value, Data + Pos, 4);
+	return Value;
+}
+
+static bool IsSCDAV2AnimSequenceName(const char* Name)
+{
+	if (!Name || !Name[0])
+		return false;
+	if (!stricmp(Name, "None") ||
+		!stricmp(Name, "NotifyName") ||
+		!stricmp(Name, "PlayOnlyFoward") ||
+		!stricmp(Name, "PlayOnController") ||
+		!stricmp(Name, "PlayPivot") ||
+		!stricmp(Name, "Sound") ||
+		!stricmp(Name, "SoundSlot") ||
+		!stricmp(Name, "AnimSound") ||
+		!stricmp(Name, "bScriptCallingSound"))
+		return false;
+	int Len = 0;
+	bool HasLower = false;
+	bool HasLetter = false;
+	bool HasDigit = false;
+	for (const char* C = Name; *C; C++, Len++)
+	{
+		if (Len >= 64)
+			return false;
+		char Ch = *C;
+		if (Ch >= 'a' && Ch <= 'z')
+		{
+			HasLower = true;
+			HasLetter = true;
+			continue;
+		}
+		if (Ch >= 'A' && Ch <= 'Z')
+		{
+			HasLetter = true;
+			continue;
+		}
+		if (Ch >= '0' && Ch <= '9')
+		{
+			HasDigit = true;
+			continue;
+		}
+		if (Ch == '_')
+			continue;
+		return false;
+	}
+	return Len >= 3 && HasLetter && HasLower && HasDigit;
+}
+
+static bool LoadSCDAV2ManifestSequences(UMeshAnimation& Anim, const TArray<byte>& Data, int SourceLogicalOffset)
+{
+	guard(LoadSCDAV2ManifestSequences);
+	if (!Anim.Package || !Data.Num())
+		return false;
+
+	struct FSeqInfo
+	{
+		int Pos;
+		int NameEnd;
+		int NameIndex;
+		int NumFrames;
+		float Rate;
+	};
+
+	TArray<FSeqInfo> Candidates;
+	const byte* Bytes = Data.GetData();
+	const int Size = Data.Num();
+	for (int Pos = 0; Pos + 32 < Size; Pos++)
+	{
+		int NamePos = Pos;
+		int NameIndex = 0;
+		if (!ReadSCDAV2StaticCompactIndex(Bytes, Size, NamePos, NameIndex))
+			continue;
+		if (NameIndex <= 0 || NameIndex >= Anim.Package->Summary.NameCount)
+			continue;
+		const char* SeqName = Anim.Package->GetName(NameIndex);
+		if (!IsSCDAV2AnimSequenceName(SeqName))
+			continue;
+		if (NamePos + 23 > Size)
+			continue;
+		bool ZeroHeader = true;
+		for (int i = 0; i < 6; i++)
+		{
+			if (Bytes[NamePos + i] != 0)
+			{
+				ZeroHeader = false;
+				break;
+			}
+		}
+		if (!ZeroHeader)
+			continue;
+		int NumFrames = Bytes[NamePos + 6];
+		if (NumFrames <= 0 || NumFrames > 240)
+			continue;
+		if (Bytes[NamePos + 7] || Bytes[NamePos + 8] || Bytes[NamePos + 9] || Bytes[NamePos + 10])
+			continue;
+		float Rate = ReadSCDAV2StaticFloatLE(Bytes, NamePos + 11);
+		if (Rate < 1.0f || Rate > 120.0f)
+			continue;
+		if (Candidates.Num() && Pos < Candidates.Last().NameEnd)
+			continue; // filters the second byte of a two-byte compact name, e.g. PlayOnlyFoward
+		FSeqInfo* Info = new (Candidates) FSeqInfo;
+		Info->Pos = Pos;
+		Info->NameEnd = NamePos;
+		Info->NameIndex = NameIndex;
+		Info->NumFrames = NumFrames;
+		Info->Rate = Rate;
+	}
+
+	if (!Candidates.Num())
+		return false;
+
+	Anim.Moves.Empty(Candidates.Num());
+	Anim.AnimSeqs.Empty(Candidates.Num());
+	FQuat Identity;
+	Identity.Set(0, 0, 0, 1);
+	for (int SeqIndex = 0; SeqIndex < Candidates.Num(); SeqIndex++)
+	{
+		const FSeqInfo& Info = Candidates[SeqIndex];
+		MotionChunk* Move = new (Anim.Moves) MotionChunk;
+		Move->RootSpeed3D.Set(0, 0, 0);
+		Move->TrackTime = max(1, Info.NumFrames);
+		Move->StartBone = 0;
+		Move->Flags = 0;
+		const int BoneCount = Anim.RefBones.Num();
+		Move->BoneIndices.Empty(BoneCount);
+		Move->BoneIndices.AddZeroed(BoneCount);
+		Move->AnimTracks.Empty(BoneCount);
+		Move->AnimTracks.AddZeroed(BoneCount);
+		for (int BoneIndex = 0; BoneIndex < BoneCount; BoneIndex++)
+		{
+			Move->BoneIndices[BoneIndex] = BoneIndex;
+			AnalogTrack& Track = Move->AnimTracks[BoneIndex];
+			Track.Flags = 0;
+			Track.KeyQuat.Add(Identity);
+			Track.KeyTime.Add(0.0f);
+			if (BoneIndex == 0)
+			{
+				FVector Zero;
+				Zero.Set(0, 0, 0);
+				Track.KeyPos.Add(Zero);
+			}
+		}
+
+		FMeshAnimSeq* Seq = new (Anim.AnimSeqs) FMeshAnimSeq;
+		Seq->f28 = 0;
+		Seq->Name = Anim.Package->GetName(Info.NameIndex);
+		Seq->Groups.Empty();
+		Seq->StartFrame = 0;
+		Seq->NumFrames = Info.NumFrames;
+		Seq->Notifys.Empty();
+		Seq->Rate = Info.Rate;
+	}
+
+	if (getenv("SCDA_DEBUG_ANIM"))
+	{
+		appPrintf("SCDA V2 MeshAnimation %s: sidecar sequences=%d source=%08X\n",
+			Anim.Name, Anim.AnimSeqs.Num(), SourceLogicalOffset);
+		for (int i = 0; i < Candidates.Num() && i < 32; i++)
+			appPrintf("  seq %d pos=%08X name=%s frames=%d rate=%g\n",
+				i, SourceLogicalOffset + Candidates[i].Pos,
+				Anim.Package->GetName(Candidates[i].NameIndex),
+				Candidates[i].NumFrames, Candidates[i].Rate);
+	}
+	return Anim.AnimSeqs.Num() > 0;
+	unguard;
+}
+
 void UMeshAnimation::SerializeSC4(FArchive &Ar)
 {
 	guard(UMeshAnimation::SerializeSC4);
+
+	bool ManifestSkeleton = false;
+	if (!RefBones.Num() && Package)
+	{
+		TArray<FString> BoneNames;
+		TArray<int> ParentIndices;
+		if (GetScdaV2ManifestSkeleton(*Package->GetFilename(), BoneNames, ParentIndices) &&
+			BoneNames.Num() == ParentIndices.Num())
+		{
+			RefBones.Empty(BoneNames.Num());
+			for (int BoneIndex = 0; BoneIndex < BoneNames.Num(); BoneIndex++)
+			{
+				FNamedBone *Bone = new (RefBones) FNamedBone;
+				Bone->Name = *BoneNames[BoneIndex];
+				Bone->Flags = 0;
+				Bone->ParentIndex = ParentIndices[BoneIndex];
+			}
+			ManifestSkeleton = true;
+			if (getenv("SC4_DEBUG_ANIM"))
+				appPrintf("SCDA manifest MeshAnimation skeleton: %s bones=%d\n",
+					Name, RefBones.Num());
+		}
+	}
 
 	TArray<FSC4MotionChunk> SrcMoves;
 	Ar << SrcMoves;
@@ -600,6 +822,54 @@ void UMeshAnimation::SerializeSC4(FArchive &Ar)
 	if (getenv("SC4_DEBUG_ANIM"))
 		appPrintf("SC4 MeshAnimation %s: moves=%d sequences=%d end=%08X stopper=%08X\n",
 			Name, Moves.Num(), AnimSeqs.Num(), Ar.Tell(), Ar.GetStopper());
+
+	if (ManifestSkeleton && !Moves.Num() && !AnimSeqs.Num())
+	{
+		TArray<byte> ScdaAnimData;
+		int ScdaAnimDataSource = 0;
+		if (GetScdaV2ManifestAnimationData(*Package->GetFilename(), Name, ScdaAnimData, ScdaAnimDataSource))
+			LoadSCDAV2ManifestSequences(*this, ScdaAnimData, ScdaAnimDataSource);
+	}
+
+	if (getenv("SCDA_DEBUG_ANIM") && Ar.Tell() < Ar.GetStopper())
+	{
+		int SavePos = Ar.Tell();
+		int FirstNonZero = 0;
+		for (int Pos = SavePos; Pos < Ar.GetStopper(); Pos++)
+		{
+			byte B = 0;
+			Ar.Seek(Pos);
+			Ar << B;
+			if (B)
+			{
+				FirstNonZero = Pos;
+				break;
+			}
+		}
+		if (FirstNonZero)
+			appPrintf("SCDA MeshAnimation first nonzero after SC4 arrays: %08X (+%X)\n",
+				FirstNonZero, FirstNonZero - SavePos);
+		Ar.Seek(FirstNonZero ? FirstNonZero : SavePos);
+		int ProbePos = Ar.Tell();
+		int DumpSize = min(128, Ar.GetStopper() - SavePos);
+		byte Bytes[128];
+		memset(Bytes, 0, sizeof(Bytes));
+		DumpSize = min(128, Ar.GetStopper() - ProbePos);
+		Ar.Serialize(Bytes, DumpSize);
+		appPrintf("SCDA MeshAnimation probe %s: pos=%08X stopper=%08X next=%d\n",
+			Name, ProbePos, Ar.GetStopper(), DumpSize);
+		for (int Line = 0; Line < DumpSize; Line += 16)
+		{
+			appPrintf("  %08X:", ProbePos + Line);
+			for (int i = 0; i < 16 && Line + i < DumpSize; i++)
+				appPrintf(" %02X", Bytes[Line + i]);
+			appPrintf("\n");
+		}
+		Ar.Seek(SavePos);
+	}
+
+	if (ManifestSkeleton)
+		DROP_REMAINING_DATA(Ar);
 
 	unguard;
 }

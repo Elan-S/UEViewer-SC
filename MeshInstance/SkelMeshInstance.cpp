@@ -26,6 +26,11 @@
 #undef SORT_BY_OPACITY				// to not obfuscate section indices
 #endif
 
+static bool IsSCDAV2FlipMaterial(const UUnrealMaterial* Mat)
+{
+	return Mat && Mat->ShouldFlipU();
+}
+
 
 struct CMeshBoneData
 {
@@ -1415,13 +1420,36 @@ void CSkelMeshInstance::DrawMesh(unsigned flags)
 	glVertexPointer(3, GL_FLOAT, sizeof(CSkinVert), &Skinned[0].Position);
 	glNormalPointer(GL_FLOAT, sizeof(CSkinVert), &Skinned[0].Normal);
 	if (UVIndex == 0)
-	{
 		glTexCoordPointer(2, GL_FLOAT, sizeof(CSkelMeshVertex), &Mesh.Verts[0].UV.U);
-	}
 	else
-	{
 		glTexCoordPointer(2, GL_FLOAT, sizeof(CMeshUVFloat), &Mesh.ExtraUV[UVIndex-1][0].U);
-	}
+
+	TArray<CMeshUVFloat> FlippedUVs;
+	bool bUsingFlippedUVs = false;
+	auto UseDefaultUVs = [&]()
+	{
+		if (UVIndex == 0)
+			glTexCoordPointer(2, GL_FLOAT, sizeof(CSkelMeshVertex), &Mesh.Verts[0].UV.U);
+		else
+			glTexCoordPointer(2, GL_FLOAT, sizeof(CMeshUVFloat), &Mesh.ExtraUV[UVIndex-1][0].U);
+		bUsingFlippedUVs = false;
+	};
+	auto UseFlippedUVs = [&]()
+	{
+		if (!FlippedUVs.Num())
+		{
+			FlippedUVs.Empty(NumVerts);
+			FlippedUVs.AddUninitialized(NumVerts);
+			for (int VertIndex = 0; VertIndex < NumVerts; VertIndex++)
+			{
+				CMeshUVFloat UV = (UVIndex == 0) ? Mesh.Verts[VertIndex].UV : Mesh.ExtraUV[UVIndex-1][VertIndex];
+				UV.U = 1.0f - UV.U;
+				FlippedUVs[VertIndex] = UV;
+			}
+		}
+		glTexCoordPointer(2, GL_FLOAT, sizeof(CMeshUVFloat), &FlippedUVs[0].U);
+		bUsingFlippedUVs = true;
+	};
 
 	bool bSetMaterial = true;
 	if (flags & DF_SHOW_INFLUENCES)
@@ -1465,6 +1493,14 @@ void CSkelMeshInstance::DrawMesh(unsigned flags)
 		// select material
 		if (bSetMaterial)
 			SetMaterial(Sec.Material, MaterialIndex);
+		if (bSetMaterial)
+		{
+			const bool bFlipUVs = IsSCDAV2FlipMaterial(Sec.Material);
+			if (bFlipUVs && !bUsingFlippedUVs)
+				UseFlippedUVs();
+			else if (!bFlipUVs && bUsingFlippedUVs)
+				UseDefaultUVs();
+		}
 		// check tangent space
 		GLint aNormal = -1;
 		GLint aTangent = -1;

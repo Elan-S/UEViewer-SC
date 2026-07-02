@@ -447,30 +447,45 @@ void CMaterialViewer::Draw2D()
 	{
 		const UBitmapMaterial* Tex = static_cast<const UBitmapMaterial*>(Object);
 
+		int displayWidth = Tex->USize;
+		int displayHeight = Tex->VSize;
 		const char *fmt = EnumToName(Tex->Format);
+		if (HasResolvedTextureData)
+		{
+			displayWidth = ResolvedTextureWidth;
+			displayHeight = ResolvedTextureHeight;
+		}
 		DrawTextLeft(S_GREEN "Width   :" S_WHITE " %d\n"
 					 S_GREEN "Height  :" S_WHITE " %d\n"
 					 S_GREEN "Format  :" S_WHITE " %s",
-					 Tex->USize, Tex->VSize,
+					 displayWidth, displayHeight,
 					 fmt ? fmt : "???");
 
 		if (Object->IsA("Texture"))
 		{
 			const UTexture* Tex2 = static_cast<const UTexture*>(Object);
 			int width = 0, height = 0;
-			// There are some textures which has mips with no data, display a message about stripped texture size.
-			// Example: --ut2 DemoPlayerSkins.utx -obj=DemoSkeleton
-			for (int i = 0; i < Tex2->Mips.Num(); i++)
+			if (HasResolvedTextureData)
 			{
-				const FMipmap& Mip = Tex2->Mips[i];
-				if (Mip.DataArray.Num())
+				width = ResolvedTextureWidth;
+				height = ResolvedTextureHeight;
+			}
+			else
+			{
+				// There are some textures which have mips with no data. Display
+				// a message about their packaged size.
+				for (int i = 0; i < Tex2->Mips.Num(); i++)
 				{
-					width = Mip.USize;
-					height = Mip.VSize;
-					break;
+					const FMipmap& Mip = Tex2->Mips[i];
+					if (Mip.DataArray.Num())
+					{
+						width = Mip.USize;
+						height = Mip.VSize;
+						break;
+					}
 				}
 			}
-			if (width != Tex2->USize || height != Tex2->VSize)
+			if (!HasResolvedTextureData && (width != Tex2->USize || height != Tex2->VSize))
 			{
 				if (width && height)
 					DrawTextLeft(S_RED"Packaged size: %dx%d", width, height);
@@ -537,7 +552,21 @@ CMaterialViewer::CMaterialViewer(UUnrealMaterial* Material, CApplication* Window
 :	CObjectViewer(Material, Window)
 {
 	IsTexture = Material->IsTexture();
+	HasResolvedTextureData = false;
+	ResolvedTextureWidth = 0;
+	ResolvedTextureHeight = 0;
 	NonConstMaterial = const_cast<UUnrealMaterial*>(static_cast<const UUnrealMaterial*>(Object));
+	if (Object->IsA("Texture"))
+	{
+		CTextureData ResolvedData;
+		const UTexture* Tex = static_cast<const UTexture*>(Object);
+		if (Tex->GetTextureData(ResolvedData) && ResolvedData.Mips.Num() > 0)
+		{
+			HasResolvedTextureData = true;
+			ResolvedTextureWidth = ResolvedData.Mips[0].USize;
+			ResolvedTextureHeight = ResolvedData.Mips[0].VSize;
+		}
+	}
 
 	Material->Lock();
 }

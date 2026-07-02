@@ -16,6 +16,16 @@ public:
 		guard(USound::Serialize);
 
 		Super::Serialize(Ar);
+		if (Ar.Game == GAME_SplinterCell)
+		{
+			int Remaining = Ar.GetStopper() - Ar.Tell();
+			if (Remaining > 0)
+			{
+				RawData.SetNumUninitialized(Remaining);
+				Ar.Serialize(&RawData[0], Remaining);
+				return;
+			}
+		}
 		Ar << f5C;
 #if UT2 || BATTLE_TERR || LOCO
 		if ((Ar.Game == GAME_UT2 || Ar.Game == GAME_BattleTerr || Ar.Game == GAME_Loco) && Ar.ArLicenseeVer >= 2)

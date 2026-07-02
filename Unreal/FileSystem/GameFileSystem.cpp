@@ -28,6 +28,17 @@
 
 char GRootDirectory[MAX_PACKAGE_PATH];
 
+static bool IsScdaV2LMapsPath(const char *Filename)
+{
+	for (const char *Scan = Filename; *Scan; Scan++)
+	{
+		if ((!strnicmp(Scan, "DataXb/LMaps", 12) || !strnicmp(Scan, "DataXb\\LMaps", 12)) &&
+			(Scan[12] == 0 || Scan[12] == '/' || Scan[12] == '\\'))
+			return true;
+	}
+	return false;
+}
+
 
 #define UE4_PACKAGE_EXTENSIONS	"uasset", "umap",
 
@@ -109,7 +120,7 @@ static const char *KnownExtensions[] =
 	"rtc",
 #	endif
 #	if SPLINTER_CELL
-	"lin",			// Splinter Cell Xbox seekless level stream
+	"lin",			// Splinter Cell linearized package stream
 #	endif
 #	if UNREAL4
 	"ubulk",		// separately stored UE4 bulk data
@@ -413,23 +424,32 @@ static void RegisterGameFile(const char* FullName, int64 FileSize = -1)
 	}
 #endif
 #if SPLINTER_CELL
-	if (!stricmp(ext, "lin"))
+	const char* ShortName = strrchr(FullName, '/');
+	const char* ShortName2 = strrchr(FullName, '\\');
+	if (!ShortName || (ShortName2 && ShortName2 > ShortName))
+		ShortName = ShortName2;
+	ShortName = ShortName ? ShortName + 1 : FullName;
+	if (!stricmp(ext, "txt") && !stricmp(ShortName, "scda_v2_level_manifest.txt"))
 	{
-		if (getenv("SCDA_LIN_ENABLE_VFS"))
-		{
-			const char* ShortName = strrchr(FullName, '/');
-			const char* ShortName2 = strrchr(FullName, '\\');
-			if (!ShortName || (ShortName2 && ShortName2 > ShortName))
-				ShortName = ShortName2;
-			ShortName = ShortName ? ShortName + 1 : FullName;
-			if (!stricmp(ShortName, "common.lin"))
+		reader = new FFileReader(FullName);
+		if (!reader) return;
+		vfs = CreateScdaV2ManifestVFS(FullName);
+		quietVfsFailure = true;
+	}
+	if (!stricmp(ext, "lin") || !stricmp(ext, "ulnc") || !stricmp(ext, "tlnc"))
+	{
+		// if (getenv("SCDA_LIN_ENABLE_VFS"))
+		// {
+			const bool IsCommonLin = !stricmp(ShortName, "common.lin");
+			const bool IsScdaV2LevelLin = !stricmp(ext, "lin") && IsScdaV2LMapsPath(FullName);
+			if (!IsCommonLin && !IsScdaV2LevelLin && (!stricmp(ext, "ulnc") || !stricmp(ext, "tlnc")))
 			{
 				reader = new FFileReader(FullName);
 				if (!reader) return;
 				vfs = CreateScdaLinVFS(FullName);
 				quietVfsFailure = true;
 			}
-		}
+		// }
 	}
 #endif
 

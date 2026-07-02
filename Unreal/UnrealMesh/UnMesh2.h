@@ -1439,8 +1439,16 @@ public:
 			ConvertAnims();
 			return;
 		}
-		if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0)
+		if (Ar.Game == GAME_SplinterCell && (
+			(Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0) ||
+			(Ar.ArVer == 100 && Ar.ArLicenseeVer >= 127)))
 		{
+			if (getenv("SCDA_USE_SCCT_ANIM"))
+			{
+				SerializeSCCT(Ar);
+				ConvertAnims();
+				return;
+			}
 			SerializeSC4(Ar);
 			ConvertAnims();
 			return;

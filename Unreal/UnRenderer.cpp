@@ -535,6 +535,12 @@ static int Upload2D(UUnrealMaterial *Tex, bool doMipmap, bool clampS, bool clamp
 		appPrintf("WARNING: %s %s has no valid mipmaps\n", Tex->GetClassName(), Tex->Name);
 		return BAD_TEXTURE;
 	}
+	if (getenv("SCDA_LIN_DEBUG") && Tex->GetGame() == GAME_SplinterCell)
+	{
+		appPrintf("SCDA viewer texture: %s resolved %dx%d mips=%d format=%s\n",
+			Tex->Name, TexData.Mips[0].USize, TexData.Mips[0].VSize,
+			TexData.Mips.Num(), TexData.OriginalFormatName);
+	}
 
 	bool floatTexture = PixelFormatInfo[TexData.Format].Float != 0;
 	if (floatTexture)

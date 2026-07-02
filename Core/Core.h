@@ -556,6 +556,19 @@ public:
 		memset(this, 0, sizeof(*this));
 	}
 
+	// Clear a handled error while preserving the current error handler.
+	inline void ClearError()
+	{
+		IsSwError = false;
+		SuppressLog = false;
+		IsErrorLogged = false;
+		FmtNeedArrow = false;
+#if THREADING
+		ErrorThreadId = 0;
+#endif
+		History[0] = 0;
+	}
+
 	// Set custom error handler (executed with HandleError() call)
 	inline void SetErrorHandler(ErrorHandlerType Handler)
 	{
