@@ -5121,6 +5121,50 @@ static bool FindSCCTBonePalettes(FArchive &Ar, int Start, int Stop, int WedgeCou
 	unguard;
 }
 
+static bool IsSCCTBoneNameLike(const TArray<FMeshBone> &Bones, int BoneIndex, const char *Part)
+{
+	if (!Bones.IsValidIndex(BoneIndex))
+		return false;
+	return appStristr(*Bones[BoneIndex].Name, Part) != NULL;
+}
+
+static int FindSCCTBoneByName(const TArray<FMeshBone> &Bones, const char *Name)
+{
+	for (int BoneIndex = 0; BoneIndex < Bones.Num(); BoneIndex++)
+		if (!stricmp(*Bones[BoneIndex].Name, Name))
+			return BoneIndex;
+	return -1;
+}
+
+static void FixSCCTLeadingBonePaletteEntry(TArray<FSCCTBonePalette> &Palettes, const TArray<FMeshBone> &Bones, const char *MeshName)
+{
+	guard(FixSCCTLeadingBonePaletteEntry);
+	if (stricmp(MeshName, "COOP_Player") && stricmp(MeshName, "NPCA"))
+		return;
+	int Spine2Bone = FindSCCTBoneByName(Bones, "B Spine2");
+	if (Spine2Bone < 0)
+		return;
+	for (int PaletteIndex = 0; PaletteIndex < Palettes.Num(); PaletteIndex++)
+	{
+		FSCCTBonePalette &P = Palettes[PaletteIndex];
+		if (P.Map[0] == 0xFF || P.Map[1] == 0xFF)
+			continue;
+		if (!IsSCCTBoneNameLike(Bones, P.Map[0], "Finger"))
+			continue;
+		if (!IsSCCTBoneNameLike(Bones, P.Map[1], "Spine") &&
+			!IsSCCTBoneNameLike(Bones, P.Map[1], "Clavicle"))
+		{
+			continue;
+		}
+
+		P.Map[0] = Spine2Bone;
+		if (getenv("SCCT_DEBUG_PALETTE"))
+			appPrintf("SCCT fixed leading bone palette %s wedges=%d-%d\n",
+				MeshName, P.FirstWedge, P.LastWedge);
+	}
+	unguard;
+}
+
 static const FSCCTBonePalette* FindSCCTPaletteForWedge(const TArray<FSCCTBonePalette> &Palettes, int WedgeIndex)
 {
 	for (int i = 0; i < Palettes.Num(); i++)
@@ -5724,6 +5768,7 @@ void USkeletalMesh::SerializeSCell(FArchive &Ar)
 			TArray<FVector> WedgePoints;
 			TArray<FSCCTBonePalette> BonePalettes;
 			FindSCCTBonePalettes(Ar, ScanStart, Ar.GetStopper(), Wedges.Num(), MeshBones.Num(), BonePalettes);
+			FixSCCTLeadingBonePaletteEntry(BonePalettes, MeshBones, Name);
 			if (!FindSCCTWedgeInfluences(Ar, ScanStart, Ar.GetStopper(), Points, Wedges, MeshBones.Num(), BonePalettes, VertInfluences, WedgePoints) || !VertInfluences.Num())
 			{
 				appPrintf("WARNING: Unable to locate SCCT skeletal mesh influence data for %s, using serialized influences\n", Name);
