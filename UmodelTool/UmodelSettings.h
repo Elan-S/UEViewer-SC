@@ -14,6 +14,8 @@ struct CStartupSettings
 	bool			UseSkeletalMesh;
 	bool			UseAnimation;
 	bool			UseStaticMesh;
+	bool			UseSpeedTree;
+	bool			UseFracturedStaticMesh;
 	bool			UseVertMesh;
 	bool			UseTexture;
 	bool			UseMorphTarget;
@@ -32,6 +34,8 @@ struct CStartupSettings
 		PROP_BOOL(UseSkeletalMesh)
 		PROP_BOOL(UseAnimation)
 		PROP_BOOL(UseStaticMesh)
+		PROP_BOOL(UseSpeedTree)
+		PROP_BOOL(UseFracturedStaticMesh)
 		PROP_BOOL(UseVertMesh)
 		PROP_BOOL(UseTexture)
 		PROP_BOOL(UseMorphTarget)

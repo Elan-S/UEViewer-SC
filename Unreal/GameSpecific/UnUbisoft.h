@@ -14,6 +14,12 @@ bool GetScdaV2ManifestSkeleton(const char *PackageFilename, TArray<FString>& Bon
 	TArray<int>& ParentIndices);
 bool GetScdaV2ManifestAnimationData(const char *PackageFilename, const char *ObjectName,
 	TArray<byte>& Data, int& SourceLogicalOffset);
+bool GetScdaV2ManifestAnimationPayloads(TArray<FString>& PackageFilenames,
+	TArray<int>& ExportIndices, const char* MeshPackageFilename);
+bool AreScdaV2LevelPackagesRelated(const char* MeshPackageFilename, const char* AnimationPackageFilename);
+bool ResolveScdaV2ManifestImport(const char* ImporterFilename, const char* PackageName, FString& Filename);
+bool ResolveScdaV2ManifestMaterial(const char* ImporterFilename, const char* PackageName,
+	const char* ObjectName, const char* ClassName, FString& Filename, int& ExportIndex);
 
 #endif // SPLINTER_CELL
 

@@ -100,6 +100,8 @@ void CStartupSettings::Reset()
 	UseSkeletalMesh = true;
 	UseAnimation = true;
 	UseStaticMesh = true;
+	UseSpeedTree = true;
+	UseFracturedStaticMesh = true;
 	UseVertMesh = true;
 	UseTexture = true;
 	UseMorphTarget = true;

@@ -545,6 +545,64 @@ public:
 
 class UAnimSet;
 
+struct FBoneAtomScript
+{
+	DECLARE_STRUCT(FBoneAtomScript);
+	float Qx, Qy, Qz, Qw;
+	float Tx, Ty, Tz, S;
+
+	FBoneAtomScript() : Qx(0), Qy(0), Qz(0), Qw(0), Tx(0), Ty(0), Tz(0), S(0) {}
+
+	BEGIN_PROP_TABLE
+		PROP_FLOAT(Qx)
+		PROP_FLOAT(Qy)
+		PROP_FLOAT(Qz)
+		PROP_FLOAT(Qw)
+		PROP_FLOAT(Tx)
+		PROP_FLOAT(Ty)
+		PROP_FLOAT(Tz)
+		PROP_FLOAT(S)
+	END_PROP_TABLE
+};
+
+// Army of Two serializes this as tagged properties, not a native binary header.
+struct FAO2CompressedAnimationInfo
+{
+	DECLARE_STRUCT(FAO2CompressedAnimationInfo);
+	int Version;
+	int NumTracks;
+	TArray<int> EncodedDofDataIndices;
+	TArray<float> StaticDofs;
+	int NumDynamicDofs;
+	int FramesPerBlock;
+	int NumBlocks;
+	int BlockType;
+	TArray<byte> DynamicDofCompressedDatumTypes;
+	TArray<byte> Blocks;
+	FBoneAtomScript TrackZeroStart;
+	FBoneAtomScript TrackZeroEndNonLooping;
+
+	FAO2CompressedAnimationInfo()
+	: Version(0), NumTracks(0), NumDynamicDofs(0), FramesPerBlock(0), NumBlocks(0), BlockType(0) {}
+
+	BEGIN_PROP_TABLE
+		PROP_INT(Version)
+		PROP_INT(NumTracks)
+		PROP_ARRAY(EncodedDofDataIndices, PropType::Int)
+		PROP_ARRAY(StaticDofs, PropType::Float)
+		PROP_INT(NumDynamicDofs)
+		PROP_INT(FramesPerBlock)
+		PROP_INT(NumBlocks)
+		PROP_INT(BlockType)
+		PROP_ARRAY(DynamicDofCompressedDatumTypes, PropType::Byte)
+		PROP_ARRAY(Blocks, PropType::Byte)
+		PROP_STRUC(TrackZeroStart, FBoneAtomScript)
+		PROP_STRUC(TrackZeroEndNonLooping, FBoneAtomScript)
+		PROP_DROP(TrackZeroEndLooping)
+		PROP_DROP(TrackZeroEndLoopingRlfi)
+	END_PROP_TABLE
+};
+
 class UAnimSequence : public UObject
 {
 	DECLARE_CLASS(UAnimSequence, UObject);
@@ -564,10 +622,7 @@ public:
 	TArray<int32>			CompressedTrackOffsets;
 	TArray<uint8>			CompressedByteStream;
 	byte					AnimationCompressor;
-	TArray<int32>			AO2CompressionHeader;
-	TArray<int32>			AO2CompressedTrackInfo;
-	TArray<uint8>			AO2CompressionExtraData;
-	TArray<uint8>			AO2CompressedAnimData;
+	FAO2CompressedAnimationInfo AO2CompressionInfo;
 	bool					bIsAdditive;
 	FName					AdditiveRefName;
 #if R6VEGAS
@@ -657,7 +712,7 @@ public:
 		PROP_ARRAY(TrackOffsets, PropType::Int)
 #endif
 		// unsupported
-		PROP_DROP(AO2CompressionInfo)
+		PROP_STRUC(AO2CompressionInfo, FAO2CompressedAnimationInfo)
 		PROP_DROP(CompressionScheme)
 		PROP_DROP(bDoNotOverrideCompression)
 		PROP_DROP(CompressCommandletVersion)
@@ -726,7 +781,6 @@ public:
 	END_PROP_TABLE
 
 	virtual void Serialize(FArchive &Ar);
-	void SerializeAO2CompressionInfo(FArchive &Ar, int DataSize);
 #if ARMYOF2
 	bool DecodeAO2Anims(CAnimSequence *Dst, UAnimSet *Owner) const;
 #endif
@@ -912,6 +966,36 @@ protected:
 	void ConvertMesh();
 };
 
+class USpeedTree : public UObject
+{
+	DECLARE_CLASS(USpeedTree, UObject);
+public:
+	int						RandomSeed;
+	UObject					*BranchMaterial;
+	UObject					*FrondMaterial;
+	UObject					*LeafMaterial;
+	UObject					*BillboardMaterial;
+	TArray<byte>			SpeedTreeData;
+	CStaticMesh				*ConvertedMesh;
+
+	BEGIN_PROP_TABLE
+		PROP_INT(RandomSeed)
+		PROP_OBJ(BranchMaterial)
+		PROP_OBJ(FrondMaterial)
+		PROP_OBJ(LeafMaterial)
+		PROP_OBJ(BillboardMaterial)
+	END_PROP_TABLE
+
+	USpeedTree();
+	virtual ~USpeedTree();
+
+	virtual void Serialize(FArchive &Ar);
+	virtual void GetMetadata(FArchive& Ar) const;
+
+protected:
+	void ConvertMesh();
+};
+
 class UStaticMeshComponent3 : public UObject
 {
 	DECLARE_CLASS(UStaticMeshComponent3, UObject);
@@ -960,6 +1044,8 @@ public:
 	REGISTER_CLASS(UMorphTarget) \
 	REGISTER_CLASS(UMorphTargetSet) \
 	REGISTER_CLASS(FRawAnimSequenceTrack) \
+	REGISTER_CLASS(FAO2CompressedAnimationInfo) \
+	REGISTER_CLASS(FBoneAtomScript) \
 	REGISTER_CLASS(FAnimNotifyEvent3) \
 	REGISTER_CLASS(UAnimSequence)	\
 	REGISTER_CLASS(UAnimSet)		\
@@ -972,6 +1058,7 @@ public:
 	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, InstancedStaticMeshComponent) \
 	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, UFracturedStaticMeshComponent) \
 	REGISTER_CLASS_ALIAS(UStaticMeshComponent3, FracturedStaticMeshComponent) \
+	REGISTER_CLASS(USpeedTree) \
 	REGISTER_CLASS_ALIAS(UStaticMesh3, UStaticMesh) \
 	REGISTER_CLASS_ALIAS(UStaticMesh3, UFracturedStaticMesh)
 

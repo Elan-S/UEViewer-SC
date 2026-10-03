@@ -440,10 +440,250 @@ static bool ReadSCConvSiblingLeadTexture(UTexture &Tex, FArchive &Ar)
 }
 #endif // LEAD
 
+static bool IsArchiveRangeZero(FArchive& Ar, int Start, int Stop);
+
 void UUnreal3Material::Serialize(FArchive &Ar)
 {
 	guard(UUnreal3Material::Serialize);
 #if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 130 && Ar.ArLicenseeVer <= 167)
+	{
+		if (getenv("SCDA_DUMP_MATERIAL_RAW"))
+		{
+			int SavePos = Ar.Tell();
+			int Size = Ar.GetStopper() - SavePos;
+			char Filename[256];
+			appSprintf(ARRAY_ARG(Filename), "scda_material_%s_raw.bin", Name);
+			FILE* F = fopen(Filename, "wb");
+			if (F)
+			{
+				TArray<byte> Raw;
+				Raw.AddUninitialized(Size);
+				Ar.Serialize(Raw.GetData(), Size);
+				fwrite(Raw.GetData(), 1, Size, F);
+				fclose(F);
+				appPrintf("SCDA dumped raw material export: %s size=%d\n", Filename, Size);
+				Ar.Seek(SavePos);
+			}
+		}
+
+		auto ResolveTextureRef = [this](int ObjectRef) -> UTexture*
+		{
+			if (!Package || ObjectRef == 0)
+				return NULL;
+			UObject *Value = NULL;
+			if (ObjectRef < 0 && unsigned(-ObjectRef - 1) < Package->Summary.ImportCount)
+			{
+				const FObjectImport& Imp = Package->GetImport(-ObjectRef - 1);
+				if (strnicmp(*Imp.ClassName, "Texture", 7) && stricmp(*Imp.ClassName, "ProceduralTexture"))
+					return NULL;
+				Value = Package->CreateImport(-ObjectRef - 1);
+			}
+			else if (ObjectRef > 0 && unsigned(ObjectRef - 1) < Package->Summary.ExportCount)
+			{
+				const FObjectExport& Exp = Package->GetExport(ObjectRef - 1);
+				const char *ClassName = Package->GetClassNameFor(Exp);
+				if (strnicmp(ClassName, "Texture", 7) && stricmp(ClassName, "ProceduralTexture"))
+					return NULL;
+				Value = Package->CreateExport(ObjectRef - 1);
+			}
+			if (Value && Value->IsA("Texture"))
+				return static_cast<UTexture*>(Value);
+			return NULL;
+		};
+
+		auto ReadCompactAt = [&Ar](int Pos, int Stop, int& Value) -> int
+		{
+			if (Pos >= Stop)
+				return 0;
+			int Save = Ar.Tell();
+			Ar.Seek(Pos);
+			byte B0;
+			Ar << B0;
+			int Sign = B0 & 0x80;
+			Value = B0 & 0x3F;
+			int Shift = 6;
+			if (B0 & 0x40)
+			{
+				for (int i = 0; i < 4; i++)
+				{
+					if (Ar.Tell() >= Stop)
+					{
+						Ar.Seek(Save);
+						return 0;
+					}
+					byte B;
+					Ar << B;
+					Value |= (B & 0x7F) << Shift;
+					Shift += 7;
+					if (!(B & 0x80))
+						break;
+				}
+			}
+			if (Sign)
+				Value = -Value;
+			const int End = Ar.Tell();
+			Ar.Seek(Save);
+			return End - Pos;
+		};
+
+		auto FindTextureInPayload = [&Ar, &ResolveTextureRef, &ReadCompactAt](int Start, int Stop) -> UTexture*
+		{
+			for (int Pos = Start; Pos < Stop; Pos++)
+			{
+				int Ref = 0;
+				const int Size = ReadCompactAt(Pos, Stop, Ref);
+				if (!Size)
+					continue;
+				UTexture *Tex = ResolveTextureRef(Ref);
+				if (Tex)
+					return Tex;
+			}
+			return NULL;
+		};
+
+		while (Ar.Tell() < Ar.GetStopper())
+		{
+			int NameIndex;
+			const int NamePos = Ar.Tell();
+			const int NameLen = ReadCompactAt(NamePos, Ar.GetStopper(), NameIndex);
+			if (!NameLen)
+				break;
+			Ar.Seek(NamePos + NameLen);
+			if (!Package || NameIndex < 0 || unsigned(NameIndex) >= Package->Summary.NameCount)
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+			const char *PropertyName = Package->GetName(NameIndex);
+			if (!stricmp(PropertyName, "None"))
+				break;
+
+			if (Ar.Tell() >= Ar.GetStopper())
+				break;
+			byte Info;
+			Ar << Info;
+			const int Type = Info & 0xF;
+			const bool IsArray = (Info & 0x80) != 0;
+			if (Type == 10)
+			{
+				int StructName;
+				const int StructPos = Ar.Tell();
+				const int StructLen = ReadCompactAt(StructPos, Ar.GetStopper(), StructName);
+				if (!StructLen)
+					break;
+				Ar.Seek(StructPos + StructLen);
+			}
+
+			int DataSize = 0;
+			bool bStopParsing = false;
+			switch ((Info >> 4) & 7)
+			{
+			case 0: DataSize = 1; break;
+			case 1: DataSize = 2; break;
+			case 2: DataSize = 4; break;
+			case 3: DataSize = 12; break;
+			case 4: DataSize = 16; break;
+			case 5:
+				if (Ar.Tell() + (int)sizeof(byte) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				{ byte Size; Ar << Size; DataSize = Size; }
+				break;
+			case 6:
+				if (Ar.Tell() + (int)sizeof(uint16) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				{ uint16 Size; Ar << Size; DataSize = Size; }
+				break;
+			case 7:
+				if (Ar.Tell() + (int)sizeof(int) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				Ar << DataSize;
+				break;
+			}
+			if (bStopParsing)
+				break;
+			if (Type != 3 && IsArray)
+			{
+				if (Ar.Tell() >= Ar.GetStopper())
+					break;
+				byte Index;
+				Ar << Index;
+				if (Index >= 128)
+				{
+					if (Ar.Tell() >= Ar.GetStopper())
+						break;
+					byte Extra;
+					Ar << Extra;
+					if (Index & 0x40)
+					{
+						if (Ar.Tell() + 2 > Ar.GetStopper())
+							break;
+						Ar << Extra;
+						Ar << Extra;
+					}
+				}
+			}
+			if (DataSize < 0 || Ar.Tell() > Ar.GetStopper() - DataSize)
+			{
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+
+			const int ValueStart = Ar.Tell();
+			const int ValueStop = ValueStart + DataSize;
+			if (Type == 5)
+			{
+				int ObjectRef;
+				const int RefLen = ReadCompactAt(ValueStart, ValueStop, ObjectRef);
+				if (!RefLen)
+				{
+					Ar.Seek(ValueStop);
+					continue;
+				}
+				UTexture *Tex = ResolveTextureRef(ObjectRef);
+				if (Tex)
+				{
+					for (int i = 0; i < ARRAY_COUNT(Textures); i++)
+					{
+						char SlotName[16];
+						appSprintf(ARRAY_ARG(SlotName), "Texture%d", i);
+						if (!stricmp(PropertyName, SlotName))
+						{
+							Textures[i] = Tex;
+							break;
+						}
+					}
+				}
+			}
+			else if (Type == 10)
+			{
+				UTexture *Tex = FindTextureInPayload(ValueStart, ValueStop);
+				if (Tex)
+				{
+					if (!stricmp(PropertyName, "Texture"))
+						Texture.TwoDTexture = Tex;
+					else if (!stricmp(PropertyName, "_MainMap"))
+						_MainMap.TwoDTexture = Tex;
+					else if (!stricmp(PropertyName, "Mask"))
+						Mask.TwoDTexture = Tex;
+					else if (!stricmp(PropertyName, "Texture2"))
+						Texture2Input.TwoDTexture = Tex;
+				}
+			}
+			Ar.Seek(ValueStop);
+		}
+		DROP_REMAINING_DATA(Ar);
+		return;
+	}
 	if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArLicenseeVer == 0)
 	{
 		if (getenv("SCDA_DUMP_MATERIAL_RAW"))
@@ -484,12 +724,56 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 {
 	guard(USCX_basic_material::Serialize);
 #if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell && IsArchiveRangeZero(Ar, Ar.Tell(), Ar.GetStopper()))
+	{
+		DROP_REMAINING_DATA(Ar);
+		return;
+	}
 	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
 	{
+		auto ReadCompactAt = [&Ar](int Pos, int Stop, int& Value) -> int
+		{
+			if (Pos >= Stop)
+				return 0;
+			int Save = Ar.Tell();
+			Ar.Seek(Pos);
+			byte B0;
+			Ar << B0;
+			int Sign = B0 & 0x80;
+			Value = B0 & 0x3F;
+			int Shift = 6;
+			if (B0 & 0x40)
+			{
+				for (int i = 0; i < 4; i++)
+				{
+					if (Ar.Tell() >= Stop)
+					{
+						Ar.Seek(Save);
+						return 0;
+					}
+					byte B;
+					Ar << B;
+					Value |= (B & 0x7F) << Shift;
+					Shift += 7;
+					if (!(B & 0x80))
+						break;
+				}
+			}
+			if (Sign)
+				Value = -Value;
+			const int End = Ar.Tell();
+			Ar.Seek(Save);
+			return End - Pos;
+		};
+
 		while (Ar.Tell() < Ar.GetStopper())
 		{
 			int NameIndex;
-			Ar << AR_INDEX(NameIndex);
+			const int NamePos = Ar.Tell();
+			const int NameLen = ReadCompactAt(NamePos, Ar.GetStopper(), NameIndex);
+			if (!NameLen)
+				break;
+			Ar.Seek(NamePos + NameLen);
 			if (!Package || NameIndex < 0 || unsigned(NameIndex) >= Package->Summary.NameCount)
 			{
 				DROP_REMAINING_DATA(Ar);
@@ -499,6 +783,8 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 			if (!stricmp(PropertyName, "None"))
 				break;
 
+			if (Ar.Tell() >= Ar.GetStopper())
+				break;
 			byte Info;
 			Ar << Info;
 			const int Type = Info & 0xF;
@@ -506,10 +792,15 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 			if (Type == 10)
 			{
 				int StructName;
-				Ar << AR_INDEX(StructName);
+				const int StructPos = Ar.Tell();
+				const int StructLen = ReadCompactAt(StructPos, Ar.GetStopper(), StructName);
+				if (!StructLen)
+					break;
+				Ar.Seek(StructPos + StructLen);
 			}
 
 			int DataSize = 0;
+			bool bStopParsing = false;
 			switch ((Info >> 4) & 7)
 			{
 			case 0: DataSize = 1; break;
@@ -517,20 +808,49 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 			case 2: DataSize = 4; break;
 			case 3: DataSize = 12; break;
 			case 4: DataSize = 16; break;
-			case 5: { byte Size; Ar << Size; DataSize = Size; break; }
-			case 6: { uint16 Size; Ar << Size; DataSize = Size; break; }
-			case 7: Ar << DataSize; break;
+			case 5:
+				if (Ar.Tell() + (int)sizeof(byte) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				{ byte Size; Ar << Size; DataSize = Size; }
+				break;
+			case 6:
+				if (Ar.Tell() + (int)sizeof(uint16) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				{ uint16 Size; Ar << Size; DataSize = Size; }
+				break;
+			case 7:
+				if (Ar.Tell() + (int)sizeof(int) > Ar.GetStopper())
+				{
+					bStopParsing = true;
+					break;
+				}
+				Ar << DataSize;
+				break;
 			}
+			if (bStopParsing)
+				break;
 			if (Type != 3 && IsArray)
 			{
+				if (Ar.Tell() >= Ar.GetStopper())
+					break;
 				byte Index;
 				Ar << Index;
 				if (Index >= 128)
 				{
+					if (Ar.Tell() >= Ar.GetStopper())
+						break;
 					byte Extra;
 					Ar << Extra;
 					if (Index & 0x40)
 					{
+						if (Ar.Tell() + 2 > Ar.GetStopper())
+							break;
 						Ar << Extra;
 						Ar << Extra;
 					}
@@ -543,10 +863,16 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 			}
 
 			const int ValueStart = Ar.Tell();
+			const int ValueStop = ValueStart + DataSize;
 			if (Type == 5)
 			{
 				int ObjectRef;
-				Ar << AR_INDEX(ObjectRef);
+				const int RefLen = ReadCompactAt(ValueStart, ValueStop, ObjectRef);
+				if (!RefLen)
+				{
+					Ar.Seek(ValueStop);
+					continue;
+				}
 				const bool UseValue =
 					!stricmp(PropertyName, "Base") ||
 					!stricmp(PropertyName, "Normal") ||
@@ -585,7 +911,7 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 					bFlipU = true;
 				}
 			}
-			Ar.Seek(ValueStart + DataSize);
+			Ar.Seek(ValueStop);
 		}
 		DROP_REMAINING_DATA(Ar);
 		return;
@@ -593,13 +919,176 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 #endif
 	Super::Serialize(Ar);
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
+	if (Ar.Game == GAME_SplinterCell)
 		DROP_REMAINING_DATA(Ar);
 #endif
 #if LEAD
 	if (Ar.Game == GAME_SplinterCellConv)
 		DROP_REMAINING_DATA(Ar);
 #endif
+	unguard;
+}
+
+static int GetSCDACompactIndexLength(FArchive& Ar, int Pos, int Stop, int& Value)
+{
+	if (Pos >= Stop)
+		return 0;
+	int SavePos = Ar.Tell();
+	Ar.Seek(Pos);
+	byte B0;
+	Ar << B0;
+	const bool Negative = (B0 & 0x80) != 0;
+	Value = B0 & 0x3F;
+	int Shift = 6;
+	if (B0 & 0x40)
+	{
+		for (int i = 0; i < 4; i++)
+		{
+			if (Ar.Tell() >= Stop)
+			{
+				Ar.Seek(SavePos);
+				return 0;
+			}
+			byte B;
+			Ar << B;
+			Value |= (B & 0x7F) << Shift;
+			Shift += 7;
+			if (!(B & 0x80))
+				break;
+		}
+	}
+	if (Negative)
+		Value = -Value;
+	const int EndPos = Ar.Tell();
+	Ar.Seek(SavePos);
+	return EndPos - Pos;
+}
+
+static int GetTextureBitsForSize(int Size)
+{
+	int Bits = 0;
+	for (int Value = Size; Value > 1; Value >>= 1)
+		Bits++;
+	return Bits;
+}
+
+static bool IsReasonableSCDATextureSize(int USize, int VSize)
+{
+	return USize > 0 && VSize > 0 && USize <= 8192 && VSize <= 8192 &&
+		(USize & (USize - 1)) == 0 && (VSize & (VSize - 1)) == 0;
+}
+
+static bool ReadSCDAPcV1FullTextureMipChain(UTexture& Tex, FArchive& Ar, int Start, int Stop)
+{
+	guard(ReadSCDAPcV1FullTextureMipChain);
+	if (Start < 0 || Start + 16 >= Stop)
+		return false;
+
+	int SavePos = Ar.Tell();
+	Ar.Seek(Start);
+	byte ChainMarker, ChainFormat;
+	Ar << ChainMarker << ChainFormat;
+	if (ChainMarker != 1 || ChainFormat == 0 || ChainFormat > 8)
+	{
+		Ar.Seek(SavePos);
+		return false;
+	}
+
+	TArray<FMipmap> NewMips;
+	int Pos = Ar.Tell();
+	int PreviousUSize = 0;
+	int PreviousVSize = 0;
+	while (Pos + 16 < Stop)
+	{
+		Ar.Seek(Pos);
+		int SkipPos;
+		Ar << SkipPos;
+		const int DataCountPos = Ar.Tell();
+		int DataSize;
+		const int CountLen = GetSCDACompactIndexLength(Ar, DataCountPos, Stop, DataSize);
+		if (!CountLen || DataSize <= 0)
+			break;
+
+		const int DataStart = DataCountPos + CountLen;
+		const int FooterPos = DataStart + DataSize;
+		const int NextPos = FooterPos + 10;
+		if (SkipPos != FooterPos || FooterPos + 10 > Stop)
+			break;
+
+		Ar.Seek(FooterPos);
+		int MipUSize, MipVSize;
+		byte MipUBits, MipVBits;
+		Ar << MipUSize << MipVSize << MipUBits << MipVBits;
+		if (!IsReasonableSCDATextureSize(MipUSize, MipVSize))
+			break;
+		if (PreviousUSize && (MipUSize > PreviousUSize || MipVSize > PreviousVSize))
+			break;
+
+		FMipmap* Mip = new (NewMips) FMipmap;
+		Mip->USize = MipUSize;
+		Mip->VSize = MipVSize;
+		Mip->UBits = MipUBits ? MipUBits : GetTextureBitsForSize(MipUSize);
+		Mip->VBits = MipVBits ? MipVBits : GetTextureBitsForSize(MipVSize);
+		Mip->DataArray.Empty(DataSize);
+		Mip->DataArray.AddUninitialized(DataSize);
+		Ar.Seek(DataStart);
+		Ar.Serialize(Mip->DataArray.GetData(), DataSize);
+
+		PreviousUSize = MipUSize;
+		PreviousVSize = MipVSize;
+		Pos = NextPos;
+	}
+
+	Ar.Seek(SavePos);
+	if (!NewMips.Num())
+		return false;
+
+	Tex.Mips.Empty(NewMips.Num());
+	for (int i = 0; i < NewMips.Num(); i++)
+	{
+		FMipmap* Mip = new (Tex.Mips) FMipmap;
+		Mip->USize = NewMips[i].USize;
+		Mip->VSize = NewMips[i].VSize;
+		Mip->UBits = NewMips[i].UBits;
+		Mip->VBits = NewMips[i].VBits;
+		Mip->DataArray.RawCopy(NewMips[i].DataArray, sizeof(byte));
+	}
+	Tex.USize = Tex.Mips[0].USize;
+	Tex.VSize = Tex.Mips[0].VSize;
+	Tex.UBits = Tex.Mips[0].UBits;
+	Tex.VBits = Tex.Mips[0].VBits;
+
+	if (getenv("SCDA_LIN_DEBUG"))
+		appPrintf("SCDA PC v1 full texture chain: %s mips=%d top=%dx%d fmt=%d start=%X end=%X\n",
+			Tex.Name, Tex.Mips.Num(), Tex.USize, Tex.VSize, Tex.Format, Start, Pos);
+	return true;
+	unguard;
+}
+
+static bool IsArchiveRangeZero(FArchive& Ar, int Start, int Stop)
+{
+	guard(IsArchiveRangeZero);
+	if (Start < 0 || Stop <= Start)
+		return false;
+	int SavePos = Ar.Tell();
+	byte Buffer[4096];
+	for (int Pos = Start; Pos < Stop; )
+	{
+		const int Count = min((int)sizeof(Buffer), Stop - Pos);
+		Ar.Seek(Pos);
+		Ar.Serialize(Buffer, Count);
+		for (int i = 0; i < Count; i++)
+		{
+			if (Buffer[i])
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+		}
+		Pos += Count;
+	}
+	Ar.Seek(SavePos);
+	return true;
 	unguard;
 }
 
@@ -610,6 +1099,14 @@ void USCX_basic_material::Serialize(FArchive &Ar)
 void UTexture::Serialize(FArchive &Ar)
 {
 	guard(UTexture::Serialize);
+#if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell && IsArchiveRangeZero(Ar, Ar.Tell(), Ar.GetStopper()))
+	{
+		Mips.Empty();
+		DROP_REMAINING_DATA(Ar);
+		return;
+	}
+#endif
 	Super::Serialize(Ar);
 #if SPLINTER_CELL
 	if (Ar.Game == GAME_SplinterCell && Ar.ArVer >= 173 && Ar.ArLicenseeVer == 0 && Ar.Tell() >= Ar.GetStopper())
@@ -669,8 +1166,58 @@ void UTexture::Serialize(FArchive &Ar)
 		Ar << unk;
 	}
 #endif // AA2
+#if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 130 && Ar.ArLicenseeVer <= 167)
+	{
+		int SavePos = Ar.Tell();
+		if (ReadSCDAPcV1FullTextureMipChain(*this, Ar, SavePos, Ar.GetStopper()) ||
+			ReadSCDAPcV1FullTextureMipChain(*this, Ar, SavePos - 1, Ar.GetStopper()))
+		{
+			DROP_REMAINING_DATA(Ar);
+			return;
+		}
+		int Count;
+		Ar << AR_INDEX(Count);
+		Ar.Seek(SavePos);
+		if (Count != 1)
+		{
+			Mips.Empty();
+			DROP_REMAINING_DATA(Ar);
+			return;
+		}
+		if (USize <= 0 || VSize <= 0)
+		{
+			Mips.Empty();
+			DROP_REMAINING_DATA(Ar);
+			return;
+		}
+	}
+#endif
 	Ar << Mips;
 #if SPLINTER_CELL
+	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 130 && Ar.ArLicenseeVer <= 167)
+	{
+		for (int i = 0; i < Mips.Num(); i++)
+		{
+			FMipmap& Mip = Mips[i];
+			if (Mip.DataArray.Num() == 0)
+				continue;
+
+			const int MipUSize = max(USize >> i, 1);
+			const int MipVSize = max(VSize >> i, 1);
+			if (Mip.USize <= 0 || Mip.VSize <= 0 || Mip.UBits == 0 || Mip.VBits == 0)
+			{
+				Mip.USize = MipUSize;
+				Mip.VSize = MipVSize;
+				Mip.UBits = 0;
+				for (int Size = Mip.USize; Size > 1; Size >>= 1)
+					Mip.UBits++;
+				Mip.VBits = 0;
+				for (int Size = Mip.VSize; Size > 1; Size >>= 1)
+					Mip.VBits++;
+			}
+		}
+	}
 	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124 && Mips.Num() == 0)
 	{
 		int StreamUSize, StreamVSize, StreamFormatCode;
@@ -685,7 +1232,7 @@ void UTexture::Serialize(FArchive &Ar)
 			VBits = 0;
 			for (int Size = VSize; Size > 1; Size >>= 1)
 				VBits++;
-			if (StreamFormatCode >= 1 && StreamFormatCode <= 8)
+			if (StreamFormatCode >= 1 && StreamFormatCode <= 13)
 				Format = TEXF_DXT1;
 		}
 	}
@@ -734,7 +1281,7 @@ void UTexture::Serialize(FArchive &Ar)
 	}
 #endif // EXTEEL
 #if SPLINTER_CELL
-	if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 123 && Ar.ArLicenseeVer != 124)
+	if (Ar.Game == GAME_SplinterCell)
 		DROP_REMAINING_DATA(Ar);
 #endif
 	unguard;
@@ -1207,33 +1754,37 @@ bool UTexture::GetTextureData(CTextureData &TexData) const
 			Package ? *Package->GetFilename() : NULL) &&
 			StreamUSize > 0 && StreamVSize > 0)
 		{
-			ETexturePixelFormat StreamFormat = TPF_UNKNOWN;
+			// The manifest count describes this resource's mip prefix, not a
+			// pixel-format enum. GPU resources can contain only the top two
+			// levels; requiring a complete chain discarded those resources.
+			ETexturePixelFormat StreamFormat = TPF_DXT1;
 			int ExpectedSize = 0;
 			bool SizeMatched = false;
-			if (FormatCode == 1)
+			int StreamMipCount = max(1, FormatCode);
+			while (StreamUSize > 0 && StreamVSize > 0)
 			{
-				StreamFormat = TPF_DXT1;
-				ExpectedSize = GetScdaDxt1MipSize(StreamUSize, StreamVSize);
-				SizeMatched = ExpectedSize == StreamData.Num();
+			    int U = StreamUSize, V = StreamVSize;
+			    ExpectedSize = 0;
+			    for (int Mip = 0; Mip < StreamMipCount; Mip++)
+			    {
+			        ExpectedSize += GetScdaDxt1MipSize(U, V);
+			        U = max(1, U >> 1);
+			        V = max(1, V >> 1);
+			    }
+			    if (ExpectedSize == StreamData.Num() || Align(ExpectedSize, 0x200) == StreamData.Num())
+			    {
+			        SizeMatched = true;
+			        break;
+			    }
+			    if (StreamUSize <= 1 && StreamVSize <= 1) break;
+			    StreamUSize = max(1, StreamUSize >> 1);
+			    StreamVSize = max(1, StreamVSize >> 1);
 			}
-			else if (FormatCode >= 2 && FormatCode <= 8) // mipmapped DXT1 resource; BIN stores an aligned mip tail
-			{
-				StreamFormat = TPF_DXT1;
-				while (true)
-				{
-					int ChainSize = GetScdaDxt1ChainSize(StreamUSize, StreamVSize);
-					if (Align(ChainSize, 0x200) == StreamData.Num())
-					{
-						SizeMatched = true;
-						break;
-					}
-					if (StreamUSize <= 1 && StreamVSize <= 1)
-						break;
-					StreamUSize = max(1, StreamUSize >> 1);
-					StreamVSize = max(1, StreamVSize >> 1);
-				}
-				ExpectedSize = GetScdaDxt1ChainSize(StreamUSize, StreamVSize);
-			}
+			// Keep a resident source when it has a larger available top mip.
+			for (int Mip = 0; Mip < Mips.Num(); Mip++)
+			    if (Mips[Mip].DataArray.Num() &&
+			        int64(Mips[Mip].USize) * Mips[Mip].VSize > int64(StreamUSize) * StreamVSize)
+			        SizeMatched = false;
 
 			if (StreamFormat != TPF_UNKNOWN && SizeMatched && ExpectedSize > 0 && ExpectedSize <= StreamData.Num())
 			{
@@ -1251,7 +1802,7 @@ bool UTexture::GetTextureData(CTextureData &TexData) const
 					DstMip->USize = StreamUSize;
 					DstMip->VSize = StreamVSize;
 					DataOffset += MipSize;
-					if (FormatCode == 1 || (StreamUSize <= 4 && StreamVSize <= 4))
+					if (TexData.Mips.Num() >= StreamMipCount || (StreamUSize <= 4 && StreamVSize <= 4))
 						break;
 					StreamUSize = max(1, StreamUSize >> 1);
 					StreamVSize = max(1, StreamVSize >> 1);

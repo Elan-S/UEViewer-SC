@@ -375,8 +375,47 @@ public:
 	virtual void Serialize(FArchive &Ar)
 	{
 		guard(UPalette::Serialize);
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell)
+		{
+			const int SavePos = Ar.Tell();
+			const int Stop = Ar.GetStopper();
+			bool bAllZero = Stop > SavePos;
+			byte Buffer[4096];
+			for (int Pos = SavePos; bAllZero && Pos < Stop; )
+			{
+				const int Count = min((int)sizeof(Buffer), Stop - Pos);
+				Ar.Seek(Pos);
+				Ar.Serialize(Buffer, Count);
+				for (int i = 0; i < Count; i++)
+				{
+					if (Buffer[i])
+					{
+						bAllZero = false;
+						break;
+					}
+				}
+				Pos += Count;
+			}
+			Ar.Seek(SavePos);
+			if (bAllZero)
+			{
+				Colors.Empty();
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+		}
+#endif // SPLINTER_CELL
 		Super::Serialize(Ar);
 		Ar << Colors;
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Colors.Num() != 256)
+		{
+			Colors.Empty();
+			DROP_REMAINING_DATA(Ar);
+			return;
+		}
+#endif // SPLINTER_CELL
 		assert(Colors.Num() == 256);	// NUM_PAL_COLORS in UT
 		// UE1 uses Palette[0] as color {0,0,0,0} when texture uses PF_Masked flag
 		// (see UOpenGLRenderDevice::SetTexture())
@@ -582,6 +621,17 @@ public:
 	BEGIN_PROP_TABLE
 		PROP_OBJ(Faces)
 	END_PROP_TABLE
+
+	virtual void Serialize(FArchive &Ar)
+	{
+		guard(UCubemap::Serialize);
+		Super::Serialize(Ar);
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell)
+			DROP_REMAINING_DATA(Ar);
+#endif // SPLINTER_CELL
+		unguard;
+	}
 
 #if RENDERING
 	virtual bool Upload();
@@ -1457,6 +1507,7 @@ public:
 	REGISTER_CLASS_ALIAS(UUnreal3Material, EvolvedModernMaterial) \
 	REGISTER_CLASS(USCX_basic_material) \
 	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_glow_material) \
+	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_unlit_material) \
 	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_glass_material) \
 	REGISTER_CLASS_ALIAS(USCX_basic_material, USCX_refractiveglass_material)
 

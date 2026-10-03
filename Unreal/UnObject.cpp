@@ -1073,31 +1073,6 @@ void CTypeInfo::ReadUnrealProperty(FArchive& Ar, FPropertyTag& Tag, void* Object
 	{
 		if (!Prop)
 			appPrintf("%s: unknown %s %s\n", DbgTypeName, Name, *Tag.Name); // notify about the unknown property
-#if ARMYOF2
-		if (Ar.Game == GAME_ArmyOf2 && !strcmp(Name, "UAnimSequence") && !strcmp(*Tag.Name, "AO2CompressionInfo"))
-		{
-			int SavePos = Ar.Tell();
-			static_cast<UAnimSequence*>(ObjectData)->SerializeAO2CompressionInfo(Ar, Tag.DataSize);
-			Ar.Seek(SavePos);
-			if (getenv("AO2_ANIM_DEBUG"))
-			{
-				int DumpSize = min(Tag.DataSize, 0x100);
-				appPrintf("AO2CompressionInfo at %X size=%d struct=%s\n", SavePos, Tag.DataSize, *Tag.StrucName);
-				for (int Pos = 0; Pos < DumpSize; Pos += 16)
-				{
-					byte Data[16];
-					int LineSize = min(16, DumpSize - Pos);
-					Ar.Seek(SavePos + Pos);
-					Ar.Serialize(Data, LineSize);
-					appPrintf("  %04X:", Pos);
-					for (int i = 0; i < LineSize; i++)
-						appPrintf(" %02X", Data[i]);
-					appPrintf("\n");
-				}
-			}
-			Ar.Seek(SavePos);
-		}
-#endif // ARMYOF2
 #if DEBUG_PROPS
 		appPrintf("  (skipping %s)\n", *Tag.Name);
 #endif

@@ -244,7 +244,7 @@ static void ScanPackageExports(UnPackage* package, CGameFileInfo* file)
 
 		if (!stricmp(ObjectClass, "SkeletalMesh") || !stricmp(ObjectClass, "DestructibleMesh"))
 			file->NumSkeletalMeshes++;
-		else if (!stricmp(ObjectClass, "StaticMesh"))
+		else if (!stricmp(ObjectClass, "StaticMesh") || !stricmp(ObjectClass, "SpeedTree"))
 			file->NumStaticMeshes++;
 		else if (!stricmp(ObjectClass, "Animation") || !stricmp(ObjectClass, "MeshAnimation") || !stricmp(ObjectClass, "AnimSequence")) // whole AnimSet count for UE2 and number of sequences for UE3+
 			file->NumAnimations++;

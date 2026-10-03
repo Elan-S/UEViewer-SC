@@ -217,6 +217,12 @@ static void RegisterClasses(int game)
 			UnregisterClass("Skeleton", false);
 	}
 	if (!GSettings.Startup.UseStaticMesh) UnregisterClass("StaticMesh", true);
+	if (!GSettings.Startup.UseSpeedTree) UnregisterClass("SpeedTree", true);
+	if (!GSettings.Startup.UseFracturedStaticMesh)
+	{
+		UnregisterClass("FracturedStaticMesh", true);
+		UnregisterClass("FracturedStaticMeshComponent", true);
+	}
 	if (!GSettings.Startup.UseVertMesh) UnregisterClass("VertMesh", true);
 	if (!GSettings.Startup.UseTexture)
 	{
@@ -272,7 +278,11 @@ static void CallExportSkeletalMesh(const CSkeletalMesh* Mesh)
 
 static void CallExportStaticMesh(const CStaticMesh* Mesh)
 {
-	assert(Mesh);
+	if (!Mesh)
+	{
+		appPrintf("ERROR: static mesh has no converted mesh data\n");
+		return;
+	}
 	switch (GSettings.Export.StaticMeshFormat)
 	{
 	case EExportMeshFormat::psk:
@@ -287,7 +297,11 @@ static void CallExportStaticMesh(const CStaticMesh* Mesh)
 
 static void CallExportAnimation(const CAnimSet* Anim)
 {
-	assert(Anim);
+	if (!Anim)
+	{
+		appPrintf("WARNING: skipping animation export with no converted tracks\n");
+		return;
+	}
 	switch (GSettings.Export.SkeletalMeshFormat)
 	{
 	case EExportMeshFormat::psk:
@@ -314,6 +328,7 @@ static void RegisterExporters()
 	RegisterExporter<USkeletalMesh3>([](const USkeletalMesh3* Mesh) { CallExportSkeletalMesh(Mesh->ConvertedMesh); });
 	RegisterExporter<UAnimSet>([](const UAnimSet* Anim) { CallExportAnimation(Anim->ConvertedAnim); });
 	RegisterExporter<UStaticMesh3>([](const UStaticMesh3* Mesh) { CallExportStaticMesh(Mesh->ConvertedMesh); });
+	RegisterExporter<USpeedTree>([](const USpeedTree* Mesh) { CallExportStaticMesh(Mesh->ConvertedMesh); });
 	RegisterExporter<USoundNodeWave>(ExportSoundNodeWave);
 	RegisterExporter<USwfMovie>(ExportGfx);
 	RegisterExporter<UFaceFXAnimSet>(ExportFaceFXAnimSet);
@@ -421,6 +436,8 @@ static void PrintUsage()
 			"                    unsupported data format\n"
 			"    -noanim         disable loading of MeshAnimation classes\n"
 			"    -nostat         disable loading of StaticMesh class\n"
+			"    -nospeedtree    disable loading of SpeedTree class\n"
+			"    -nofracturedstat disable loading of FracturedStaticMesh class\n"
 			"    -novert         disable loading of VertMesh class\n"
 			"    -notex          disable loading of Material classes\n"
 			"    -nomorph        disable loading of MorphTarget class\n"
@@ -844,6 +861,8 @@ int main(int argc, const char **argv)
 			// disable classes
 			OPT_NBOOL("nomesh",  GSettings.Startup.UseSkeletalMesh)
 			OPT_NBOOL("nostat",  GSettings.Startup.UseStaticMesh)
+			OPT_NBOOL("nospeedtree", GSettings.Startup.UseSpeedTree)
+			OPT_NBOOL("nofracturedstat", GSettings.Startup.UseFracturedStaticMesh)
 			OPT_NBOOL("novert",  GSettings.Startup.UseVertMesh)
 			OPT_NBOOL("noanim",  GSettings.Startup.UseAnimation)
 			OPT_NBOOL("notex",   GSettings.Startup.UseTexture)

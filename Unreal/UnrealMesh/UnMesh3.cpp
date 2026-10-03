@@ -16,6 +16,10 @@
 #include "Mesh/StaticMesh.h"
 #include "TypeConvert.h"
 
+#if USE_SPEEDTREE
+#include "SpeedTreeRT.h"
+#endif
+
 
 //#define DEBUG_SKELMESH		1
 //#define DEBUG_STATICMESH		1
@@ -31,6 +35,30 @@
 #else
 #define DBG_STAT(...)
 #endif
+
+static bool IsGearsUltimateLikeArchive(FArchive& Ar)
+{
+#if GEARSU
+	if (Ar.Game == GAME_GoWU)
+		return true;
+	UnPackage* Package = Ar.CastTo<UnPackage>();
+	return Package && (Package->ArVer == 497 || Package->ArVer == 614) && Package->ArLicenseeVer == 13 &&
+		Package->ImportTableHasPackageName;
+#else
+	return false;
+#endif
+}
+
+static bool IsGearsReduxArchive(FArchive& Ar)
+{
+#if GEARSU
+	UnPackage* Package = Ar.CastTo<UnPackage>();
+	return Package && (Package->ArVer == 497 || Package->ArVer == 614) && Package->ArLicenseeVer == 13 &&
+		Package->ImportTableHasPackageName;
+#else
+	return false;
+#endif
+}
 
 static bool UseUE3ActorStaticMeshMaterials(int Game)
 {
@@ -504,7 +532,7 @@ struct FSkelMeshSection3
 		if (Ar.Game == GAME_BladeNSoul && Ar.ArVer >= 571) goto new_ver;
 #endif
 #if GEARSU
-		if (Ar.Game == GAME_GoWU) return Ar;
+		if (IsGearsUltimateLikeArchive(Ar)) return Ar;
 #endif
 		if (Ar.ArVer >= 599)
 		{
@@ -1122,11 +1150,19 @@ struct FSkeletalMeshVertexBuffer3
 		DBG_SKEL("Reading GPU skin\n");
 
 	#if GEARSU
-		if (Ar.Game == GAME_GoWU)
+		if (IsGearsUltimateLikeArchive(Ar))
 		{
 			int32 NumVerts;
 			int32 Stride; // wrong value: contains 0x44, real vertex size is 0x40 - so can't use BulkSerialize
-			Ar << NumVerts << Stride;
+			if (IsGearsReduxArchive(Ar))
+			{
+				Ar << NumVerts;
+				Stride = 0x28;
+			}
+			else
+			{
+				Ar << NumVerts << Stride;
+			}
 			S.VertsFloat.AddZeroed(NumVerts);
 			// Stride = 0x44 -> real size = 0x40
 			// String = 0x4C -> real size = 0x48
@@ -1887,12 +1923,23 @@ struct FStaticLODModel3
 		if (Ar.Game == GAME_DunDef && Ar.ArLicenseeVer >= 21) goto serialize_uv_set_count;
 #endif
 #if GEARSU
-		if (Ar.Game == GAME_GoWU)
+		if (IsGearsUltimateLikeArchive(Ar))
 		{
-			Lod.NumUVSets = 4;
-			// Value: usually 4, sometimes 8. It is not NumUVSets
-			int32 unk1;
-			Ar << unk1;
+			if (IsGearsReduxArchive(Ar))
+			{
+				int32 VertexSize;
+				Ar << VertexSize;
+				Lod.NumUVSets = (VertexSize - 0x20) / sizeof(FMeshUVFloat);
+				if (Lod.NumUVSets < 1 || Lod.NumUVSets > NUM_UV_SETS_UE3)
+					appError("GearsRedux: unexpected vertex size %d", VertexSize);
+			}
+			else
+			{
+				Lod.NumUVSets = 4;
+				// Value: usually 4, sometimes 8. It is not NumUVSets
+				int32 unk1;
+				Ar << unk1;
+			}
 			GNumGPUUVSets = Lod.NumUVSets;
 			Ar << Lod.GPUSkin;
 			TArray<FVector> unk2; // int ( value, 0, index )
@@ -2728,12 +2775,41 @@ UStaticMesh3::~UStaticMesh3()
 	delete ConvertedMesh;
 }
 
+USpeedTree::USpeedTree()
+:	RandomSeed(1)
+,	BranchMaterial(NULL)
+,	FrondMaterial(NULL)
+,	LeafMaterial(NULL)
+,	BillboardMaterial(NULL)
+,	ConvertedMesh(NULL)
+{}
+
+USpeedTree::~USpeedTree()
+{
+	delete ConvertedMesh;
+}
+
 void UStaticMeshComponent3::Serialize(FArchive& Ar)
 {
 	guard(UStaticMeshComponent3::Serialize);
 
 	if (Ar.ArVer >= 322 && Ar.Game != GAME_GoWJ)
 		Ar << NetIndex;
+
+#if ARMYOF2
+	if (Ar.Game == GAME_ArmyOf2)
+	{
+		// Level components have one dword before their tagged properties.
+		// AO2Game components first store their own FName, then that dword.
+		// Identify the second layout by its embedded object name.
+		const int HeaderStart = Ar.Tell();
+		FName ComponentName;
+		if (!ReadUE3ComponentFName(Ar, ComponentName) || stricmp(ComponentName, Name))
+			Ar.Seek(HeaderStart);
+		int ComponentHeader;
+		Ar << ComponentHeader;
+	}
+#endif
 
 	while (true)
 	{
@@ -2956,7 +3032,7 @@ struct FStaticMeshSection3
 #endif // FABLE
 
 #if GEARSU
-		if (Ar.Game == GAME_GoWU) return Ar;
+		if (IsGearsUltimateLikeArchive(Ar)) return Ar;
 #endif
 
 		if (Ar.ArVer >= 514) Ar << S.f30;
@@ -3660,7 +3736,7 @@ struct FStaticMeshLODModel3
 			if (Ar.Game == GAME_BladeNSoul && Ar.ArVer >= 572) goto color_stream;
 #endif
 #if GEARSU
-			if (Ar.Game == GAME_GoWU)
+			if (IsGearsUltimateLikeArchive(Ar))
 			{
 				// Some stream
 				int32 unkCount1, unkCount2, unkStride;
@@ -3839,7 +3915,7 @@ struct FStaticMeshLODModel3
 	after_indices:
 
 #if GEARSU
-		if (Ar.Game == GAME_GoWU) return Ar;
+		if (IsGearsUltimateLikeArchive(Ar)) return Ar;
 #endif
 
 		if (Ar.ArVer < 686)
@@ -4075,6 +4151,724 @@ struct FStaticMeshUnk5
 		return Ar << S.f0 << S.f4[0] << S.f4[1] << S.f4[2];
 	}
 };
+
+#if USE_SPEEDTREE
+
+static CVec3 SpeedTreeVec3(const float* V)
+{
+	CVec3 R;
+	R.Set(V ? V[0] : 0.0f, V ? V[1] : 0.0f, V ? V[2] : 0.0f);
+	return R;
+}
+
+static FVector SpeedTreeFVector(const float* V)
+{
+	FVector R;
+	R.Set(V ? V[0] : 0.0f, V ? V[1] : 0.0f, V ? V[2] : 0.0f);
+	return R;
+}
+
+static void SpeedTreePackNormal(CPackedNormal& Dst, const float* Src)
+{
+	CVec3 V = SpeedTreeVec3(Src);
+	V.Normalize();
+	Pack(Dst, V);
+}
+
+static void SetSpeedTreeBasis(CStaticMeshVertex& V, const float* NormalPtr, const float* TangentPtr, const float* BinormalPtr)
+{
+	CVec3 Normal = SpeedTreeVec3(NormalPtr);
+	CVec3 Tangent = SpeedTreeVec3(TangentPtr);
+	CVec3 Binormal = SpeedTreeVec3(BinormalPtr);
+	if (Normal.Normalize() == 0.0f)
+		Normal.Set(0, 0, 1);
+	if (Tangent.Normalize() == 0.0f)
+		Tangent.Set(1, 0, 0);
+	Pack(V.Normal, Normal);
+	Pack(V.Tangent, Tangent);
+
+	float Sign = 1.0f;
+	if (Binormal.Normalize() != 0.0f)
+	{
+		CVec3 ComputedBinormal;
+		cross(Normal, Tangent, ComputedBinormal);
+		ComputedBinormal.Normalize();
+		Sign = dot(Binormal, ComputedBinormal) >= 0.0f ? 1.0f : -1.0f;
+	}
+	V.Normal.SetW(Sign);
+}
+
+static void SetSpeedTreeUV(CStaticMeshVertex& V, const float* UV)
+{
+	V.UV.U = UV[0];
+	V.UV.V = 1.0f - UV[1];
+}
+
+static void SpeedTreeSetColor(CStaticMeshLod* Lod, int VertexIndex, unsigned int Color)
+{
+	FColor& Dst = Lod->VertexColors[VertexIndex];
+	Dst.R = (Color >> 0) & 0xFF;
+	Dst.G = (Color >> 8) & 0xFF;
+	Dst.B = (Color >> 16) & 0xFF;
+	Dst.A = (Color >> 24) & 0xFF;
+}
+
+static void SpeedTreeSetWhite(CStaticMeshLod* Lod, int VertexIndex)
+{
+	FColor& Dst = Lod->VertexColors[VertexIndex];
+	Dst.R = Dst.G = Dst.B = Dst.A = 255;
+}
+
+static int CountSpeedTreeStripIndices(const CSpeedTreeRT::SGeometry::SIndexed& Src, int LodIndex)
+{
+	if (LodIndex < 0 || LodIndex >= Src.m_nNumLods || !Src.m_pNumStrips || !Src.m_pStripLengths || !Src.m_pStrips)
+		return 0;
+
+	int Count = 0;
+	for (int StripIndex = 0; StripIndex < Src.m_pNumStrips[LodIndex]; StripIndex++)
+	{
+		const int StripLength = Src.m_pStripLengths[LodIndex][StripIndex];
+		if (StripLength >= 3)
+			Count += (StripLength - 2) * 3;
+	}
+	return Count;
+}
+
+static int CountSpeedTreeIndexedVerts(const CSpeedTreeRT::SGeometry::SIndexed& Src, int LodIndex)
+{
+	return CountSpeedTreeStripIndices(Src, LodIndex) ? Src.m_nNumVertices : 0;
+}
+
+static const CSpeedTreeRT::SGeometry::SLeaf::SCard* GetSpeedTreeLeafCard(const CSpeedTreeRT::SGeometry::SLeaf& Src, int LeafIndex)
+{
+	if (!Src.m_pCards || !Src.m_pLeafCardIndices || LeafIndex < 0 || LeafIndex >= Src.m_nNumLeaves)
+		return NULL;
+	return Src.m_pCards + Src.m_pLeafCardIndices[LeafIndex];
+}
+
+static int CountSpeedTreeLeafVerts(const CSpeedTreeRT::SGeometry::SLeaf* Src)
+{
+	if (!Src || Src->m_nNumLeaves <= 0 || !Src->m_pCenterCoords)
+		return 0;
+
+	int Count = 0;
+	for (int LeafIndex = 0; LeafIndex < Src->m_nNumLeaves; LeafIndex++)
+	{
+		const CSpeedTreeRT::SGeometry::SLeaf::SCard* Card = GetSpeedTreeLeafCard(*Src, LeafIndex);
+		const CSpeedTreeRT::SGeometry::SLeaf::SMesh* Mesh = Card ? Card->m_pMesh : NULL;
+		Count += Mesh ? Mesh->m_nNumVertices : 4;
+	}
+	return Count;
+}
+
+static int CountSpeedTreeLeafIndices(const CSpeedTreeRT::SGeometry::SLeaf* Src)
+{
+	if (!Src || Src->m_nNumLeaves <= 0 || !Src->m_pCenterCoords)
+		return 0;
+
+	int Count = 0;
+	for (int LeafIndex = 0; LeafIndex < Src->m_nNumLeaves; LeafIndex++)
+	{
+		const CSpeedTreeRT::SGeometry::SLeaf::SCard* Card = GetSpeedTreeLeafCard(*Src, LeafIndex);
+		const CSpeedTreeRT::SGeometry::SLeaf::SMesh* Mesh = Card ? Card->m_pMesh : NULL;
+		Count += Mesh ? Mesh->m_nNumIndices : 6;
+	}
+	return Count;
+}
+
+static int AddSpeedTreeSection(CStaticMeshLod* Lod, int FirstIndex, int NumIndices, UObject* Material)
+{
+	if (NumIndices <= 0)
+		return FirstIndex;
+
+	CMeshSection* Section = new (Lod->Sections) CMeshSection;
+	memset(Section, 0, sizeof(CMeshSection));
+	Section->Material = static_cast<UUnrealMaterial*>(Material);
+	Section->FirstIndex = FirstIndex;
+	Section->NumFaces = NumIndices / 3;
+	return FirstIndex + NumIndices;
+}
+
+static void AddSpeedTreeIndex(CStaticMeshLod* Lod, int Index)
+{
+	if (Lod->Indices.Is32Bit())
+		Lod->Indices.Indices32.Add(Index);
+	else
+		Lod->Indices.Indices16.Add((uint16)Index);
+}
+
+static void AddSpeedTreeTri(CStaticMeshLod* Lod, int A, int B, int C)
+{
+	AddSpeedTreeIndex(Lod, A);
+	AddSpeedTreeIndex(Lod, B);
+	AddSpeedTreeIndex(Lod, C);
+}
+
+static void CopySpeedTreeIndexedGeometry(CStaticMeshLod* Lod, const CSpeedTreeRT::SGeometry::SIndexed& Src, int LodIndex, int& VertexBase)
+{
+	const int NumIndices = CountSpeedTreeStripIndices(Src, LodIndex);
+	if (!NumIndices)
+		return;
+
+	const int StartVertex = VertexBase;
+	for (int i = 0; i < Src.m_nNumVertices; i++, VertexBase++)
+	{
+		CStaticMeshVertex& V = Lod->Verts[VertexBase];
+		V.Position = SpeedTreeVec3(Src.m_pCoords + i * 3);
+		SetSpeedTreeBasis(V,
+			Src.m_pNormals ? Src.m_pNormals + i * 3 : NULL,
+			Src.m_pTangents ? Src.m_pTangents + i * 3 : NULL,
+			Src.m_pBinormals ? Src.m_pBinormals + i * 3 : NULL);
+		if (Src.m_pTexCoords[CSpeedTreeRT::TL_DIFFUSE])
+			SetSpeedTreeUV(V, Src.m_pTexCoords[CSpeedTreeRT::TL_DIFFUSE] + i * 2);
+		if (Src.m_pColors)
+			SpeedTreeSetColor(Lod, VertexBase, Src.m_pColors[i]);
+		else
+			SpeedTreeSetWhite(Lod, VertexBase);
+	}
+
+	for (int StripIndex = 0; StripIndex < Src.m_pNumStrips[LodIndex]; StripIndex++)
+	{
+		const int StripLength = Src.m_pStripLengths[LodIndex][StripIndex];
+		const int* Strip = Src.m_pStrips[LodIndex][StripIndex];
+		if (!Strip || StripLength < 3)
+			continue;
+		for (int i = 0; i < StripLength - 2; i++)
+		{
+			int A = StartVertex + Strip[i + 0];
+			int B = StartVertex + Strip[i + 1];
+			int C = StartVertex + Strip[i + 2];
+			if (i & 1)
+				AddSpeedTreeTri(Lod, A, C, B);
+			else
+				AddSpeedTreeTri(Lod, A, B, C);
+		}
+	}
+}
+
+static void CopySpeedTreeLeafMesh(CStaticMeshLod* Lod, const CSpeedTreeRT::SGeometry::SLeaf& Src, int LeafIndex, const CSpeedTreeRT::SGeometry::SLeaf::SMesh& Mesh, int& VertexBase)
+{
+	const int Base = VertexBase;
+	CVec3 Center = SpeedTreeVec3(Src.m_pCenterCoords + LeafIndex * 3);
+	for (int i = 0; i < Mesh.m_nNumVertices; i++, VertexBase++)
+	{
+		CStaticMeshVertex& V = Lod->Verts[VertexBase];
+		V.Position = SpeedTreeVec3(Mesh.m_pCoords + i * 3);
+		V.Position[0] += Center[0];
+		V.Position[1] += Center[1];
+		V.Position[2] += Center[2];
+		SetSpeedTreeBasis(V,
+			Mesh.m_pNormals ? Mesh.m_pNormals + i * 3 : NULL,
+			Mesh.m_pTangents ? Mesh.m_pTangents + i * 3 : NULL,
+			Mesh.m_pBinormals ? Mesh.m_pBinormals + i * 3 : NULL);
+		if (Mesh.m_pTexCoords)
+			SetSpeedTreeUV(V, Mesh.m_pTexCoords + i * 2);
+		SpeedTreeSetWhite(Lod, VertexBase);
+	}
+	for (int i = 0; i + 2 < Mesh.m_nNumIndices; i += 3)
+		AddSpeedTreeTri(Lod, Base + Mesh.m_pIndices[i + 0], Base + Mesh.m_pIndices[i + 1], Base + Mesh.m_pIndices[i + 2]);
+}
+
+static void CopySpeedTreeLeafCard(CStaticMeshLod* Lod, const CSpeedTreeRT::SGeometry::SLeaf& Src, int LeafIndex, const CSpeedTreeRT::SGeometry::SLeaf::SCard& Card, int& VertexBase)
+{
+	const int Base = VertexBase;
+	CVec3 Center = SpeedTreeVec3(Src.m_pCenterCoords + LeafIndex * 3);
+	for (int Corner = 0; Corner < 4; Corner++, VertexBase++)
+	{
+		CStaticMeshVertex& V = Lod->Verts[VertexBase];
+		V.Position = Card.m_pCoords ? SpeedTreeVec3(Card.m_pCoords + Corner * 4) : CVec3();
+		V.Position[0] += Center[0];
+		V.Position[1] += Center[1];
+		V.Position[2] += Center[2];
+		SetSpeedTreeBasis(V,
+			Src.m_pNormals ? Src.m_pNormals + LeafIndex * 12 + Corner * 3 : NULL,
+			Src.m_pTangents ? Src.m_pTangents + LeafIndex * 12 + Corner * 3 : NULL,
+			Src.m_pBinormals ? Src.m_pBinormals + LeafIndex * 12 + Corner * 3 : NULL);
+		if (Card.m_pTexCoords)
+			SetSpeedTreeUV(V, Card.m_pTexCoords + Corner * 2);
+		if (Src.m_pColors)
+			SpeedTreeSetColor(Lod, VertexBase, Src.m_pColors[LeafIndex * 4 + Corner]);
+		else
+			SpeedTreeSetWhite(Lod, VertexBase);
+	}
+
+	AddSpeedTreeTri(Lod, Base + 0, Base + 1, Base + 2);
+	AddSpeedTreeTri(Lod, Base + 0, Base + 2, Base + 3);
+}
+
+static void CopySpeedTreeLeaves(CStaticMeshLod* Lod, const CSpeedTreeRT::SGeometry::SLeaf* Src, int& VertexBase)
+{
+	if (!Src || Src->m_nNumLeaves <= 0 || !Src->m_pCenterCoords)
+		return;
+
+	for (int LeafIndex = 0; LeafIndex < Src->m_nNumLeaves; LeafIndex++)
+	{
+		const CSpeedTreeRT::SGeometry::SLeaf::SCard* Card = GetSpeedTreeLeafCard(*Src, LeafIndex);
+		if (!Card)
+			continue;
+		if (Card->m_pMesh)
+			CopySpeedTreeLeafMesh(Lod, *Src, LeafIndex, *Card->m_pMesh, VertexBase);
+		else
+			CopySpeedTreeLeafCard(Lod, *Src, LeafIndex, *Card, VertexBase);
+	}
+}
+
+static void BuildSpeedTreeLod(CStaticMesh* Mesh, const USpeedTree* Object, const CSpeedTreeRT::SGeometry& Geometry, int LodIndex)
+{
+	const CSpeedTreeRT::SGeometry::SLeaf* Leaves = LodIndex < Geometry.m_nNumLeafLods ? Geometry.m_pLeaves + LodIndex : NULL;
+	const int BranchVerts = CountSpeedTreeIndexedVerts(Geometry.m_sBranches, LodIndex);
+	const int FrondVerts = CountSpeedTreeIndexedVerts(Geometry.m_sFronds, LodIndex);
+	const int LeafVerts = CountSpeedTreeLeafVerts(Leaves);
+	const int BranchIndices = CountSpeedTreeStripIndices(Geometry.m_sBranches, LodIndex);
+	const int FrondIndices = CountSpeedTreeStripIndices(Geometry.m_sFronds, LodIndex);
+	const int LeafIndices = CountSpeedTreeLeafIndices(Leaves);
+	const int NumVerts = BranchVerts + FrondVerts + LeafVerts;
+	const int NumIndices = BranchIndices + FrondIndices + LeafIndices;
+
+	if (!NumVerts || !NumIndices)
+		return;
+
+	CStaticMeshLod* Lod = new (Mesh->Lods) CStaticMeshLod;
+	Lod->NumTexCoords = 1;
+	Lod->HasNormals = true;
+	Lod->HasTangents = true;
+	Lod->AllocateVerts(NumVerts);
+	Lod->AllocateVertexColorBuffer();
+	if (NumVerts > 65535)
+		Lod->Indices.Indices32.Empty(NumIndices);
+	else
+		Lod->Indices.Indices16.Empty(NumIndices);
+
+	int FirstIndex = 0;
+	FirstIndex = AddSpeedTreeSection(Lod, FirstIndex, BranchIndices, Object->BranchMaterial);
+	FirstIndex = AddSpeedTreeSection(Lod, FirstIndex, FrondIndices, Object->FrondMaterial);
+	AddSpeedTreeSection(Lod, FirstIndex, LeafIndices, Object->LeafMaterial);
+
+	int VertexBase = 0;
+	CopySpeedTreeIndexedGeometry(Lod, Geometry.m_sBranches, LodIndex, VertexBase);
+	CopySpeedTreeIndexedGeometry(Lod, Geometry.m_sFronds, LodIndex, VertexBase);
+	CopySpeedTreeLeaves(Lod, Leaves, VertexBase);
+}
+
+static bool LoadSpeedTreeFromBytes(CSpeedTreeRT& Tree, const byte* Data, int Size)
+{
+	CSpeedTreeRT::ResetError();
+	return Data && Size > 0 && Tree.LoadTree((const unsigned char*)Data, Size);
+}
+
+static bool LoadSpeedTreeData(CSpeedTreeRT& Tree, const TArray<byte>& Data)
+{
+	const byte* Bytes = Data.GetData();
+	const int Size = Data.Num();
+	if (LoadSpeedTreeFromBytes(Tree, Bytes, Size))
+		return true;
+	if (Size > 4 && LoadSpeedTreeFromBytes(Tree, Bytes + 4, Size - 4))
+		return true;
+	return false;
+}
+
+static void DumpSpeedTreeData(const USpeedTree* Object, const TArray<byte>& Data)
+{
+	const char* DumpDir = getenv("GEARS_SPEEDTREE_DUMP");
+	if (!DumpDir || !DumpDir[0] || !Data.Num())
+		return;
+
+	const byte* Bytes = Data.GetData();
+	int Offset = 0;
+	int WriteSize = Data.Num();
+	if (WriteSize > 16 && Bytes[4] == 0xE8 && Bytes[5] == 0x03 && Bytes[6] == 0 && Bytes[7] == 0)
+	{
+		Offset = 4;
+		WriteSize -= 4;
+	}
+
+	char Filename[1024];
+	appSprintf(ARRAY_ARG(Filename), "%s/%s_%s.spt", DumpDir, Object->GetPackageName(), Object->Name);
+	appMakeDirectoryForFile(Filename);
+	FILE* F = fopen(Filename, "wb");
+	if (F)
+	{
+		fwrite(Bytes + Offset, 1, WriteSize, F);
+		fclose(F);
+		appPrintf("Dumped SpeedTree data: %s (%d bytes)\n", Filename, WriteSize);
+	}
+}
+
+#if 0
+
+static CVec3 SpeedTreeVec3(const float* V)
+{
+	CVec3 R;
+	R.Set(V[0], V[1], V[2]);
+	return R;
+}
+
+static FVector SpeedTreeFVector(const float* V)
+{
+	FVector R;
+	R.Set(V[0], V[1], V[2]);
+	return R;
+}
+
+static CVec3 SpeedTreeUnpackVec3(const SpeedTree::st_uint8* V)
+{
+	SpeedTree::Vec3 ST = SpeedTree::CCore::UncompressVec3(V);
+	CVec3 R;
+	R.Set(ST.x, ST.y, ST.z);
+	return R;
+}
+
+static void SpeedTreePackNormal(CPackedNormal& Dst, const SpeedTree::st_uint8* Src)
+{
+	Pack(Dst, SpeedTreeUnpackVec3(Src));
+}
+
+static int CountSpeedTreeIndexedVerts(const SpeedTree::SIndexedTriangles* Src)
+{
+	return (Src && Src->HasGeometry()) ? Src->m_nNumVertices : 0;
+}
+
+static int CountSpeedTreeIndexedIndices(const SpeedTree::SIndexedTriangles* Src)
+{
+	if (!Src || !Src->HasGeometry())
+		return 0;
+	int Count = 0;
+	for (int i = 0; i < Src->m_nNumMaterialGroups; i++)
+		Count += Src->m_pDrawCallInfo[i].m_nLength;
+	return Count;
+}
+
+static int CountSpeedTreeLeafCardVerts(const SpeedTree::SLeafCards* Src)
+{
+	return (Src && Src->HasGeometry()) ? Src->m_nTotalNumCards * 4 : 0;
+}
+
+static int CountSpeedTreeLeafCardIndices(const SpeedTree::SLeafCards* Src)
+{
+	return (Src && Src->HasGeometry()) ? Src->m_nTotalNumCards * 6 : 0;
+}
+
+static int AddSpeedTreeSection(CStaticMeshLod* Lod, int FirstIndex, int NumIndices)
+{
+	if (NumIndices <= 0)
+		return FirstIndex;
+
+	CMeshSection* Section = new (Lod->Sections) CMeshSection;
+	memset(Section, 0, sizeof(CMeshSection));
+	Section->FirstIndex = FirstIndex;
+	Section->NumFaces = NumIndices / 3;
+	return FirstIndex + NumIndices;
+}
+
+static void AddSpeedTreeIndex(CStaticMeshLod* Lod, int Index)
+{
+	if (Lod->Indices.Is32Bit())
+		Lod->Indices.Indices32.Add(Index);
+	else
+		Lod->Indices.Indices16.Add((uint16)Index);
+}
+
+static void CopySpeedTreeIndexedGeometry(CStaticMeshLod* Lod, const SpeedTree::SIndexedTriangles* Src, int& VertexBase)
+{
+	if (!Src || !Src->HasGeometry())
+		return;
+
+	const int StartVertex = VertexBase;
+	for (int i = 0; i < Src->m_nNumVertices; i++, VertexBase++)
+	{
+		CStaticMeshVertex& V = Lod->Verts[VertexBase];
+		V.Position = SpeedTreeVec3(Src->m_pCoords + i * 3);
+		if (Src->m_pNormals)
+			SpeedTreePackNormal(V.Normal, Src->m_pNormals + i * 3);
+		if (Src->m_pTangents)
+			SpeedTreePackNormal(V.Tangent, Src->m_pTangents + i * 3);
+		if (Src->m_pBinormals && Src->m_pNormals && Src->m_pTangents)
+		{
+			CVec3 Normal = SpeedTreeUnpackVec3(Src->m_pNormals + i * 3);
+			CVec3 Tangent = SpeedTreeUnpackVec3(Src->m_pTangents + i * 3);
+			CVec3 Binormal = SpeedTreeUnpackVec3(Src->m_pBinormals + i * 3);
+			CVec3 ComputedBinormal;
+			cross(Normal, Tangent, ComputedBinormal);
+			V.Normal.SetW(dot(Binormal, ComputedBinormal) > 0 ? 1.0f : -1.0f);
+		}
+		else
+		{
+			V.Normal.SetW(1.0f);
+		}
+		if (Src->m_pTexCoordsDiffuse)
+		{
+			V.UV.U = Src->m_pTexCoordsDiffuse[i * 2 + 0];
+			V.UV.V = Src->m_pTexCoordsDiffuse[i * 2 + 1];
+		}
+		Lod->VertexColors[VertexBase].R = 255;
+		Lod->VertexColors[VertexBase].G = 255;
+		Lod->VertexColors[VertexBase].B = 255;
+		Lod->VertexColors[VertexBase].A = Src->m_pAmbientOcclusionValues ? Src->m_pAmbientOcclusionValues[i] : 255;
+	}
+
+	const int NumIndices = CountSpeedTreeIndexedIndices(Src);
+	for (int GroupIndex = 0; GroupIndex < Src->m_nNumMaterialGroups; GroupIndex++)
+	{
+		const SpeedTree::SDrawCallInfo& DrawCall = Src->m_pDrawCallInfo[GroupIndex];
+		for (unsigned i = 0; i < DrawCall.m_nLength; i++)
+		{
+			unsigned SourceIndex = DrawCall.m_nOffset + i;
+			int Index = Src->m_pTriangleIndices32 ? Src->m_pTriangleIndices32[SourceIndex] : Src->m_pTriangleIndices16[SourceIndex];
+			AddSpeedTreeIndex(Lod, StartVertex + Index);
+		}
+	}
+}
+
+static void CopySpeedTreeLeafCards(CStaticMeshLod* Lod, const SpeedTree::SLeafCards* Src, int& VertexBase)
+{
+	if (!Src || !Src->HasGeometry())
+		return;
+
+	static const float CornerX[4] = { -1,  1,  1, -1 };
+	static const float CornerY[4] = { -1, -1,  1,  1 };
+	const int StartVertex = VertexBase;
+
+	for (int Card = 0; Card < Src->m_nTotalNumCards; Card++)
+	{
+		CVec3 Pos = SpeedTreeVec3(Src->m_pPositions + Card * 3);
+		float Width = Src->m_pDimensions[Card * 2 + 0];
+		float Height = Src->m_pDimensions[Card * 2 + 1];
+		float PivotX = Src->m_pPivotPoints ? Src->m_pPivotPoints[Card * 2 + 0] : 0.5f;
+		float PivotY = Src->m_pPivotPoints ? Src->m_pPivotPoints[Card * 2 + 1] : 0.5f;
+
+		for (int Corner = 0; Corner < 4; Corner++, VertexBase++)
+		{
+			int CornerIndex = Card * 12 + Corner * 3;
+			int UvIndex = Card * 8 + Corner * 2;
+			CVec3 Normal = Src->m_pNormals ? SpeedTreeUnpackVec3(Src->m_pNormals + CornerIndex) : CVec3();
+			CVec3 Tangent = Src->m_pTangents ? SpeedTreeUnpackVec3(Src->m_pTangents + CornerIndex) : CVec3();
+			CVec3 Binormal = Src->m_pBinormals ? SpeedTreeUnpackVec3(Src->m_pBinormals + CornerIndex) : CVec3();
+			float X = (CornerX[Corner] * 0.5f + 0.5f - PivotX) * Width;
+			float Y = (CornerY[Corner] * 0.5f + 0.5f - PivotY) * Height;
+
+			CStaticMeshVertex& V = Lod->Verts[VertexBase];
+			V.Position = Pos;
+			V.Position[0] += Tangent[0] * X + Binormal[0] * Y;
+			V.Position[1] += Tangent[1] * X + Binormal[1] * Y;
+			V.Position[2] += Tangent[2] * X + Binormal[2] * Y;
+			Pack(V.Normal, Normal);
+			Pack(V.Tangent, Tangent);
+			V.Normal.SetW(1.0f);
+			if (Src->m_pTexCoordsDiffuse)
+			{
+				V.UV.U = Src->m_pTexCoordsDiffuse[UvIndex + 0];
+				V.UV.V = Src->m_pTexCoordsDiffuse[UvIndex + 1];
+			}
+			Lod->VertexColors[VertexBase].R = 255;
+			Lod->VertexColors[VertexBase].G = 255;
+			Lod->VertexColors[VertexBase].B = 255;
+			Lod->VertexColors[VertexBase].A = Src->m_pAmbientOcclusionValues ? Src->m_pAmbientOcclusionValues[Card] : 255;
+		}
+
+		int Base = StartVertex + Card * 4;
+		AddSpeedTreeIndex(Lod, Base + 0);
+		AddSpeedTreeIndex(Lod, Base + 1);
+		AddSpeedTreeIndex(Lod, Base + 2);
+		AddSpeedTreeIndex(Lod, Base + 0);
+		AddSpeedTreeIndex(Lod, Base + 2);
+		AddSpeedTreeIndex(Lod, Base + 3);
+	}
+}
+
+static void BuildSpeedTreeLod(CStaticMesh* Mesh, const SpeedTree::SGeometry* Geometry, int LodIndex)
+{
+	const SpeedTree::SIndexedTriangles* Branches = LodIndex < Geometry->m_nNumBranchLods ? &Geometry->m_pBranchLods[LodIndex] : NULL;
+	const SpeedTree::SIndexedTriangles* Fronds = LodIndex < Geometry->m_nNumFrondLods ? &Geometry->m_pFrondLods[LodIndex] : NULL;
+	const SpeedTree::SIndexedTriangles* LeafMeshes = LodIndex < Geometry->m_nNumLeafMeshLods ? &Geometry->m_pLeafMeshLods[LodIndex] : NULL;
+	const SpeedTree::SLeafCards* LeafCards = LodIndex < Geometry->m_nNumLeafCardLods ? &Geometry->m_pLeafCardLods[LodIndex] : NULL;
+	int NumVerts = CountSpeedTreeIndexedVerts(Branches) + CountSpeedTreeIndexedVerts(Fronds) + CountSpeedTreeIndexedVerts(LeafMeshes) + CountSpeedTreeLeafCardVerts(LeafCards);
+	int BranchIndices = CountSpeedTreeIndexedIndices(Branches);
+	int FrondIndices = CountSpeedTreeIndexedIndices(Fronds);
+	int LeafMeshIndices = CountSpeedTreeIndexedIndices(LeafMeshes);
+	int LeafCardIndices = CountSpeedTreeLeafCardIndices(LeafCards);
+
+	if (!NumVerts || !(BranchIndices + FrondIndices + LeafMeshIndices + LeafCardIndices))
+		return;
+
+	CStaticMeshLod* Lod = new (Mesh->Lods) CStaticMeshLod;
+	Lod->NumTexCoords = 1;
+	Lod->HasNormals = true;
+	Lod->HasTangents = true;
+	Lod->AllocateVerts(NumVerts);
+	Lod->AllocateVertexColorBuffer();
+	if (NumVerts > 65535)
+		Lod->Indices.Indices32.Empty(BranchIndices + FrondIndices + LeafMeshIndices + LeafCardIndices);
+	else
+		Lod->Indices.Indices16.Empty(BranchIndices + FrondIndices + LeafMeshIndices + LeafCardIndices);
+
+	int FirstIndex = 0;
+	FirstIndex = AddSpeedTreeSection(Lod, FirstIndex, BranchIndices);
+	FirstIndex = AddSpeedTreeSection(Lod, FirstIndex, FrondIndices);
+	FirstIndex = AddSpeedTreeSection(Lod, FirstIndex, LeafMeshIndices);
+	AddSpeedTreeSection(Lod, FirstIndex, LeafCardIndices);
+
+	int VertexBase = 0;
+	CopySpeedTreeIndexedGeometry(Lod, Branches, VertexBase);
+	CopySpeedTreeIndexedGeometry(Lod, Fronds, VertexBase);
+	CopySpeedTreeIndexedGeometry(Lod, LeafMeshes, VertexBase);
+	CopySpeedTreeLeafCards(Lod, LeafCards, VertexBase);
+}
+
+static bool LoadSpeedTreeFromBytes(SpeedTree::CCore& Tree, const byte* Data, int Size)
+{
+	return Data && Size > 0 && Tree.LoadTree((const SpeedTree::st_byte*)Data, Size, false);
+}
+
+static bool LoadSpeedTreeCookedData(SpeedTree::CCore& Tree, const TArray<byte>& Data)
+{
+	const byte* Bytes = Data.GetData();
+	int Size = Data.Num();
+	if (LoadSpeedTreeFromBytes(Tree, Bytes, Size))
+		return true;
+	if (Size > 27 && LoadSpeedTreeFromBytes(Tree, Bytes + 27, Size - 27))
+		return true;
+	if (Size > 4)
+	{
+		int Count = *(const int*)Bytes;
+		if (Count > 0 && Count <= Size - 4 && LoadSpeedTreeFromBytes(Tree, Bytes + 4, Count))
+			return true;
+		if (Count > 0 && Count <= Size - 8 && LoadSpeedTreeFromBytes(Tree, Bytes + 8, Count))
+			return true;
+	}
+	return false;
+}
+
+static void DumpSpeedTreeData(const USpeedTree* Object, const TArray<byte>& Data)
+{
+	const char* DumpDir = getenv("GEARS_SPEEDTREE_DUMP");
+	if (!DumpDir || !DumpDir[0] || !Data.Num())
+		return;
+
+	const byte* Bytes = Data.GetData();
+	int Size = Data.Num();
+	int Offset = 0;
+	int WriteSize = Size;
+	if (Size > 4 && Bytes[4] == '_' && Bytes[5] == '_' && Bytes[6] == 'I' && Bytes[7] == 'd')
+	{
+		Offset = 4;
+		WriteSize = Size - 4;
+	}
+
+	char Filename[1024];
+	appSprintf(ARRAY_ARG(Filename), "%s/%s_%s.spt", DumpDir, Object->GetPackageName(), Object->Name);
+	appMakeDirectoryForFile(Filename);
+	FILE* F = fopen(Filename, "wb");
+	if (F)
+	{
+		fwrite(Bytes + Offset, 1, WriteSize, F);
+		fclose(F);
+		appPrintf("Dumped SpeedTree data: %s (%d bytes)\n", Filename, WriteSize);
+	}
+}
+
+static bool IsLegacySpeedTreeSptData(const TArray<byte>& Data)
+{
+	const byte* Bytes = Data.GetData();
+	int Size = Data.Num();
+	static const char Signature[] = "__IdvSpt_02_";
+	for (int i = 0; i <= Size - (int)sizeof(Signature); i++)
+	{
+		if (!memcmp(Bytes + i, Signature, sizeof(Signature) - 1))
+			return true;
+	}
+	return false;
+}
+
+#endif // disabled SpeedTree 5 converter
+
+#endif // USE_SPEEDTREE
+
+void USpeedTree::Serialize(FArchive &Ar)
+{
+	guard(USpeedTree::Serialize);
+
+	Super::Serialize(Ar);
+	int Remaining = Ar.GetStopper() - Ar.Tell();
+	if (Remaining > 0)
+	{
+		SpeedTreeData.SetNumUninitialized(Remaining);
+		Ar.Serialize(SpeedTreeData.GetData(), Remaining);
+#if USE_SPEEDTREE
+		DumpSpeedTreeData(this, SpeedTreeData);
+#endif
+	}
+	ConvertMesh();
+
+	unguard;
+}
+
+void USpeedTree::ConvertMesh()
+{
+	guard(USpeedTree::ConvertMesh);
+
+#if USE_SPEEDTREE
+	CSpeedTreeRT Tree;
+	if (!LoadSpeedTreeData(Tree, SpeedTreeData))
+	{
+		appNotify("SpeedTree %s.%s: %s", GetPackageName(), Name, CSpeedTreeRT::GetCurrentError());
+		return;
+	}
+
+	if (!Tree.Compute(NULL, RandomSeed ? RandomSeed : 1, true))
+	{
+		appNotify("SpeedTree %s.%s compute failed: %s", GetPackageName(), Name, CSpeedTreeRT::GetCurrentError());
+		return;
+	}
+
+	CSpeedTreeRT::SGeometry Geometry;
+	Tree.GetGeometry(Geometry, SpeedTree_BranchGeometry | SpeedTree_FrondGeometry | SpeedTree_LeafGeometry);
+
+	CStaticMesh* Mesh = new CStaticMesh(this);
+	ConvertedMesh = Mesh;
+	float Bounds[6];
+	Tree.GetBoundingBox(Bounds);
+	Mesh->BoundingBox.Min = SpeedTreeFVector(Bounds);
+	Mesh->BoundingBox.Max = SpeedTreeFVector(Bounds + 3);
+	CVec3 Diag;
+	VectorSubtract(CVT(Mesh->BoundingBox.Max), CVT(Mesh->BoundingBox.Min), Diag);
+	Mesh->BoundingSphere.R = Diag.GetLength() * 0.5f;
+
+	int NumLods = Geometry.m_sBranches.m_nNumLods;
+	if (Geometry.m_sFronds.m_nNumLods > NumLods) NumLods = Geometry.m_sFronds.m_nNumLods;
+	if (Geometry.m_nNumLeafLods > NumLods) NumLods = Geometry.m_nNumLeafLods;
+	for (int LodIndex = 0; LodIndex < NumLods; LodIndex++)
+		BuildSpeedTreeLod(Mesh, this, Geometry, LodIndex);
+
+	if (!Mesh->Lods.Num())
+	{
+		delete Mesh;
+		ConvertedMesh = NULL;
+		appNotify("SpeedTree %s.%s has no exportable triangle geometry", GetPackageName(), Name);
+		return;
+	}
+	Mesh->FinalizeMesh();
+#else
+	appNotify("SpeedTree %s.%s requires SpeedTreeRT support", GetPackageName(), Name);
+#endif
+
+	unguard;
+}
+
+void USpeedTree::GetMetadata(FArchive& Ar) const
+{
+	guard(USpeedTree::GetMetadata);
+
+	int NumLods = ConvertedMesh ? ConvertedMesh->Lods.Num() : 0;
+	Ar << NumLods;
+	if (NumLods)
+	{
+		CStaticMeshLod& Lod = ConvertedMesh->Lods[0];
+		int NumIndices = Lod.Indices.Num();
+		Ar << Lod.NumVerts << Lod.NumTexCoords << NumIndices;
+	}
+
+	unguard;
+}
 
 
 void UStaticMesh3::Serialize(FArchive &Ar)

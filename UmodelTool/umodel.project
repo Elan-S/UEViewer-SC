@@ -6,7 +6,8 @@ PRJ = umodel
 
 UMODEL=UmodelTool
 
-INCLUDES += $UMODEL UI
+INCLUDES += $UMODEL UI $R/ThirdParty/SpeedTreeRT/SourceCode
+DEFINES += USE_SPEEDTREE=1 FULL_SPEEDTREE_LIB
 
 !if "$PLATFORM" eq "win32" || "$PLATFORM" eq "win64"
 	IS_WINDOWS = 1
@@ -33,6 +34,12 @@ sources(MAIN) = {
 	MeshInstance/*.cpp
 	Core/*.cpp
 	$UMODEL/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/EvalKey_Source/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/LibFilename_Source/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/LibRandom_Source/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/LibSpline_Source/*.cpp
+	ThirdParty/SpeedTreeRT/SourceCode/LibVector_Source/*.cpp
 !if "$IS_WINDOWS" eq "1"
 	UI/*.cpp
 	$UMODEL/res/umodel.rc

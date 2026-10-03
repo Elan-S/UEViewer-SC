@@ -7,6 +7,7 @@
 #include "UE4Version.h"			// for VER_UE4_NON_OUTER_PACKAGE_IMPORT
 
 #include "GameDatabase.h"		// for GetGameTag()
+#include "GameSpecific/UnUbisoft.h"
 
 //#define PROFILE_PACKAGE_TABLES	1
 
@@ -243,6 +244,18 @@ void FObjectImport::Serialize(FArchive& Ar)
 		return;
 	}
 #endif
+#if UNREAL3
+	if (Ar.Engine() >= GAME_UE3)
+	{
+		UnPackage* Package = Ar.CastTo<UnPackage>();
+		if (Package && Package->ImportTableHasPackageName)
+		{
+			FName PackageName;
+			Ar << ClassPackage << ClassName << PackageName << PackageIndex << ObjectName;
+			return;
+		}
+	}
+#endif
 	// this code is the same for all engine versions
 	Ar << ClassPackage << ClassName << PackageIndex << ObjectName;
 
@@ -271,9 +284,15 @@ void FObjectImport::Serialize(FArchive& Ar)
 	Package loading (creation) / unloading
 -----------------------------------------------------------------------------*/
 
+static bool IsSCDAPcTexturePackageWithCompactTables(const UnPackage& Package);
+static bool ValidateSCDAPcTextureImportTable(UnPackage& Package);
+static bool ValidateSCDAPcTextureExportTable(UnPackage& Package);
+static bool DetectUE3ImportTableWithPackageName(UnPackage& Package);
+
 UnPackage::UnPackage(const char *filename, const CGameFileInfo* fileInfo, bool silent)
 :	Loader(NULL)
 ,	PairFNameIndex(false)
+,	ImportTableHasPackageName(false)
 #if UNREAL4
 ,	ExportIndices_IOS(NULL)
 #endif
@@ -414,6 +433,14 @@ UnPackage::UnPackage(const char *filename, const CGameFileInfo* fileInfo, bool s
 #endif // UNREAL3
 
 	LoadNameTable();
+	ImportTableHasPackageName = DetectUE3ImportTableWithPackageName(*this);
+	if (IsSCDAPcTexturePackageWithCompactTables(*this) &&
+		(!ValidateSCDAPcTextureImportTable(*this) || !ValidateSCDAPcTextureExportTable(*this)))
+	{
+		appPrintf("WARNING: %s has unsupported SCDA PC texture package tables; loading names only\n", *GetFilename());
+		Summary.ImportCount = 0;
+		Summary.ExportCount = 0;
+	}
 	LoadImportTable();
 	LoadExportTable();
 
@@ -580,6 +607,180 @@ void UnPackage::LoadImportTable()
 // Game-specific de-obfuscation of export tables
 void PatchBnSExports(FObjectExport *Exp, const FPackageFileSummary &Summary);
 void PatchDunDefExports(FObjectExport *Exp, const FPackageFileSummary &Summary);
+
+static bool ReadCompactIndexAt(FArchive& Ar, int Stop, int& Pos, int& Value)
+{
+	if (Pos < 0 || Pos >= Stop)
+		return false;
+	const int SavePos = Ar.Tell();
+	Ar.Seek(Pos);
+	byte B0;
+	Ar << B0;
+	const bool Negative = (B0 & 0x80) != 0;
+	Value = B0 & 0x3F;
+	int Shift = 6;
+	if (B0 & 0x40)
+	{
+		for (int i = 0; i < 4; i++)
+		{
+			if (Ar.Tell() >= Stop)
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			byte B;
+			Ar << B;
+			Value |= (B & 0x7F) << Shift;
+			Shift += 7;
+			if (!(B & 0x80))
+				break;
+		}
+	}
+	if (Negative)
+		Value = -Value;
+	Pos = Ar.Tell();
+	Ar.Seek(SavePos);
+	return true;
+}
+
+static bool IsSCDAPcTexturePackageWithCompactTables(const UnPackage& Package)
+{
+	if (Package.Game != GAME_SplinterCell || Package.ArVer != 100 ||
+		Package.ArLicenseeVer < 130 || Package.ArLicenseeVer > 167)
+		return false;
+	const FString Filename = Package.GetFilename();
+	const char* Name = *Filename;
+	const char* Ext = strrchr(Name, '.');
+	return Ext && !stricmp(Ext, ".utx");
+}
+
+static bool ValidateSCDAPcTextureImportTable(UnPackage& Package)
+{
+	const FPackageFileSummary& Summary = Package.Summary;
+	if (!Summary.ImportCount)
+		return true;
+	int Pos = Summary.ImportOffset;
+	const int Stop = Summary.ExportOffset > Summary.ImportOffset ? Summary.ExportOffset : Package.GetFileSize();
+	for (int i = 0; i < Summary.ImportCount; i++)
+	{
+		int ClassPackage, ClassName, PackageIndex, ObjectName;
+		if (!ReadCompactIndexAt(Package, Stop, Pos, ClassPackage) ||
+			!ReadCompactIndexAt(Package, Stop, Pos, ClassName) ||
+			Pos + (int)sizeof(int32) > Stop)
+			return false;
+		Package.Seek(Pos);
+		Package << PackageIndex;
+		Pos += sizeof(int32);
+		if (!ReadCompactIndexAt(Package, Stop, Pos, ObjectName))
+			return false;
+		if (ClassPackage < 0 || ClassPackage >= Summary.NameCount ||
+			ClassName < 0 || ClassName >= Summary.NameCount ||
+			ObjectName < 0 || ObjectName >= Summary.NameCount)
+			return false;
+	}
+	return true;
+}
+
+static bool ValidateSCDAPcTextureExportTable(UnPackage& Package)
+{
+	const FPackageFileSummary& Summary = Package.Summary;
+	if (!Summary.ExportCount)
+		return true;
+	int Pos = Summary.ExportOffset;
+	const int Stop = Package.GetFileSize();
+	for (int i = 0; i < Summary.ExportCount; i++)
+	{
+		int ClassIndex, SuperIndex, PackageIndex, ObjectName, SerialSize, SerialOffset = 0;
+		uint32 ObjectFlags;
+		if (!ReadCompactIndexAt(Package, Stop, Pos, ClassIndex) ||
+			!ReadCompactIndexAt(Package, Stop, Pos, SuperIndex) ||
+			Pos + (int)sizeof(int32) > Stop)
+			return false;
+		Package.Seek(Pos);
+		Package << PackageIndex;
+		Pos += sizeof(int32);
+		if (!ReadCompactIndexAt(Package, Stop, Pos, ObjectName) ||
+			Pos + (int)sizeof(uint32) > Stop)
+			return false;
+		Package.Seek(Pos);
+		Package << ObjectFlags;
+		Pos += sizeof(uint32);
+		if (!ReadCompactIndexAt(Package, Stop, Pos, SerialSize))
+			return false;
+		if (SerialSize < 0)
+			return false;
+		if (SerialSize && !ReadCompactIndexAt(Package, Stop, Pos, SerialOffset))
+			return false;
+		if ((ClassIndex < 0 && -ClassIndex > Summary.ImportCount) ||
+			(ClassIndex > 0 && ClassIndex > Summary.ExportCount) ||
+			ObjectName < 0 || ObjectName >= Summary.NameCount ||
+			(SerialSize && (SerialOffset < 0 || SerialOffset > Stop || SerialSize > Stop - SerialOffset)))
+			return false;
+	}
+	return true;
+}
+
+static bool ReadFNameIndexPairAt(FArchive& Ar, int Stop, int& Pos, int& Index, int& ExtraIndex)
+{
+	if (Pos < 0 || Pos + 8 > Stop)
+		return false;
+	const int SavePos = Ar.Tell();
+	Ar.Seek(Pos);
+	Ar << Index << ExtraIndex;
+	Pos += 8;
+	Ar.Seek(SavePos);
+	return true;
+}
+
+static bool IsValidUE3ObjectRef(int Index, int ImportCount, int ExportCount)
+{
+	return (Index == 0) ||
+		(Index < 0 && -Index <= ImportCount) ||
+		(Index > 0 && Index <= ExportCount);
+}
+
+static bool DetectUE3ImportTableWithPackageName(UnPackage& Package)
+{
+#if UNREAL3
+	const FPackageFileSummary& Summary = Package.Summary;
+	if (Package.Game < GAME_UE3 || Package.Game >= GAME_UE4_BASE || !Summary.ImportCount)
+		return false;
+	if (Summary.ExportOffset <= Summary.ImportOffset)
+		return false;
+
+	const int TableSize = Summary.ExportOffset - Summary.ImportOffset;
+	if (TableSize / Summary.ImportCount != 36 || TableSize % Summary.ImportCount != 0)
+		return false;
+
+	int Pos = Summary.ImportOffset;
+	const int Stop = Summary.ExportOffset;
+	for (int i = 0; i < Summary.ImportCount; i++)
+	{
+		int ClassPackage, ClassPackageExtra, ClassName, ClassNameExtra, PackageName, PackageNameExtra;
+		int PackageIndex, ObjectName, ObjectNameExtra;
+		if (!ReadFNameIndexPairAt(Package, Stop, Pos, ClassPackage, ClassPackageExtra) ||
+			!ReadFNameIndexPairAt(Package, Stop, Pos, ClassName, ClassNameExtra) ||
+			!ReadFNameIndexPairAt(Package, Stop, Pos, PackageName, PackageNameExtra) ||
+			Pos + (int)sizeof(int32) > Stop)
+			return false;
+		Package.Seek(Pos);
+		Package << PackageIndex;
+		Pos += sizeof(int32);
+		if (!ReadFNameIndexPairAt(Package, Stop, Pos, ObjectName, ObjectNameExtra))
+			return false;
+
+		if (ClassPackage < 0 || ClassPackage >= Summary.NameCount ||
+			ClassName < 0 || ClassName >= Summary.NameCount ||
+			PackageName < 0 || PackageName >= Summary.NameCount ||
+			ObjectName < 0 || ObjectName >= Summary.NameCount ||
+			!IsValidUE3ObjectRef(PackageIndex, Summary.ImportCount, Summary.ExportCount))
+			return false;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
 
 void UnPackage::LoadExportTable()
 {
@@ -1122,6 +1323,9 @@ UObject* UnPackage::CreateExport(int index)
 	unguardf("%s:%d", *GetFilename(), index);
 }
 
+static inline bool IsSCDAPcV1LinearizedPackage(const UnPackage* Package);
+static bool IsSCDAPcV1TextureOrMaterialImport(const FObjectImport& Imp);
+static UnPackage* LoadSCDAPcV1FullTexturePackage(const UnPackage* ImporterPackage, const FObjectImport& Imp, const char* PackageName);
 
 UObject* UnPackage::CreateImport(int index)
 {
@@ -1139,7 +1343,24 @@ UObject* UnPackage::CreateImport(int index)
 		return NULL;
 	}
 #endif
-	UnPackage *Package = LoadPackage(PackageName);
+	UnPackage *Package = LoadSCDAPcV1FullTexturePackage(this, Imp, PackageName);
+#if SPLINTER_CELL
+	FString ManifestImportFilename;
+	int ManifestMaterialIndex = INDEX_NONE;
+	if (!Package && Game == GAME_SplinterCell && ArVer == 100 && ArLicenseeVer == 127 &&
+		ResolveScdaV2ManifestMaterial(*GetFilename(), PackageName, *Imp.ObjectName, *Imp.ClassName,
+			ManifestImportFilename, ManifestMaterialIndex))
+	{
+		UnPackage* MaterialPackage = LoadPackage(*ManifestImportFilename);
+		if (MaterialPackage && ManifestMaterialIndex >= 0 && unsigned(ManifestMaterialIndex) < MaterialPackage->Summary.ExportCount)
+			return MaterialPackage->CreateExport(ManifestMaterialIndex);
+	}
+	if (!Package && Game == GAME_SplinterCell && ArVer == 100 && ArLicenseeVer == 127 &&
+		ResolveScdaV2ManifestImport(*GetFilename(), PackageName, ManifestImportFilename))
+		Package = LoadPackage(*ManifestImportFilename);
+#endif
+	if (!Package)
+		Package = LoadPackage(PackageName);
 	int ObjIndex = INDEX_NONE;
 
 	if (Package)
@@ -1331,6 +1552,52 @@ const char *UnPackage::GetUncookedPackageName(int PackageIndex) const
 
 TArray<UnPackage*>	UnPackage::PackageMap;
 TArray<char*>		MissingPackages;
+
+static inline bool IsSCDAPcV1LinearizedPackage(const UnPackage* Package)
+{
+	return Package &&
+		Package->Game == GAME_SplinterCell &&
+		Package->ArVer == 100 &&
+		Package->ArLicenseeVer >= 165 &&
+		Package->ArLicenseeVer <= 167;
+}
+
+static bool IsSCDAPcV1TextureOrMaterialImport(const FObjectImport& Imp)
+{
+	const char* ClassName = *Imp.ClassName;
+	return !stricmp(ClassName, "Texture") ||
+		!stricmp(ClassName, "ProceduralTexture") ||
+		!stricmp(ClassName, "Cubemap") ||
+		!stricmp(ClassName, "Unreal3Material") ||
+		!strnicmp(ClassName, "SCX_", 4);
+}
+
+static UnPackage* LoadSCDAPcV1FullTexturePackage(const UnPackage* ImporterPackage, const FObjectImport& Imp, const char* PackageName)
+{
+	if (!IsSCDAPcV1LinearizedPackage(ImporterPackage) ||
+		!PackageName ||
+		!PackageName[0] ||
+		!IsSCDAPcV1TextureOrMaterialImport(Imp))
+	{
+		return NULL;
+	}
+
+	// SCDA v1 demo has both Textures_s (streamed low-res) and Textures (full mip source).
+	// Bare package imports can resolve to either, so material/texture imports should prefer
+	// the full texture package when it exists.
+	if (strchr(PackageName, '/') || strchr(PackageName, '\\'))
+		return NULL;
+
+	FString ImporterFilename = ImporterPackage->GetFilename();
+	const char* ImporterName = *ImporterFilename;
+	if (!strnicmp(ImporterName, "Textures/", 9) || !strnicmp(ImporterName, "Textures_s/", 11))
+		return NULL;
+
+	char Filename[MAX_PACKAGE_PATH];
+	appSprintf(ARRAY_ARG(Filename), "Textures/%s.utx", PackageName);
+	const CGameFileInfo* Info = CGameFileInfo::Find(Filename);
+	return Info ? UnPackage::LoadPackage(Info, true) : NULL;
+}
 
 /*static*/ UnPackage *UnPackage::LoadPackage(const char *Name, bool silent)
 {

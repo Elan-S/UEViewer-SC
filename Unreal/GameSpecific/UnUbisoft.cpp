@@ -81,6 +81,9 @@ struct FScdaLinTextureStreamEntry
 	FString		TextureName;
 	FString		PackageFilename;
 	FString		BinFilename;
+	FString		SourceFilename;
+	FString		ResolvedBinFilename;
+	int			GpuMipCount = 0;
 	int			LogicalOffset;
 	int			GpuOffset;
 	int			GpuSize;
@@ -118,6 +121,15 @@ struct FScdaLinManifestSourceFile
 };
 
 static TArray<FScdaLinTextureStreamEntry> GScdaLinTextureStreams;
+static int CompareScdaTextureStreamResolution(const FScdaLinTextureStreamEntry& A,
+	const FScdaLinTextureStreamEntry& B)
+{
+	const int64 AreaA = (int64)A.USize * A.VSize;
+	const int64 AreaB = (int64)B.USize * B.VSize;
+	if (AreaA != AreaB) return AreaA > AreaB ? -1 : 1;
+	if (!!A.GpuMipCount != !!B.GpuMipCount) return A.GpuMipCount ? -1 : 1;
+	return 0;
+}
 static FString GScdaLinManifestFilename;
 static TArray<FScdaLinPackage> *GScdaLinPackages;
 static TArray<FScdaLinSourceFile> GScdaLinPayloadFiles;
@@ -139,6 +151,7 @@ static void AddScdaLinSegment(FScdaLinPackage& Package, int VirtualOffset, const
 	const char *SourceFilename = NULL, int SourceLogicalOffset = 0);
 static bool IsScdaLinRangeMapped(const FScdaLinPackage& Package, int Offset, int Size);
 static bool HasScdaLinTextureStream(const char *TextureName, const char *PackageFilename = NULL);
+static FString GetScdaV2SourceLevel(const FString& Source);
 static bool ShouldScanScdaLinPayloads();
 static bool ShouldSynthesizeScdaLinLevelTexturePackages();
 static bool ShouldSynthesizeScdaLinLevelSkeletalPackages();
@@ -1328,10 +1341,19 @@ static void GetScdaLinTexturePackageLevelBase(const char *PackageFilename, FStri
 	OutBase = Base;
 }
 
-static bool ScdaLinTextureStreamMatchesPackage(const FScdaLinTextureStreamEntry& Entry, const char *PackageFilename)
+static bool ScdaLinTextureStreamMatchesPackage(const FScdaLinTextureStreamEntry& Entry, const char *PackageFilename,
+	bool FallbackTexture = false)
 {
 	if (!Entry.PackageFilename.IsEmpty())
-		return PackageFilename && !stricmp(*Entry.PackageFilename, PackageFilename);
+	{
+		if (PackageFilename && !stricmp(*Entry.PackageFilename, PackageFilename)) return true;
+		if (!FallbackTexture || !PackageFilename || Entry.SourceFilename.IsEmpty()) return false;
+		const char* End = strrchr(PackageFilename, '/');
+		if (!End) return false;
+		const char* Start = End;
+		while (Start > PackageFilename && Start[-1] != '/') Start--;
+		return !stricmp(*FString(End - Start, Start), *GetScdaV2SourceLevel(Entry.SourceFilename));
+	}
 
 	FString LevelBase;
 	GetScdaLinTexturePackageLevelBase(PackageFilename, LevelBase);
@@ -1347,20 +1369,34 @@ bool LoadScdaLinTextureStream(const char *TextureName, TArray<byte>& Data, int& 
 {
 	for (const FScdaLinTextureStreamEntry& Entry : GScdaLinTextureStreams)
 	{
-		if (stricmp(*Entry.TextureName, TextureName))
+		const int NameLen = strlen(TextureName);
+		const bool FallbackTexture = NameLen > 3 && !stricmp(TextureName + NameLen - 3, "_fb") &&
+			Entry.TextureName.Len() == NameLen - 3 && !strnicmp(*Entry.TextureName, TextureName, NameLen - 3);
+		if (stricmp(*Entry.TextureName, TextureName) && !FallbackTexture)
 			continue;
-		if (!ScdaLinTextureStreamMatchesPackage(Entry, PackageFilename))
+		if (!ScdaLinTextureStreamMatchesPackage(Entry, PackageFilename, FallbackTexture))
 			continue;
 
 		FArchive *Reader = NULL;
 		int64 FileSize = 0;
-		const CGameFileInfo *File = CGameFileInfo::Find(*Entry.BinFilename);
+		const CGameFileInfo *File = Entry.ResolvedBinFilename.IsEmpty()
+			? CGameFileInfo::Find(*Entry.BinFilename) : NULL;
 		if (File)
 		{
 			FileSize = File->Size;
 			Reader = File->CreateReader(true);
 		}
-		if (!Reader && !GScdaLinManifestFilename.IsEmpty())
+		if (!Reader && !Entry.ResolvedBinFilename.IsEmpty())
+		{
+			FFileReader *DiskReader = new FFileReader(*Entry.ResolvedBinFilename, EFileArchiveOptions::NoOpenError);
+			if (DiskReader->IsOpen())
+			{
+				Reader = DiskReader;
+				FileSize = Reader->GetFileSize();
+			}
+			else delete DiskReader;
+		}
+		if (!Reader && Entry.ResolvedBinFilename.IsEmpty() && !GScdaLinManifestFilename.IsEmpty())
 		{
 			char BaseDir[MAX_PACKAGE_PATH];
 			appStrncpyz(BaseDir, *GScdaLinManifestFilename, ARRAY_COUNT(BaseDir));
@@ -1388,21 +1424,24 @@ bool LoadScdaLinTextureStream(const char *TextureName, TArray<byte>& Data, int& 
 		}
 		if (!Reader)
 			continue;
-		if (Entry.BinOffset < 0 || Entry.BinSize <= 0 || Entry.BinOffset > FileSize - Entry.BinSize)
+		const int ReadOffset = Entry.GpuMipCount > 0 ? Entry.GpuOffset : Entry.BinOffset;
+		const int ReadSize = Entry.GpuMipCount > 0 ? Entry.GpuSize : Entry.BinSize;
+		if (ReadOffset < 0 || ReadSize <= 0 || ReadOffset > FileSize - ReadSize)
 		{
 			delete Reader;
 			continue;
 		}
 
-		Data.Empty(Entry.BinSize);
-		Data.AddUninitialized(Entry.BinSize);
-		Reader->Seek(Entry.BinOffset);
-		Reader->Serialize(Data.GetData(), Entry.BinSize);
+		Data.Empty(ReadSize);
+		Data.AddUninitialized(ReadSize);
+		Reader->Seek(ReadOffset);
+		Reader->Serialize(Data.GetData(), ReadSize);
 		delete Reader;
 
 		GpuSize = Entry.GpuSize;
 		TextureId = Entry.TextureId;
 		ResolveScdaLinTextureStreamInfo(Entry, USize, VSize, FormatCode);
+		if (Entry.GpuMipCount > 0) FormatCode = Entry.GpuMipCount;
 		if (getenv("SCDA_LIN_DEBUG"))
 			appPrintf("SCDA streamed texture: %s <- %s %X+%X gpuSize=%X id=%X meta=%dx%d fmt=%d\n",
 				TextureName, *Entry.BinFilename, Entry.BinOffset, Entry.BinSize, Entry.GpuSize, Entry.TextureId,
@@ -1417,12 +1456,16 @@ bool GetScdaLinTextureStreamInfo(const char *TextureName, int& USize, int& VSize
 {
 	for (const FScdaLinTextureStreamEntry& Entry : GScdaLinTextureStreams)
 	{
-		if (stricmp(*Entry.TextureName, TextureName))
+		const int NameLen = strlen(TextureName);
+		const bool FallbackTexture = NameLen > 3 && !stricmp(TextureName + NameLen - 3, "_fb") &&
+			Entry.TextureName.Len() == NameLen - 3 && !strnicmp(*Entry.TextureName, TextureName, NameLen - 3);
+		if (stricmp(*Entry.TextureName, TextureName) && !FallbackTexture)
 			continue;
-		if (!ScdaLinTextureStreamMatchesPackage(Entry, PackageFilename))
+		if (!ScdaLinTextureStreamMatchesPackage(Entry, PackageFilename, FallbackTexture))
 			continue;
 		if (!ResolveScdaLinTextureStreamInfo(Entry, USize, VSize, FormatCode))
 			return false;
+		if (Entry.GpuMipCount > 0) FormatCode = Entry.GpuMipCount;
 		return true;
 	}
 	return false;
@@ -2386,13 +2429,18 @@ static void InitScdaLinPackageFromHeader(FScdaLinPackage& Package,
 	{
 		if (Export.SerialSize <= 0)
 			continue;
-		if (IsScdaLinTexturePackage(Package.Filename) && IsScdaLinTextureExportClass(Export.ClassName))
+		if (IsScdaLinTextureExportClass(Export.ClassName) &&
+			(!DirectMapNativeExports || IsScdaLinTexturePackage(Package.Filename)))
 		{
-			if (HasScdaLinTextureStream(*Export.ObjectName, *Package.Filename))
+			// A LIN export offset is a virtual package offset, not a source
+			// offset. Mixed skeletal packages also contain textures. Install
+			// a valid empty texture until an explicit payload replaces it.
+			if (!DirectMapNativeExports || HasScdaLinTextureStream(*Export.ObjectName, *Package.Filename))
 				AddScdaLinTextureStubSegment(Package, Export);
 			continue;
 		}
-		if (IsScdaLinTexturePackage(Package.Filename) && IsScdaLinPaletteExportClass(Export.ClassName))
+		if (IsScdaLinPaletteExportClass(Export.ClassName) &&
+			(!DirectMapNativeExports || IsScdaLinTexturePackage(Package.Filename)))
 		{
 			AddScdaLinPaletteStubSegment(Package, Export);
 			continue;
@@ -2682,10 +2730,10 @@ static bool HasScdaLinTextureStream(const char *TextureName, const char *Package
 
 static bool TryMapScdaLinStreamTextureStub(FScdaLinPackage& Package, int Offset, int Size)
 {
-	if (!IsScdaLinTexturePackage(Package.Filename))
-		return false;
 	for (const FScdaLinExportRange& Export : Package.Exports)
 	{
+		if (!IsScdaLinTextureExportClass(Export.ClassName))
+			continue;
 		if (Export.SerialSize <= 0 || Offset < Export.SerialOffset ||
 			Offset + Size > Export.SerialOffset + Export.SerialSize)
 			continue;
@@ -3451,19 +3499,24 @@ protected:
 
 struct FScdaV2ManifestPayloadRecord
 {
+	FString ObjectName;
 	int		ExportIndex;
 	int		VirtualOffset;
 	int		Size;
+	int		SourceSize;
 	int		SourceLogicalOffset;
 	FString	SourceFilename;
 	bool	SyntheticAnimation;
+	bool	AnimationPayload;
 
 	FScdaV2ManifestPayloadRecord()
 	:	ExportIndex(-1)
 	,	VirtualOffset(0)
 	,	Size(0)
+	,	SourceSize(0)
 	,	SourceLogicalOffset(0)
 	,	SyntheticAnimation(false)
+	,	AnimationPayload(false)
 	{}
 };
 
@@ -3491,19 +3544,98 @@ struct FScdaV2ManifestStaticObjectRecord
 	int SourceNameOffset;
 	int SerialOffset;
 	int SerialSize;
+	int SourceSize;
 	int SourceLogicalOffset;
+	FString VertexSourceFilename;
+	int VertexOffset = 0;
+	int VertexCount = 0;
+	int VertexInsert = 0;
+	int ColorOffset = 0;
+	int ColorInsert = 0;
 
 	FScdaV2ManifestStaticObjectRecord()
 	:	SourceNameOffset(0)
 	,	SerialOffset(0)
 	,	SerialSize(0)
+	,	SourceSize(0)
 	,	SourceLogicalOffset(0)
 	{}
 };
 
+static void AddScdaV2ManifestStaticPayload(FScdaLinPackage& Package,
+	const FScdaLinExportRange& Export, const FScdaV2ManifestStaticObjectRecord& Object,
+	const TArray<byte>& SourceData, const TArray<byte>* VertexData = NULL)
+{
+	if (Object.SerialSize <= 0 || Object.SourceSize <= 0 ||
+		Object.SourceSize > Object.SerialSize || Object.SerialSize != Export.SerialSize ||
+		Object.SourceLogicalOffset < 0 ||
+		Object.SourceLogicalOffset > SourceData.Num() - Object.SourceSize)
+		return;
+	if (!Object.VertexSourceFilename.IsEmpty())
+	{
+		// Linear serialization omits the external vertex/color arrays but keeps
+		// their revisions. Reinsert the exact SM buffer bytes at those boundaries.
+		const int Count = Object.VertexCount;
+		if (!VertexData || Count < 1 || Count > 65536 || Object.VertexOffset < 0 ||
+			Object.VertexOffset > VertexData->Num() - Count * 28 ||
+			Object.VertexInsert < 1 || Object.VertexInsert > Object.SourceSize)
+			return;
+		byte CompactCount[5];
+		const int CountSize = WriteScdaLinCompactIndex(CompactCount, sizeof(CompactCount), Count);
+		const int VertexSize = CountSize + Count * 28;
+		const int ColorSize = Object.ColorInsert ? CountSize + Count * 4 : 0;
+		if (Object.SourceSize > Object.SerialSize - VertexSize - ColorSize ||
+			(Object.ColorInsert && (Object.ColorInsert < Object.VertexInsert ||
+			Object.ColorInsert > Object.SourceSize || Object.ColorOffset < 0 ||
+			Object.ColorOffset > VertexData->Num() - Count * 4)))
+			return;
+		TArray<byte> Rebuilt;
+		Rebuilt.AddZeroed(Object.SerialSize);
+		const byte* Source = SourceData.GetData() + Object.SourceLogicalOffset;
+		byte* Dest = Rebuilt.GetData();
+		memcpy(Dest, Source, Object.VertexInsert);
+		memcpy(Dest + Object.VertexInsert, CompactCount, CountSize);
+		memcpy(Dest + Object.VertexInsert + CountSize, VertexData->GetData() + Object.VertexOffset, Count * 28);
+		int SourcePos = Object.VertexInsert;
+		int DestPos = SourcePos + VertexSize;
+		if (Object.ColorInsert)
+		{
+			const int MiddleSize = Object.ColorInsert - SourcePos;
+			memcpy(Dest + DestPos, Source + SourcePos, MiddleSize);
+			DestPos += MiddleSize;
+			SourcePos += MiddleSize;
+			memcpy(Dest + DestPos, CompactCount, CountSize);
+			memcpy(Dest + DestPos + CountSize, VertexData->GetData() + Object.ColorOffset, Count * 4);
+			DestPos += ColorSize;
+		}
+		memcpy(Dest + DestPos, Source + SourcePos, Object.SourceSize - SourcePos);
+		AddScdaLinSegment(Package, Export.SerialOffset, Rebuilt.GetData(), Object.SerialSize,
+			*Object.SourceFilename, Object.SourceLogicalOffset);
+		return;
+	}
+	// Linear loading omits the second index buffer. Preserve the original
+	// virtual export extent so the package stopper remains valid.
+	if (Object.SourceSize == Object.SerialSize)
+	{
+		AddScdaLinSegment(Package, Export.SerialOffset,
+			SourceData.GetData() + Object.SourceLogicalOffset, Object.SerialSize,
+			*Object.SourceFilename, Object.SourceLogicalOffset);
+	}
+	else
+	{
+		TArray<byte> Padded;
+		Padded.AddZeroed(Object.SerialSize);
+		memcpy(Padded.GetData(), SourceData.GetData() + Object.SourceLogicalOffset, Object.SourceSize);
+		AddScdaLinSegment(Package, Export.SerialOffset, Padded.GetData(), Object.SerialSize,
+			*Object.SourceFilename, Object.SourceLogicalOffset);
+	}
+}
+
 struct FScdaV2ManifestPackageRecord
 {
 	FString Filename;
+	FString OriginalFilename;
+	FString LevelName;
 	FString SourceFilename;
 	FString Kind;
 	int HeaderOffset;
@@ -3525,6 +3657,82 @@ struct FScdaV2ManifestPackageRecord
 };
 
 static TArray<FScdaV2ManifestPackageRecord> *GScdaV2ManifestRecords;
+
+static FString GetScdaV2SourceLevel(const FString& Source)
+{
+	const char *Name = *Source;
+	const char *Slash = strrchr(Name, '/');
+	const char *Backslash = strrchr(Name, '\\');
+	if (!Slash || (Backslash && Backslash > Slash)) Slash = Backslash;
+	Name = Slash ? Slash + 1 : Name;
+	const char *Dot = strrchr(Name, '.');
+	return Dot ? FString(Dot - Name, Name) : FString(Name);
+}
+
+bool ResolveScdaV2ManifestImport(const char* ImporterFilename, const char* PackageName, FString& Filename)
+{
+	if (!GScdaV2ManifestRecords || !ImporterFilename || !PackageName) return false;
+	FString Level;
+	for (const FScdaV2ManifestPackageRecord& Record : *GScdaV2ManifestRecords)
+		if (!stricmp(*Record.Filename, ImporterFilename))
+		{
+			Level = Record.LevelName.IsEmpty() ? GetScdaV2SourceLevel(Record.SourceFilename) : Record.LevelName;
+			break;
+		}
+	if (Level.IsEmpty()) return false;
+	for (const FScdaV2ManifestPackageRecord& Record : *GScdaV2ManifestRecords)
+	{
+		const FString RecordLevel = Record.LevelName.IsEmpty() ? GetScdaV2SourceLevel(Record.SourceFilename) : Record.LevelName;
+		if (Record.OriginalFilename.IsEmpty() || stricmp(*RecordLevel, *Level)) continue;
+		// Imports name the original package, while the VFS keeps each level's
+		// copy at a distinct path to avoid replacing another level's exports.
+		FString Base = GetScdaV2SourceLevel(Record.OriginalFilename);
+		if (!stricmp(*Base, PackageName) || !stricmp(*Record.OriginalFilename, PackageName))
+		{
+			Filename = Record.Filename;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ResolveScdaV2ManifestMaterial(const char* ImporterFilename, const char* PackageName,
+	const char* ObjectName, const char* ClassName, FString& Filename, int& ExportIndex)
+{
+	if (!GScdaV2ManifestRecords || !ImporterFilename || !PackageName || !ObjectName ||
+		!ClassName || !appStristr(ClassName, "material")) return false;
+	FString Level;
+	for (const FScdaV2ManifestPackageRecord& Record : *GScdaV2ManifestRecords)
+		if (!stricmp(*Record.Filename, ImporterFilename)) { Level = Record.LevelName; break; }
+	if (Level.IsEmpty()) return false;
+	FString FallbackPackage = PackageName;
+	FallbackPackage += "_fb";
+	FString FallbackObject = ObjectName;
+	const int ObjectNameLength = strlen(ObjectName);
+	if (ObjectNameLength < 3 || stricmp(ObjectName + ObjectNameLength - 3, "_fb"))
+		FallbackObject += "_fb";
+	// Fallback packages need not have an import alias: the skeleton imports
+	// only the full material. Also allow exact mapped object names in this
+	// level's material packages when no import alias was generated.
+	for (int Pass = 0; Pass < 4; Pass++)
+	{
+		const char* WantedPackage = Pass ? *FallbackPackage : PackageName;
+		const char* WantedObject = (Pass == 1 || Pass == 3) ? *FallbackObject : ObjectName;
+		for (const FScdaV2ManifestPackageRecord& Record : *GScdaV2ManifestRecords)
+		{
+			if (stricmp(*Record.LevelName, *Level) || Record.OriginalFilename.IsEmpty() ||
+				(Pass < 2 && stricmp(*GetScdaV2SourceLevel(Record.OriginalFilename), WantedPackage))) continue;
+			for (const FScdaV2ManifestPayloadRecord& Payload : Record.Payloads)
+				if (!stricmp(*Payload.ObjectName, WantedObject) && !Payload.AnimationPayload && Payload.Size > 0)
+				{
+					Filename = Record.Filename;
+					ExportIndex = Payload.ExportIndex;
+					return true;
+				}
+		}
+	}
+	return false;
+}
 
 bool GetScdaV2ManifestSkeleton(const char *PackageFilename, TArray<FString>& BoneNames,
 	TArray<int>& ParentIndices)
@@ -3573,6 +3781,64 @@ bool GetScdaV2ManifestAnimationData(const char *PackageFilename, const char *Obj
 		}
 	}
 	return false;
+}
+
+static bool GetScdaV2LevelFamily(const char* Filename, FString& Family)
+{
+	if (!Filename) return false;
+	const char* Base = Filename;
+	for (const char* p = Filename; *p; p++)
+		if (*p == '/' || *p == '\\') Base = p + 1;
+	if ((*Base != 'x' && *Base != 'X') || Base[1] < '0' || Base[1] > '9')
+		return false;
+	const char* Place = strchr(Base, '_');
+	if (!Place) return false;
+	Place++;
+	if (!strnicmp(Place, "coop_", 5)) Place += 5;
+	const char* End = Place;
+	while (*End && *End != '_' && *End != '.') End++;
+	if (End == Place) return false;
+	char Token[128];
+	int Length = min(int(End - Place), int(sizeof(Token) - 1));
+	memcpy(Token, Place, Length);
+	Token[Length] = 0;
+	Family = Token;
+	return true;
+}
+
+bool AreScdaV2LevelPackagesRelated(const char* MeshPackageFilename, const char* AnimationPackageFilename)
+{
+	FString MeshFamily, AnimFamily;
+	if (!GetScdaV2LevelFamily(MeshPackageFilename, MeshFamily) ||
+		!GetScdaV2LevelFamily(AnimationPackageFilename, AnimFamily))
+		return MeshPackageFilename && AnimationPackageFilename &&
+			!stricmp(MeshPackageFilename, AnimationPackageFilename);
+	int CommonLength = min(strlen(*MeshFamily), strlen(*AnimFamily));
+	// Accept the game's abbreviated location labels (ice/Iceland, kin/Kinshasa).
+	return !stricmp(*MeshFamily, *AnimFamily) ||
+		(CommonLength >= 3 && !strnicmp(*MeshFamily, *AnimFamily, CommonLength));
+}
+
+bool GetScdaV2ManifestAnimationPayloads(TArray<FString>& PackageFilenames,
+	TArray<int>& ExportIndices, const char* MeshPackageFilename)
+{
+	PackageFilenames.Empty();
+	ExportIndices.Empty();
+	if (!GScdaV2ManifestRecords)
+		return false;
+	for (const FScdaV2ManifestPackageRecord& Record : *GScdaV2ManifestRecords)
+	{
+		if (!AreScdaV2LevelPackagesRelated(MeshPackageFilename, *Record.Filename))
+			continue;
+		for (const FScdaV2ManifestPayloadRecord& Payload : Record.Payloads)
+		{
+			if (!Payload.AnimationPayload || Payload.SyntheticAnimation || Payload.ExportIndex < 0)
+				continue;
+			PackageFilenames.Add(Record.Filename);
+			ExportIndices.Add(Payload.ExportIndex);
+		}
+	}
+	return PackageFilenames.Num() > 0;
 }
 
 struct FScdaV2ManifestSourceCache
@@ -3703,6 +3969,9 @@ static void ScdaV2AddOrUpdateStaticObject(TArray<FScdaV2ManifestStaticObjectReco
 	{
 		if (stricmp(*Existing.ObjectName, *Object.ObjectName))
 			continue;
+		if (Existing.SerialOffset > 0 && Object.SerialOffset > 0 &&
+			Existing.SerialOffset != Object.SerialOffset)
+			continue;
 		if (Existing.SerialSize <= 0 && Object.SerialSize > 0)
 			Existing = Object;
 		return;
@@ -3722,6 +3991,84 @@ static void ScdaV2AppendNameEntry(TArray<byte>& Data, const FString& Name)
 	memcpy(Data.GetData() + Pos, Text, Length);
 	Data[Pos + Length] = 0;
 	memset(Data.GetData() + Pos + Length + 1, 0, 4);
+}
+
+static bool BuildScdaV2ResidentAnimationPackage(FScdaLinPackage& Package,
+	const FScdaV2ManifestPackageRecord& Record, const FScdaLinHeader& Header)
+{
+	guard(BuildScdaV2ResidentAnimationPackage);
+	if (!Record.Payloads.Num() || !Header.Names.Num() || stricmp(*Header.Names[0], "None"))
+		return false;
+	TArray<FString> Names;
+	for (const FString& Name : Header.Names)
+		Names.Add(Name); // Native bones and sequences retain their original indices.
+	ScdaV2AddUniqueName(Names, "Core");
+	ScdaV2AddUniqueName(Names, "Engine");
+	ScdaV2AddUniqueName(Names, "Class");
+	ScdaV2AddUniqueName(Names, "MeshAnimation");
+	for (const FScdaV2ManifestPayloadRecord& Payload : Record.Payloads)
+		ScdaV2AddUniqueName(Names, Payload.ObjectName);
+	const int EngineIndex = ScdaV2FindNameIndex(Names, "Engine");
+	const int ClassIndex = ScdaV2FindNameIndex(Names, "Class");
+	const int AnimationIndex = ScdaV2FindNameIndex(Names, "MeshAnimation");
+	TArray<byte> Data;
+	Data.AddZeroed(0x98);
+	ScdaV2PatchInt32(Data, 0x00, PACKAGE_FILE_TAG);
+	ScdaV2PatchInt32(Data, 0x04, 100 | (127 << 16));
+	ScdaV2PatchInt32(Data, 0x08, 0x13);
+	ScdaV2PatchInt32(Data, 0x0C, 1);
+	ScdaV2PatchInt32(Data, 0x10, Names.Num());
+	ScdaV2PatchInt32(Data, 0x14, 0x98);
+	ScdaV2PatchInt32(Data, 0x18, Record.Payloads.Num());
+	ScdaV2PatchInt32(Data, 0x20, 1);
+	ScdaV2PatchInt32(Data, 0x28, 0x0FF0ADDE);
+	for (const FString& Name : Names)
+		ScdaV2AppendNameEntry(Data, Name);
+	const int ImportOffset = Data.Num();
+	ScdaV2AppendCompactIndex(Data, EngineIndex);
+	ScdaV2AppendCompactIndex(Data, ClassIndex);
+	ScdaV2AppendInt32(Data, 0);
+	ScdaV2AppendCompactIndex(Data, AnimationIndex);
+	const int ExportOffset = Data.Num();
+	Package.Names.Empty(Names.Num());
+	for (const FString& Name : Names)
+		Package.Names.Add(Name);
+	Package.Exports.Empty(Record.Payloads.Num());
+	int MaxEnd = Record.OriginalSize;
+	for (const FScdaV2ManifestPayloadRecord& Payload : Record.Payloads)
+	{
+		if (Payload.ExportIndex != Package.Exports.Num() || !Payload.AnimationPayload ||
+			Payload.Size <= 0 || Payload.VirtualOffset < 0x01000000 ||
+			Payload.VirtualOffset > 0x7FFFFFFF - Payload.Size)
+			return false;
+		int NameIndex = ScdaV2FindNameIndex(Names, *Payload.ObjectName);
+		ScdaV2AppendCompactIndex(Data, -1);
+		ScdaV2AppendCompactIndex(Data, 0);
+		ScdaV2AppendInt32(Data, 0);
+		ScdaV2AppendCompactIndex(Data, NameIndex);
+		ScdaV2AppendInt32(Data, 0);
+		ScdaV2AppendCompactIndex(Data, Payload.Size);
+		ScdaV2AppendCompactIndex(Data, Payload.VirtualOffset);
+		FScdaLinExportRange& Export = Package.Exports[Package.Exports.AddDefaulted()];
+		Export.SerialOffset = Payload.VirtualOffset;
+		Export.SerialSize = Payload.Size;
+		Export.ClassIndex = -1;
+		Export.ObjectNameIndex = NameIndex;
+		Export.ObjectName = Payload.ObjectName;
+		Export.ClassName = "MeshAnimation";
+		MaxEnd = max(MaxEnd, Payload.VirtualOffset + Payload.Size);
+	}
+	ScdaV2PatchInt32(Data, 0x1C, ExportOffset);
+	ScdaV2PatchInt32(Data, 0x24, ImportOffset);
+	if (Data.Num() > 0x01000000) return false;
+	Package.Filename = Record.Filename;
+	Package.NativeSourceFilename = Record.SourceFilename;
+	Package.OriginalSize = MaxEnd;
+	Package.ImportCount = 1;
+	Package.PayloadStreamsMapped = true;
+	AddScdaLinSegment(Package, 0, Data.GetData(), Data.Num(), *Record.SourceFilename, 0);
+	return true;
+	unguard;
 }
 
 static bool BuildScdaV2StaticSidecarPackage(FScdaLinPackage& Package,
@@ -3826,6 +4173,46 @@ static bool BuildScdaV2StaticSidecarPackage(FScdaLinPackage& Package,
 	unguard;
 }
 
+static int FindScdaV2StaticExportIndexByName(const FScdaLinPackage& Package, const FString& ObjectName)
+{
+	for (int ExportIndex = 0; ExportIndex < Package.Exports.Num(); ExportIndex++)
+	{
+		const FScdaLinExportRange& Export = Package.Exports[ExportIndex];
+		if (!stricmp(*Export.ClassName, "StaticMesh") && !stricmp(*Export.ObjectName, *ObjectName))
+			return ExportIndex;
+	}
+	return -1;
+}
+
+static int FindScdaV2StaticExportIndex(const FScdaLinPackage& Package,
+	const FScdaV2ManifestStaticObjectRecord& Object)
+{
+	// Names are not unique in every LIN header. The manifest records the
+	// original export's virtual offset, which identifies the exact owner.
+	if (Object.SerialOffset > 0)
+	{
+		for (int ExportIndex = 0; ExportIndex < Package.Exports.Num(); ExportIndex++)
+		{
+			const FScdaLinExportRange& Export = Package.Exports[ExportIndex];
+			if (Export.SerialOffset == Object.SerialOffset &&
+				!stricmp(*Export.ClassName, "StaticMesh") &&
+				!stricmp(*Export.ObjectName, *Object.ObjectName))
+				return ExportIndex;
+		}
+		return -1;
+	}
+	return FindScdaV2StaticExportIndexByName(Package, Object.ObjectName);
+}
+
+static void RemoveScdaLinSegmentAt(FScdaLinPackage& Package, int VirtualOffset)
+{
+	for (int SegmentIndex = Package.Segments.Num() - 1; SegmentIndex >= 0; SegmentIndex--)
+	{
+		if (Package.Segments[SegmentIndex].VirtualOffset == VirtualOffset)
+			Package.Segments.RemoveAt(SegmentIndex);
+	}
+}
+
 class FScdaV2ManifestVFS : public FVirtualFileSystem
 {
 public:
@@ -3862,10 +4249,17 @@ public:
 		Text[Text.Num() - 1] = 0;
 
 		bool HeaderSeen = false;
+		FString CurrentLevel;
 		for (char *Line = strtok(Text.GetData(), "\r\n"); Line; Line = strtok(NULL, "\r\n"))
 		{
 			if (!Line[0] || Line[0] == '#')
 				continue;
+			char RootName[1024];
+			if (sscanf(Line, "root \"%1023[^\"]\"", RootName) == 1)
+			{
+				BaseDir = RootName;
+				continue;
+			}
 			int Version;
 			if (sscanf(Line, "UMODEL_SCDA_V2_LEVEL_MANIFEST %d", &Version) == 1)
 			{
@@ -3881,11 +4275,17 @@ public:
 			char Name1[MAX_PACKAGE_PATH], Name2[MAX_PACKAGE_PATH], Name3[MAX_PACKAGE_PATH], Name4[MAX_PACKAGE_PATH], Kind[64];
 			unsigned HeaderOffset, OriginalSize;
 			unsigned ExportIndex, SerialOffset, SerialSize, SourceLogicalOffset;
+			if (sscanf(Line, "level \"%511[^\"]\"", Name1) == 1)
+			{
+				CurrentLevel = GetScdaV2SourceLevel(FString(Name1));
+				continue;
+			}
 			if (sscanf(Line, "package \"%511[^\"]\" source \"%511[^\"]\" kind %63s header %x size %x",
 				Name1, Name2, Kind, &HeaderOffset, &OriginalSize) == 5)
 			{
 				FScdaV2ManifestPackageRecord& Record = Records[Records.AddDefaulted()];
 				Record.Filename = Name1;
+				Record.LevelName = CurrentLevel;
 				Record.SourceFilename = Name2;
 				Record.Kind = Kind;
 				Record.HeaderOffset = HeaderOffset;
@@ -3914,6 +4314,7 @@ public:
 					continue;
 				FScdaV2ManifestPackageRecord& Record = Records[Records.AddDefaulted()];
 				Record.Filename = Name1;
+				Record.LevelName = CurrentLevel;
 				Record.SourceFilename = Name2;
 				Record.Kind = "sidecar_static";
 				if (strstr(Line, " header "))
@@ -3949,11 +4350,27 @@ public:
 					Object.ObjectName = Name2;
 					Object.SourceFilename = Name3;
 					Object.SourceNameOffset = NameOffset;
+					const char* VertexField = strstr(Line, " vertex_source ");
+					if (VertexField && sscanf(VertexField,
+						" vertex_source \"%511[^\"]\" vertex_offset %x vertex_count %x vertex_insert %x",
+						Name4, &Object.VertexOffset, &Object.VertexCount, &Object.VertexInsert) == 4)
+						Object.VertexSourceFilename = Name4;
+					const char* ColorField = strstr(Line, " color_offset ");
+					if (ColorField)
+						sscanf(ColorField, " color_offset %x color_insert %x", &Object.ColorOffset, &Object.ColorInsert);
 					if (strstr(Line, " serial "))
 					{
 						Object.SerialOffset = SerialOffset;
 						Object.SerialSize = SerialSize;
 						Object.SourceLogicalOffset = SourceLogicalOffset;
+						Object.SourceSize = SerialSize;
+						const char *SourceSizeField = strstr(Line, " source_size ");
+						if (SourceSizeField)
+						{
+							unsigned ParsedSourceSize;
+							if (sscanf(SourceSizeField, " source_size %x", &ParsedSourceSize) == 1)
+								Object.SourceSize = ParsedSourceSize;
+						}
 					}
 					ScdaV2AddOrUpdateStaticObject(Record.StaticObjects, Object);
 					if (Record.SourceFilename.IsEmpty())
@@ -4014,8 +4431,9 @@ public:
 				"payload \"%511[^\"]\" index %u class \"%511[^\"]\" object \"%511[^\"]\" serial %x size %x source \"%511[^\"]\" logical %x",
 				Name1, &ExportIndex, Name2, Name3, &SerialOffset, &SerialSize, Name4, &SourceLogicalOffset) == 8)
 			{
-				for (FScdaV2ManifestPackageRecord& Record : Records)
+				for (int RecordIndex = Records.Num() - 1; RecordIndex >= 0; RecordIndex--)
 				{
+					FScdaV2ManifestPackageRecord& Record = Records[RecordIndex];
 					if (stricmp(*Record.Filename, Name1))
 						continue;
 					FScdaV2ManifestPayloadRecord& Payload = Record.Payloads[Record.Payloads.AddDefaulted()];
@@ -4023,7 +4441,16 @@ public:
 					Payload.VirtualOffset = SerialOffset;
 					Payload.Size = SerialSize;
 					Payload.SourceFilename = Name4;
+					Payload.ObjectName = Name3;
 					Payload.SourceLogicalOffset = SourceLogicalOffset;
+					Payload.AnimationPayload = !stricmp(Name2, "MeshAnimation");
+					const char *SourceSizeField = strstr(Line, " source_size ");
+					if (SourceSizeField)
+					{
+						unsigned ParsedSourceSize;
+						if (sscanf(SourceSizeField, " source_size %x", &ParsedSourceSize) == 1)
+							Payload.SourceSize = ParsedSourceSize;
+					}
 					break;
 				}
 				continue;
@@ -4078,6 +4505,7 @@ public:
 				FScdaLinTextureStreamEntry& Entry = GScdaLinTextureStreams[GScdaLinTextureStreams.AddDefaulted()];
 				Entry.TextureName = Name1;
 				Entry.PackageFilename = Name2;
+				Entry.SourceFilename = Name3;
 				Entry.BinFilename = Name4;
 				Entry.LogicalOffset = LogicalOffset;
 				Entry.GpuOffset = GpuOffset;
@@ -4088,6 +4516,11 @@ public:
 				Entry.USize = USize;
 				Entry.VSize = VSize;
 				Entry.FormatCode = FormatCode;
+				const char* GpuField = strstr(Line, " gpu_valid ");
+				int GpuValid = 0, GpuMips = 0;
+				if (GpuField && sscanf(GpuField, " gpu_valid %d gpu_mips %d", &GpuValid, &GpuMips) == 2 &&
+				    GpuValid == 1 && GpuMips > 0 && GpuMips <= 13)
+				    Entry.GpuMipCount = GpuMips;
 				NormalizeScdaLinTextureStreamInfo(Entry);
 				continue;
 			}
@@ -4101,6 +4534,7 @@ public:
 				FScdaLinTextureStreamEntry& Entry = GScdaLinTextureStreams[GScdaLinTextureStreams.AddDefaulted()];
 				Entry.TextureName = Name1;
 				Entry.BinFilename = Name3;
+				Entry.SourceFilename = Name2;
 				Entry.LogicalOffset = LogicalOffset;
 				Entry.GpuOffset = GpuOffset;
 				Entry.GpuSize = GpuSize;
@@ -4110,6 +4544,11 @@ public:
 				Entry.USize = USize;
 				Entry.VSize = VSize;
 				Entry.FormatCode = FormatCode;
+				const char* GpuField = strstr(Line, " gpu_valid ");
+				int GpuValid = 0, GpuMips = 0;
+				if (GpuField && sscanf(GpuField, " gpu_valid %d gpu_mips %d", &GpuValid, &GpuMips) == 2 &&
+				    GpuValid == 1 && GpuMips > 0 && GpuMips <= 13)
+				    Entry.GpuMipCount = GpuMips;
 				NormalizeScdaLinTextureStreamInfo(Entry);
 				continue;
 			}
@@ -4121,7 +4560,39 @@ public:
 			return false;
 		}
 		GScdaV2ManifestRecords = &Records;
+		// Shared texture/material aliases recur in every level. Register each
+		// source's copy separately and keep sidecar paths tied to this root.
+		for (int i = 0; i < Records.Num(); i++)
+		{
+			FScdaV2ManifestPackageRecord& Record = Records[i];
+			if (stricmp(*Record.Kind, "texture") && stricmp(*Record.Kind, "material") &&
+				stricmp(*Record.Kind, "material_alias")) continue;
+			Record.OriginalFilename = Record.Filename;
+			const char *Name = *Record.OriginalFilename;
+			const char *Slash = strrchr(Name, '/');
+			if (!Slash) continue;
+			Record.Filename = FString(Slash - Name + 1, Name);
+			Record.Filename += Record.LevelName.IsEmpty() ? GetScdaV2SourceLevel(Record.SourceFilename) : Record.LevelName;
+			Record.Filename += "/";
+			Record.Filename += Slash + 1;
+			Packages[i].Filename = Record.Filename;
+		}
+		for (FScdaLinTextureStreamEntry& Entry : GScdaLinTextureStreams)
+		{
+			MakeScdaManifestSiblingPath(BaseDir, Entry.BinFilename, Entry.ResolvedBinFilename);
+			for (const FScdaV2ManifestPackageRecord& Record : Records)
+			{
+				if (!Record.OriginalFilename.IsEmpty() && !stricmp(*Record.OriginalFilename, *Entry.PackageFilename) &&
+					!stricmp(*(Record.LevelName.IsEmpty() ? GetScdaV2SourceLevel(Record.SourceFilename) : Record.LevelName),
+						*GetScdaV2SourceLevel(Entry.SourceFilename)))
+				{
+					Entry.PackageFilename = Record.Filename;
+					break;
+				}
+			}
+		}
 
+		GScdaLinTextureStreams.Sort(CompareScdaTextureStreamResolution);
 		Reserve(Packages.Num());
 		for (int i = 0; i < Packages.Num(); i++)
 		{
@@ -4204,7 +4675,34 @@ protected:
 				if (!ReadScdaLinHeader(LogicalData->GetData(), LogicalData->Num(), Record.HeaderOffset, Header))
 					return false;
 				InitScdaLinPackageFromHeader(Packages[Index], Record.Filename, Record.OriginalSize, Header.Offset,
-					Header, LogicalData->GetData(), LogicalData->Num(), true, *Record.SourceFilename);
+					Header, LogicalData->GetData(), LogicalData->Num(), false, *Record.SourceFilename);
+				for (int StaticIndex = 0; StaticIndex < Record.StaticObjects.Num(); StaticIndex++)
+				{
+					const FScdaV2ManifestStaticObjectRecord& Object = Record.StaticObjects[StaticIndex];
+					if (Object.SerialSize <= 0 || Object.SourceLogicalOffset < 0)
+						continue;
+					int ExportIndex = FindScdaV2StaticExportIndex(Packages[Index], Object);
+					if (ExportIndex < 0 || ExportIndex >= Packages[Index].Exports.Num())
+						continue;
+					const FScdaLinExportRange& Export = Packages[Index].Exports[ExportIndex];
+					if (!Object.VertexSourceFilename.IsEmpty() && !GetSourceData(Object.VertexSourceFilename))
+						continue;
+					const TArray<byte> *PayloadData = GetSourceData(Object.SourceFilename.IsEmpty() ? Record.SourceFilename : Object.SourceFilename);
+					if (!PayloadData)
+						continue;
+					if (Object.SourceLogicalOffset < 0 || Object.SourceLogicalOffset > PayloadData->Num() - Object.SourceSize)
+					{
+						if (getenv("SCDA_LIN_DEBUG") || getenv("SCDA_LIN_DEBUG_PACKAGES"))
+							appPrintf("  SCDA V2 static payload skipped: %s object=%s logical=%X size=%X source_size=%X\n",
+								*Record.Filename, *Object.ObjectName, Object.SourceLogicalOffset, Object.SerialSize,
+								PayloadData->Num());
+						continue;
+					}
+					RemoveScdaLinSegmentAt(Packages[Index], Export.SerialOffset);
+					const TArray<byte>* VertexData = Object.VertexSourceFilename.IsEmpty() ? NULL : GetSourceData(Object.VertexSourceFilename);
+					AddScdaV2ManifestStaticPayload(Packages[Index], Export, Object, *PayloadData, VertexData);
+				}
+				Packages[Index].PayloadStreamsMapped = true;
 				Record.OriginalSize = Packages[Index].OriginalSize;
 				Record.Loaded = true;
 				if (getenv("SCDA_LIN_DEBUG") || getenv("SCDA_LIN_DEBUG_PACKAGES"))
@@ -4220,24 +4718,28 @@ protected:
 				const FScdaV2ManifestStaticObjectRecord& Object = Record.StaticObjects[StaticIndex];
 				if (Object.SerialSize <= 0 || Object.SourceLogicalOffset < 0)
 					continue;
-				if (StaticIndex >= Packages[Index].Exports.Num())
+				int ExportIndex = FindScdaV2StaticExportIndexByName(Packages[Index], Object.ObjectName);
+				if (ExportIndex < 0 && StaticIndex < Packages[Index].Exports.Num())
+					ExportIndex = StaticIndex;
+				if (ExportIndex < 0 || ExportIndex >= Packages[Index].Exports.Num())
 					continue;
-				const FScdaLinExportRange& Export = Packages[Index].Exports[StaticIndex];
+				const FScdaLinExportRange& Export = Packages[Index].Exports[ExportIndex];
+				if (!Object.VertexSourceFilename.IsEmpty() && !GetSourceData(Object.VertexSourceFilename))
+					continue;
 				const TArray<byte> *LogicalData = GetSourceData(Object.SourceFilename.IsEmpty() ? Record.SourceFilename : Object.SourceFilename);
 				if (!LogicalData)
 					continue;
-				if (Object.SourceLogicalOffset < 0 || Object.SourceLogicalOffset > LogicalData->Num() - Object.SerialSize)
+				if (Object.SourceLogicalOffset < 0 || Object.SourceLogicalOffset > LogicalData->Num() - Object.SourceSize)
 				{
 					if (getenv("SCDA_LIN_DEBUG") || getenv("SCDA_LIN_DEBUG_PACKAGES"))
 						appPrintf("  SCDA V2 static payload skipped: %s object=%s logical=%X size=%X source_size=%X\n",
 							*Record.Filename, *Object.ObjectName, Object.SourceLogicalOffset, Object.SerialSize,
-							LogicalData->Num());
+						LogicalData->Num());
 					continue;
 				}
-				AddScdaLinSegment(Packages[Index], Export.SerialOffset,
-					LogicalData->GetData() + Object.SourceLogicalOffset, Object.SerialSize,
-					*(Object.SourceFilename.IsEmpty() ? Record.SourceFilename : Object.SourceFilename),
-					Object.SourceLogicalOffset);
+				RemoveScdaLinSegmentAt(Packages[Index], Export.SerialOffset);
+				const TArray<byte>* VertexData = Object.VertexSourceFilename.IsEmpty() ? NULL : GetSourceData(Object.VertexSourceFilename);
+				AddScdaV2ManifestStaticPayload(Packages[Index], Export, Object, *LogicalData, VertexData);
 			}
 			Record.OriginalSize = Packages[Index].OriginalSize;
 			Record.Loaded = true;
@@ -4255,8 +4757,16 @@ protected:
 		FScdaLinHeader Header;
 		if (!ReadScdaLinHeader(LogicalData->GetData(), LogicalData->Num(), Record.HeaderOffset, Header))
 			return false;
-		InitScdaLinPackageFromHeader(Packages[Index], Record.Filename, Record.OriginalSize, Header.Offset,
-			Header, LogicalData->GetData(), LogicalData->Num(), false, *Record.SourceFilename);
+		if (!stricmp(*Record.Kind, "resident_animation"))
+		{
+			if (!BuildScdaV2ResidentAnimationPackage(Packages[Index], Record, Header))
+				return false;
+		}
+		else
+		{
+			InitScdaLinPackageFromHeader(Packages[Index], Record.Filename, Record.OriginalSize, Header.Offset,
+				Header, LogicalData->GetData(), LogicalData->Num(), false, *Record.SourceFilename);
+		}
 		for (const FScdaV2ManifestPayloadRecord& Payload : Record.Payloads)
 		{
 			if (Payload.SyntheticAnimation)
@@ -4276,9 +4786,48 @@ protected:
 				if (!PayloadData)
 					continue;
 			}
+			int PhysicalSize = Payload.SourceSize ? Payload.SourceSize : Payload.Size;
 			if (Payload.SourceLogicalOffset < 0 || Payload.Size <= 0 ||
-				Payload.SourceLogicalOffset > PayloadData->Num() - Payload.Size)
+				PhysicalSize <= 0 || PhysicalSize > Payload.Size ||
+				Payload.SourceLogicalOffset > PayloadData->Num() - PhysicalSize)
 				continue;
+			if (Payload.ExportIndex >= 0 && Payload.ExportIndex < Header.Exports.Num() &&
+				!stricmp(*Header.Exports[Payload.ExportIndex].ClassName, "SkeletalMesh"))
+				appPrintf("SCDA Xbox skeletal manifest mapping: %s.%s <- %s logical=%08X size=%X\n",
+					*Record.Filename, *Payload.ObjectName, *Payload.SourceFilename,
+					Payload.SourceLogicalOffset, PhysicalSize);
+			// Older manifests treated small skeletal exports as physically inline
+			// at header + virtual offset. Those bytes are often another resource.
+			// Keep these rows only when they actually start with a native mesh box,
+			// sphere and version; otherwise leave the export unmapped.
+			if (Payload.ExportIndex >= 0 && Payload.ExportIndex < Header.Exports.Num() &&
+				!stricmp(*Header.Exports[Payload.ExportIndex].ClassName, "SkeletalMesh") &&
+				!stricmp(*Payload.SourceFilename, *Record.SourceFilename) &&
+				Payload.SourceLogicalOffset == Record.HeaderOffset + Payload.VirtualOffset)
+			{
+				const byte* Body = PayloadData->GetData() + Payload.SourceLogicalOffset;
+				bool ValidNativeRoot = PhysicalSize >= 51 && Body[24] == 1;
+				int NativeVersion = 0;
+				if (ValidNativeRoot)
+				{
+					memcpy(&NativeVersion, Body + 41, 4);
+					ValidNativeRoot = NativeVersion == 3 || NativeVersion == 4;
+					for (int Axis = 0; Axis < 3 && ValidNativeRoot; Axis++)
+					{
+						float Low, High;
+						memcpy(&Low, Body + Axis * 4, 4);
+						memcpy(&High, Body + 12 + Axis * 4, 4);
+						ValidNativeRoot = Low == Low && High == High &&
+							fabs(Low) < 1000000 && fabs(High) < 1000000 && Low <= High;
+					}
+				}
+				if (!ValidNativeRoot)
+				{
+					appPrintf("SCDA Xbox skeletal payload rejected: %s.%s has an unverified inline offset\n",
+						*Record.Filename, *Payload.ObjectName);
+					continue;
+				}
+			}
 			// Explicit manifest payloads are authoritative. Package initialization
 			// may have installed a provisional direct-map or synthetic stub at the
 			// same virtual export offset; replace it instead of silently keeping it.
@@ -4287,9 +4836,19 @@ protected:
 				if (Packages[Index].Segments[SegmentIndex].VirtualOffset == Payload.VirtualOffset)
 					Packages[Index].Segments.RemoveAt(SegmentIndex);
 			}
-			AddScdaLinSegment(Packages[Index], Payload.VirtualOffset,
-				PayloadData->GetData() + Payload.SourceLogicalOffset, Payload.Size,
-				*Payload.SourceFilename, Payload.SourceLogicalOffset);
+			if (PhysicalSize == Payload.Size)
+				AddScdaLinSegment(Packages[Index], Payload.VirtualOffset,
+					PayloadData->GetData() + Payload.SourceLogicalOffset, Payload.Size,
+					*Payload.SourceFilename, Payload.SourceLogicalOffset);
+			else
+			{
+				TArray<byte> Padded;
+				Padded.AddZeroed(Payload.Size);
+				memcpy(Padded.GetData(), PayloadData->GetData() + Payload.SourceLogicalOffset, PhysicalSize);
+				AddScdaLinSegment(Packages[Index], Payload.VirtualOffset,
+					Padded.GetData(), Payload.Size,
+					*Payload.SourceFilename, Payload.SourceLogicalOffset);
+			}
 		}
 		for (FScdaV2ManifestAnimationDataRecord& AnimData : Record.AnimationData)
 		{

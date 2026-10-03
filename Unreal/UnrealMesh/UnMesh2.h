@@ -1409,6 +1409,7 @@ public:
 	void SerializePandora(FArchive &Ar);
 	void SerializeSCCT(FArchive &Ar);
 	void SerializeSC4(FArchive &Ar);
+	void SerializeSCDAXbox(FArchive &Ar);
 #endif
 #if UNREAL1
 	void Upgrade();
@@ -1428,6 +1429,21 @@ public:
 	virtual void Serialize(FArchive &Ar)
 	{
 		guard(UMeshAnimation.Serialize);
+#if SPLINTER_CELL
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 158 && Ar.ArLicenseeVer <= 167)
+		{
+			// SCDA PC v1 animation payloads are not standard UE2 properties or SC4 motion chunks.
+			// Keep an escape hatch while the native raw-track reader is being improved.
+			if (getenv("SCDA_SKIP_DEMO_ANIM"))
+			{
+				if (getenv("SCDA_DEBUG_ANIM"))
+					appPrintf("SCDA PC v1 MeshAnimation %s: skipped body pos=%08X stopper=%08X\n",
+						Name, Ar.Tell(), Ar.GetStopper());
+				DROP_REMAINING_DATA(Ar);
+				return;
+			}
+		}
+#endif
 		Super::Serialize(Ar);
 		if (Ar.Game >= GAME_UE2)
 			Ar << Version;					// no such field in UE1
@@ -1439,10 +1455,23 @@ public:
 			ConvertAnims();
 			return;
 		}
+		if (Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 158 && Ar.ArLicenseeVer <= 167 &&
+			!getenv("SCDA_USE_SC4_DEMO_ANIM"))
+		{
+			SerializeSCCT(Ar);
+			ConvertAnims();
+			return;
+		}
 		if (Ar.Game == GAME_SplinterCell && (
 			(Ar.ArVer >= 173 && Ar.ArVer <= 275 && Ar.ArLicenseeVer == 0) ||
 			(Ar.ArVer == 100 && Ar.ArLicenseeVer >= 127)))
 		{
+			if (Ar.ArVer == 100 && Ar.ArLicenseeVer == 127 && RefBones.Num())
+			{
+				SerializeSCDAXbox(Ar);
+				ConvertAnims();
+				return;
+			}
 			if (getenv("SCDA_USE_SCCT_ANIM"))
 			{
 				SerializeSCCT(Ar);

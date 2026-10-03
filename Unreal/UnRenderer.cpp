@@ -1743,7 +1743,9 @@ void UUnreal3Material::SetupGL()
 
 static bool IsSCDAOnlinePackage(const UnPackage* Package)
 {
-	return Package && Package->Game == GAME_SplinterCell && Package->ArVer >= 173 && Package->ArLicenseeVer == 0;
+	return Package && Package->Game == GAME_SplinterCell &&
+		((Package->ArVer >= 173 && Package->ArLicenseeVer == 0) ||
+		(Package->ArVer == 100 && Package->ArLicenseeVer >= 165 && Package->ArLicenseeVer <= 167));
 }
 
 static void SCDA_NormalizeMaterialToken(const char* Src, char* Dst, int DstSize)

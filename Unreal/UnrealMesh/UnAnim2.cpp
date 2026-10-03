@@ -10,6 +10,10 @@
 #include "TypeConvert.h"
 
 #if SPLINTER_CELL
+#include "lzo/lzo1x.h"
+#endif
+
+#if SPLINTER_CELL
 static bool IsSCCTFaceSequenceName(const char *Name);
 #endif
 
@@ -63,10 +67,32 @@ void UMeshAnimation::ConvertAnims()
 			CAnimTrack* T = new CAnimTrack;
 			S.Tracks.Add(T);
 
-			const AnalogTrack &A = M.AnimTracks[j];
-			CopyArray(T->KeyPos,  CVT(A.KeyPos));
-			CopyArray(T->KeyQuat, CVT(A.KeyQuat));
-			CopyArray(T->KeyTime, A.KeyTime);
+			const AnalogTrack *A = NULL;
+			if (M.BoneIndices.Num() == numBones)
+			{
+				int TrackIndex = M.BoneIndices[j];
+				if (M.AnimTracks.IsValidIndex(TrackIndex))
+					A = &M.AnimTracks[TrackIndex];
+			}
+			else if (M.BoneIndices.Num() == M.AnimTracks.Num())
+			{
+				for (int TrackIndex = 0; TrackIndex < M.BoneIndices.Num(); TrackIndex++)
+				{
+					if (M.BoneIndices[TrackIndex] == j)
+					{
+						A = &M.AnimTracks[TrackIndex];
+						break;
+					}
+				}
+			}
+			if (!A && M.BoneIndices.Num() != numBones && M.AnimTracks.IsValidIndex(j))
+				A = &M.AnimTracks[j];
+			if (A)
+			{
+				CopyArray(T->KeyPos,  CVT(A->KeyPos));
+				CopyArray(T->KeyQuat, CVT(A->KeyQuat));
+				CopyArray(T->KeyTime, A->KeyTime);
+			}
 			// usually MotionChunk.TrackTime is identical to NumFrames, but some packages exists where
 			// time channel should be adjusted
 			if (M.TrackTime > 0)
@@ -754,6 +780,388 @@ static bool LoadSCDAV2ManifestSequences(UMeshAnimation& Anim, const TArray<byte>
 	unguard;
 }
 
+// Xbox V2 keeps the bone tracks in an LZO1X block at the end of each move.
+// The three lengths in each packed track are byte lengths (time, rotation,
+// translation), not TArray element counts. The source executable uses the
+// same LZO1X stream terminator as the library bundled with Umodel.
+static FQuat DecodeSCDAXboxQuat48(const byte* Data)
+{
+	uint16 Packed[3];
+	memcpy(Packed, Data, sizeof(Packed));
+	const float Scale = 1.41421356237f / 32767.0f;
+	const float Shift = 0.70710678118f;
+	float C[4] = { 0, 0, 0, 0 };
+	int Missing = ((Packed[0] >> 15) & 1) | ((Packed[1] >> 14) & 2);
+	float Values[3] = {
+		(Packed[0] & 0x7FFF) * Scale - Shift,
+		(Packed[1] & 0x7FFF) * Scale - Shift,
+		(Packed[2] & 0x7FFF) * Scale - Shift,
+	};
+	int Slot = 0;
+	for (int i = 0; i < 4; i++)
+		if (i != Missing)
+			C[i] = Values[Slot++];
+	float MissingSq = 1.0f - (Values[0] * Values[0] +
+		Values[1] * Values[1] + Values[2] * Values[2]);
+	C[Missing] = MissingSq > 0 ? sqrt(MissingSq) : 0;
+	FQuat Q;
+	Q.Set(C[0], C[1], C[2], C[3]);
+	return Q;
+}
+
+static FQuat DecodeSCDAXboxQuat32(const byte* Data)
+{
+	uint32 Packed;
+	memcpy(&Packed, Data, 4);
+	int Missing = (Packed >> 30) & 3;
+	const float Scale = 1.41421356237f / 1023.0f;
+	const float Shift = 0.70710678118f;
+	float Values[3] = {
+		(Packed & 0x3FF) * Scale - Shift,
+		((Packed >> 10) & 0x3FF) * Scale - Shift,
+		((Packed >> 20) & 0x3FF) * Scale - Shift,
+	};
+	float C[4] = { 0, 0, 0, 0 };
+	int Slot = 0;
+	for (int i = 0; i < 4; i++)
+		if (i != Missing)
+			C[i] = Values[2 - Slot++];
+	float MissingSq = 1.0f;
+	for (int i = 0; i < 4; i++)
+		MissingSq -= C[i] * C[i];
+	C[Missing] = MissingSq > 0 ? sqrt(MissingSq) : 0;
+	FQuat Q;
+	Q.Set(C[0], C[1], C[2], C[3]);
+	return Q;
+}
+
+static void DecodeSCDAXboxTrack(AnalogTrack& Track, const byte* Data,
+	int TimeSize, int QuatSize, int PosSize, int Frames, int Format)
+{
+	guard(DecodeSCDAXboxTrack);
+	// The two low bits select rotation and translation packing separately.
+	// 0 = quat48/pos16, 1 = quat32/pos16, 2 = quat48/float32,
+	// 3 = quat32/float32.
+	const int QuatStride = (Format & 1) ? 4 : 6;
+	const int PosStride = (Format & 2) ? 12 : 6;
+	const int QuatCount = QuatSize / QuatStride;
+	const int PosCount = PosSize / PosStride;
+	if (TimeSize < 0 || TimeSize > 4096 ||
+		(QuatSize && (QuatSize % QuatStride || (QuatCount != 1 && QuatCount < TimeSize))) ||
+		(PosSize && (PosSize % PosStride || (PosCount != 1 && PosCount < TimeSize))))
+		appError("Invalid SCDA Xbox packed animation track lengths");
+	if (!TimeSize && (QuatSize || PosSize))
+		appError("SCDA Xbox track has keys without times");
+	Track.Flags = 0;
+	for (int i = 0; i < TimeSize; i++)
+	{
+		if (i && Data[i] < Data[i - 1])
+			appError("SCDA Xbox animation key times are not sorted");
+		if (Data[i] >= Frames)
+			appError("SCDA Xbox animation key exceeds sequence frames");
+		Track.KeyTime.Add((float)Data[i]);
+	}
+	const byte* Quats = Data + TimeSize;
+	// Some resident constant tracks retain spare key storage. The time list
+	// defines the valid key count; a single rotation/position is also constant.
+	for (int i = 0; i < min(QuatCount, TimeSize); i++)
+		Track.KeyQuat.Add((Format & 1) ?
+			DecodeSCDAXboxQuat32(Quats + i * QuatStride) :
+			DecodeSCDAXboxQuat48(Quats + i * QuatStride));
+	for (int i = 1; i < Track.KeyQuat.Num(); i++)
+	{
+		FQuat& Current = Track.KeyQuat[i];
+		const FQuat& Previous = Track.KeyQuat[i - 1];
+		if (Current.X * Previous.X + Current.Y * Previous.Y +
+			Current.Z * Previous.Z + Current.W * Previous.W < 0)
+		{
+			Current.X = -Current.X;
+			Current.Y = -Current.Y;
+			Current.Z = -Current.Z;
+			Current.W = -Current.W;
+		}
+	}
+	const byte* Positions = Quats + QuatSize;
+	// Match Xbox V2 animation translations to the mesh's coordinate scale.
+	const float TranslationScale = 2.0f / 3.0f;
+	for (int i = 0; i < min(PosCount, TimeSize); i++)
+	{
+		FVector V;
+		if (!(Format & 2))
+		{
+			int16 Packed[3];
+			memcpy(Packed, Positions + i * PosStride, sizeof(Packed));
+			V.Set(Packed[0] / 64.0f, Packed[1] / 64.0f, Packed[2] / 64.0f);
+		}
+		else
+			memcpy(&V, Positions + i * PosStride, sizeof(float) * 3);
+		if (!(V.X > -1000000 && V.X < 1000000 &&
+			V.Y > -1000000 && V.Y < 1000000 &&
+			V.Z > -1000000 && V.Z < 1000000))
+			appError("Invalid SCDA Xbox animation position");
+		V.X *= TranslationScale;
+		V.Y *= TranslationScale;
+		V.Z *= TranslationScale;
+		Track.KeyPos.Add(V);
+	}
+	unguard;
+}
+
+static void ReadSCDAXboxPackedTrack(FArchive& Ar, AnalogTrack& Track, int Frames)
+{
+	guard(ReadSCDAXboxPackedTrack);
+	uint16 TimeSize, QuatSize, PosSize;
+	Ar << TimeSize << QuatSize << PosSize;
+	int Total = int(TimeSize) + QuatSize + PosSize;
+	if (Total > 0x100000 || Ar.Tell() + Total > Ar.GetStopper())
+		appError("SCDA Xbox packed animation track exceeds export");
+	TArray<byte> Data;
+	Data.AddUninitialized(Total);
+	if (Total)
+	{
+		Ar.Serialize(Data.GetData(), Total);
+		// Inline root tracks use quat48 and float32 positions independently
+		// of the packing flags used by the external bone-track block.
+		DecodeSCDAXboxTrack(Track, Data.GetData(), TimeSize, QuatSize, PosSize, Frames, 2);
+	}
+	unguard;
+}
+
+struct FSCDAXboxSequenceHeader
+{
+	int NameIndex, GroupIndex, StartFrame, Frames;
+	float Rate;
+};
+
+static bool ReadSCDAXboxIndex(const byte* Data, int Size, int& Pos, int& Value)
+{
+	if (Pos >= Size) return false;
+	byte First = Data[Pos++];
+	unsigned int Raw = First & 0x3F;
+	if (First & 0x40)
+	{
+		int Shift = 6;
+		for (int i = 1; i < 5; i++, Shift += 7)
+		{
+			if (Pos >= Size) return false;
+			byte Next = Data[Pos++];
+			Raw |= unsigned(Next & 0x7F) << Shift;
+			if (!(Next & 0x80)) break;
+			if (i == 4) return false;
+		}
+	}
+	Value = (First & 0x80) ? -int(Raw) : int(Raw);
+	return true;
+}
+
+static bool ReadSCDAXboxSequenceHeader(const byte* Data, int Size, int Start,
+	UnPackage* Package, FSCDAXboxSequenceHeader& Header, int& End)
+{
+	int Pos = Start, GroupExtra, NotifyCount;
+	const int NameCount = Package->Summary.NameCount;
+	if (!ReadSCDAXboxIndex(Data, Size, Pos, Header.NameIndex) ||
+		!ReadSCDAXboxIndex(Data, Size, Pos, Header.GroupIndex) ||
+		!ReadSCDAXboxIndex(Data, Size, Pos, GroupExtra) ||
+		Header.NameIndex <= 0 || Header.NameIndex >= NameCount ||
+		Header.GroupIndex < 0 || Header.GroupIndex >= NameCount || GroupExtra < 0 ||
+		Pos > Size - 8)
+		return false;
+	const char* Name = Package->GetName(Header.NameIndex);
+	if (!strcmp(Name, "B") || !strncmp(Name, "B ", 2) ||
+		!strncmp(Name, "BF ", 3) || !strncmp(Name, "BR ", 3))
+		return false;
+	memcpy(&Header.StartFrame, Data + Pos, 4);
+	memcpy(&Header.Frames, Data + Pos + 4, 4);
+	Pos += 8;
+	if (Header.StartFrame < 0 || Header.Frames < 1 || Header.Frames > 4096 ||
+		Header.StartFrame > Header.Frames ||
+		!ReadSCDAXboxIndex(Data, Size, Pos, NotifyCount) ||
+		NotifyCount < 0 || NotifyCount > 1024)
+		return false;
+	for (int i = 0; i < NotifyCount; i++)
+	{
+		float Time;
+		int FunctionIndex, FunctionExtra, ObjectIndex;
+		if (Pos > Size - 4) return false;
+		memcpy(&Time, Data + Pos, 4);
+		Pos += 4;
+		if (!(Time >= -0.001f && Time <= 4096) ||
+			!ReadSCDAXboxIndex(Data, Size, Pos, FunctionIndex) ||
+			!ReadSCDAXboxIndex(Data, Size, Pos, FunctionExtra) ||
+			!ReadSCDAXboxIndex(Data, Size, Pos, ObjectIndex))
+			return false;
+	}
+	if (Pos > Size - 4) return false;
+	memcpy(&Header.Rate, Data + Pos, 4);
+	Pos += 4;
+	if (!(Header.Rate >= 1 && Header.Rate <= 120)) return false;
+	End = Pos;
+	return true;
+}
+
+void UMeshAnimation::SerializeSCDAXbox(FArchive& Ar)
+{
+	guard(UMeshAnimation::SerializeSCDAXbox);
+	int MoveCount;
+	Ar << AR_INDEX(MoveCount);
+	if (MoveCount < 0 || MoveCount > 1024 || RefBones.Num() > 512)
+		appError("Invalid SCDA Xbox animation dimensions");
+	Moves.Empty(MoveCount);
+	Moves.AddZeroed(MoveCount);
+	for (int MoveIndex = 0; MoveIndex < MoveCount; MoveIndex++)
+	{
+		MotionChunk& Move = Moves[MoveIndex];
+		float Frames;
+		int StartBone, Format;
+		Ar << Frames << StartBone << Format;
+		if (!(Frames >= 1 && Frames <= 4096) || StartBone != 0 || Format < 0 || Format > 3)
+			appError("Invalid SCDA Xbox move header");
+		Move.RootSpeed3D.Set(0, 0, 0);
+		Move.TrackTime = Frames;
+		Move.StartBone = 0;
+		Move.Flags = 0;
+		uint16 MainSize[3];
+		Ar << MainSize[0] << MainSize[1] << MainSize[2];
+		int MainBytes = int(MainSize[0]) + MainSize[1] + MainSize[2];
+		if (MainBytes > 0x100000 || Ar.Tell() + MainBytes > Ar.GetStopper())
+			appError("Invalid SCDA Xbox move buffer");
+		Ar.Seek(Ar.Tell() + MainBytes);
+		int RootTrackCount;
+		Ar << AR_INDEX(RootTrackCount);
+		if (RootTrackCount < 0 || RootTrackCount > 32)
+			appError("Invalid SCDA Xbox root-track count");
+		for (int i = 0; i < RootTrackCount; i++)
+		{
+			if (i == 0)
+				ReadSCDAXboxPackedTrack(Ar, Move.RootTrack, appRound(Frames));
+			else
+			{
+				AnalogTrack ExtraTrack;
+				ReadSCDAXboxPackedTrack(Ar, ExtraTrack, appRound(Frames));
+			}
+		}
+		int CompressedSize;
+		Ar << CompressedSize;
+		if (CompressedSize <= 0 || CompressedSize > 8 * 1024 * 1024 ||
+			Ar.Tell() + CompressedSize > Ar.GetStopper())
+			appError("Invalid SCDA Xbox external animation block");
+		TArray<byte> Compressed;
+		Compressed.AddUninitialized(CompressedSize);
+		Ar.Serialize(Compressed.GetData(), CompressedSize);
+		TArray<byte> Raw;
+		Raw.AddUninitialized(8 * 1024 * 1024);
+		lzo_uint RawSize = Raw.Num();
+		int Result = lzo1x_decompress_safe(Compressed.GetData(), CompressedSize,
+			Raw.GetData(), &RawSize, NULL);
+		if (Result != LZO_E_OK || RawSize < 4)
+			appError("Unable to decompress SCDA Xbox animation block");
+		const byte* Bytes = Raw.GetData();
+		uint32 TrackCount;
+		memcpy(&TrackCount, Bytes, 4);
+		if (TrackCount < (uint32)RefBones.Num() || TrackCount > 1024 || 4 + TrackCount * 12 > RawSize)
+			appError("SCDA Xbox bone-track count differs from skeleton");
+		Move.BoneIndices.AddZeroed(RefBones.Num());
+		Move.AnimTracks.AddZeroed(RefBones.Num());
+		int DataPos = 4 + TrackCount * 12;
+		for (int BoneIndex = 0; BoneIndex < (int)TrackCount; BoneIndex++)
+		{
+			const byte* Descriptor = Bytes + 4 + BoneIndex * 12;
+			uint16 Sizes[4];
+			memcpy(Sizes, Descriptor, sizeof(Sizes));
+			int Total = int(Sizes[0]) + Sizes[1] + Sizes[2];
+			if (Sizes[3] != Total || DataPos > (int)RawSize - Total)
+				appError("Invalid SCDA Xbox bone-track descriptor");
+			// The bone table can omit trailing attachment bones present in the
+			// track block. Consume and validate them without binding them to a
+			// different skeleton bone. Empty capacity slots also occur here.
+			if (BoneIndex >= RefBones.Num())
+			{
+				if (Total)
+				{
+					AnalogTrack UnboundTrack;
+					DecodeSCDAXboxTrack(UnboundTrack, Bytes + DataPos,
+						Sizes[0], Sizes[1], Sizes[2], appRound(Frames), Format);
+				}
+				DataPos += Total;
+				continue;
+			}
+			Move.BoneIndices[BoneIndex] = BoneIndex;
+			if (Total)
+				DecodeSCDAXboxTrack(Move.AnimTracks[BoneIndex], Bytes + DataPos,
+					Sizes[0], Sizes[1], Sizes[2], appRound(Frames), Format);
+			DataPos += Total;
+		}
+		if (DataPos != (int)RawSize)
+			appError("SCDA Xbox animation block has unmatched track bytes");
+	}
+	int SequenceCount;
+	Ar << AR_INDEX(SequenceCount);
+	if (SequenceCount != MoveCount)
+		appError("SCDA Xbox animation move/sequence count mismatch");
+	int SequenceBytes = Ar.GetStopper() - Ar.Tell();
+	if (SequenceBytes < 0 || SequenceBytes > 8 * 1024 * 1024)
+		appError("Invalid SCDA Xbox sequence data size");
+	TArray<byte> SequenceData;
+	SequenceData.AddUninitialized(SequenceBytes);
+	if (SequenceBytes)
+		Ar.Serialize(SequenceData.GetData(), SequenceBytes);
+	AnimSeqs.Empty(SequenceCount);
+	TArray<FSCDAXboxSequenceHeader> Headers;
+	TArray<int> NextCandidates, SequenceEnds;
+	Headers.AddZeroed(SequenceCount);
+	NextCandidates.AddZeroed(SequenceCount);
+	SequenceEnds.AddZeroed(SequenceCount);
+	int SeqIndex = 0;
+	while (SeqIndex < SequenceCount)
+	{
+		int Start = SeqIndex ? SequenceEnds[SeqIndex - 1] : 0;
+		int Candidate = max(Start, NextCandidates[SeqIndex]);
+		int End = 0;
+		// Version 99 has two variable-length auxiliary arrays after each
+		// sequence. Match the generator's complete-chain search: a notify or
+		// auxiliary record can imitate a header, so backtrack if it leads nowhere.
+		int Limit = SeqIndex ? min(Start + 8192, SequenceBytes) : 1;
+		for (; Candidate < Limit; Candidate++)
+			if (ReadSCDAXboxSequenceHeader(SequenceData.GetData(), SequenceBytes,
+				Candidate, Package, Headers[SeqIndex], End))
+				break;
+		if (Candidate >= Limit)
+		{
+			if (!SeqIndex)
+				appError("Unable to locate SCDA Xbox animation sequence");
+			SeqIndex--;
+			continue;
+		}
+		NextCandidates[SeqIndex] = Candidate + 1;
+		SequenceEnds[SeqIndex] = End;
+		SeqIndex++;
+		if (SeqIndex < SequenceCount)
+			NextCandidates[SeqIndex] = End;
+	}
+	for (SeqIndex = 0; SeqIndex < SequenceCount; SeqIndex++)
+	{
+		const FSCDAXboxSequenceHeader& Header = Headers[SeqIndex];
+		FMeshAnimSeq* Seq = new (AnimSeqs) FMeshAnimSeq;
+		Seq->f28 = 0;
+		Seq->Name = Package->GetName(Header.NameIndex);
+		Seq->StartFrame = Header.StartFrame;
+		Seq->NumFrames = Header.Frames;
+		Seq->Rate = Header.Rate;
+		if (Header.GroupIndex)
+		{
+			FName* Group = new (Seq->Groups) FName;
+			*Group = Package->GetName(Header.GroupIndex);
+		}
+	}
+	if (getenv("SCDA_DEBUG_ANIM"))
+		appPrintf("SCDA Xbox MeshAnimation %s: bones=%d moves=%d sequences=%d end=%08X\n",
+			Name, RefBones.Num(), Moves.Num(), AnimSeqs.Num(), Ar.Tell());
+	// Linear loading omits some original export bytes. The manifest reserves the
+	// original virtual size, which may extend beyond this native stream.
+	DROP_REMAINING_DATA(Ar);
+	unguard;
+}
+
 void UMeshAnimation::SerializeSC4(FArchive &Ar)
 {
 	guard(UMeshAnimation::SerializeSC4);
@@ -878,6 +1286,15 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 {
 	guard(UMeshAnimation::SerializeSCCT);
 
+	const bool bScdaPcV1Demo = Ar.Game == GAME_SplinterCell && Ar.ArVer == 100 && Ar.ArLicenseeVer >= 158 && Ar.ArLicenseeVer <= 167;
+	if (bScdaPcV1Demo && getenv("SCCT_DEBUG_BONES"))
+	{
+		appPrintf("SCDA demo MeshAnimation %s bones=%d\n", Name, RefBones.Num());
+		for (int BoneIndex = 0; BoneIndex < RefBones.Num(); BoneIndex++)
+			appPrintf("  bone %d name=%s flags=%08X parent=%d\n",
+				BoneIndex, *RefBones[BoneIndex].Name, RefBones[BoneIndex].Flags, RefBones[BoneIndex].ParentIndex);
+	}
+
 	struct FSCCTSeqInfo
 	{
 		int Pos;
@@ -946,6 +1363,72 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		{
 			Ar.Seek(SavePos);
 			return false;
+		}
+
+		if (bScdaPcV1Demo)
+		{
+			int NameExtra;
+			Ar << AR_INDEX(NameExtra);
+			if (NameExtra < 0 || NameExtra > 10000)
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+
+			int StartFrame, NumFrames;
+			Ar << StartFrame << NumFrames;
+			if (StartFrame < 0 || StartFrame > 100000 || NumFrames <= 0 || NumFrames > 10000)
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			if (ExpectedFrames > 1 && abs(NumFrames - ExpectedFrames) > 1)
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+
+			int NotifyCount;
+			Ar << AR_INDEX(NotifyCount);
+			if (NotifyCount < 0 || NotifyCount > 512 || Ar.Tell() + NotifyCount * 8 + 4 > Ar.GetStopper())
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			for (int NotifyIndex = 0; NotifyIndex < NotifyCount; NotifyIndex++)
+			{
+				float NotifyTime;
+				Ar << NotifyTime;
+				if (NotifyTime < -0.001f || NotifyTime > NumFrames + 0.001f)
+				{
+					Ar.Seek(SavePos);
+					return false;
+				}
+				Ar.Seek(Ar.Tell() + 4);
+			}
+
+			float SerializedRate;
+			Ar << SerializedRate;
+			if (SerializedRate < 1.0f || SerializedRate > 120.0f)
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+
+			int ExtraSize = -1;
+			if (Ar.Tell() + 4 <= Ar.GetStopper())
+				Ar << ExtraSize;
+
+			Seq.Pos = Pos;
+			Seq.End = Ar.Tell();
+			Seq.NameIndex = NameIndex;
+			Seq.StartFrame = StartFrame;
+			Seq.NumFrames = NumFrames;
+			Seq.NotifyCount = NotifyCount;
+			Seq.Rate = SerializedRate;
+			Seq.ExtraSize = ExtraSize;
+			Ar.Seek(SavePos);
+			return true;
 		}
 
 		int GroupCount;
@@ -1066,11 +1549,11 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		int Missing = SelectorMap[Selector];
 		unsigned Data = Packed & 0x3FFFFFFF;
 		static const float Shift = 0.70710678118f;
-		static const float Scale = 1.41421356237f;
+		static const float Scale = 1.41421356237f / 1023.0f;
 		float Raw[3];
-		Raw[0] = ((Data & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
-		Raw[1] = (((Data >> 10) & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
-		Raw[2] = (((Data >> 20) & 0x3FF) + 0.5f) / 1024.0f * Scale - Shift;
+		Raw[0] = (Data & 0x3FF) * Scale - Shift;
+		Raw[1] = ((Data >> 10) & 0x3FF) * Scale - Shift;
+		Raw[2] = ((Data >> 20) & 0x3FF) * Scale - Shift;
 		float C[4] = { 0, 0, 0, 0 };
 		int Slot = 0;
 		for (int i = 0; i < 4; i++)
@@ -1129,13 +1612,19 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		V.Z = Packed[2] * Scale;
 		return V;
 	};
-	auto SerializeSCCTRawTrack = [&](AnalogTrack &Track, int NumFrames, int CompressType, bool KeepPositionKeys, bool KeepConstantPositionKeys, bool MirrorPositionY, float PosScale) -> bool
+	auto SerializeSCCTRawTrack = [&](AnalogTrack &Track, int NumFrames, int CompressType, int TimePrefixBytes, bool KeepPositionKeys, bool KeepConstantPositionKeys, bool MirrorPositionY, float PosScale) -> bool
 	{
 		uint16 NumKeys, RotSize, PosSize;
 		Ar << NumKeys << RotSize << PosSize;
+		uint16 ScaleSize = 0;
+		if (TimePrefixBytes == 2)
+			Ar << ScaleSize;
+		else if (TimePrefixBytes > 0)
+			Ar.Seek(Ar.Tell() + TimePrefixBytes);
 		if (NumKeys < 1 || NumKeys > 10000 ||
 			(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
-			(PosSize != 6 && PosSize != NumKeys * 6))
+			(PosSize != 6 && PosSize != NumKeys * 6) ||
+			(ScaleSize != 0 && ScaleSize != 12 && ScaleSize != NumKeys * 12))
 			return false;
 		int RotStride = (RotSize == 6 || RotSize == NumKeys * 6) ? 6 : 4;
 		int RotKeys = RotSize / RotStride;
@@ -1194,6 +1683,8 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			if (KeepPositionKeys && (KeepConstantPositionKeys || PosKeys > 1))
 				Track.KeyPos.Add(DecodeSCCTVector(PackedPos, PosScale, MirrorPositionY));
 		}
+		if (ScaleSize)
+			Ar.Seek(Ar.Tell() + ScaleSize);
 		int UsedKeys = max(Track.KeyQuat.Num(), Track.KeyPos.Num());
 		if (UsedKeys > 0 && Track.KeyTime.Num() > UsedKeys)
 			Track.KeyTime.RemoveAt(UsedKeys, Track.KeyTime.Num() - UsedKeys);
@@ -1376,6 +1867,10 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 	MoveRawKeyCounts.Empty(SeqCount);
 	TArray<int> MoveRawFrameSpans;
 	MoveRawFrameSpans.Empty(SeqCount);
+	TArray<int> MoveRawTrackCounts;
+	MoveRawTrackCounts.Empty(SeqCount);
+	TArray<int> MoveRawPositions;
+	MoveRawPositions.Empty(SeqCount);
 	auto CopySCCTAnalogTrack = [](AnalogTrack &Dst, const AnalogTrack &Src)
 	{
 		Dst.Flags = Src.Flags;
@@ -1396,6 +1891,35 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			CopySCCTAnalogTrack(Dst.AnimTracks[TrackIndex], Src.AnimTracks[TrackIndex]);
 		CopySCCTAnalogTrack(Dst.RootTrack, Src.RootTrack);
 	};
+	auto MakeSCCTIdentityMotionChunk = [&](MotionChunk &Dst, int NumFrames)
+	{
+		Dst.RootSpeed3D.Set(0, 0, 0);
+		Dst.TrackTime = max(1, NumFrames);
+		Dst.StartBone = 0;
+		Dst.Flags = 0;
+		Dst.BoneIndices.Empty(RefBones.Num());
+		Dst.BoneIndices.AddZeroed(RefBones.Num());
+		Dst.AnimTracks.Empty(RefBones.Num());
+		Dst.AnimTracks.AddZeroed(RefBones.Num());
+		FQuat IdentityQuat;
+		IdentityQuat.Set(0, 0, 0, 1);
+		FVector IdentityPos;
+		IdentityPos.Set(0, 0, 0);
+		for (int BoneIndex = 0; BoneIndex < RefBones.Num(); BoneIndex++)
+		{
+			Dst.BoneIndices[BoneIndex] = BoneIndex;
+			AnalogTrack &Track = Dst.AnimTracks[BoneIndex];
+			Track.Flags = 0;
+			Track.KeyQuat.Add(IdentityQuat);
+			Track.KeyTime.Add(0.0f);
+			if (BoneIndex == 0)
+				Track.KeyPos.Add(IdentityPos);
+		}
+		Dst.RootTrack.Flags = 0;
+		Dst.RootTrack.KeyQuat.Empty();
+		Dst.RootTrack.KeyPos.Empty();
+		Dst.RootTrack.KeyTime.Empty();
+	};
 	auto MergeSCCTRootCompanion = [&](MotionChunk &Dst, const MotionChunk &RootSrc)
 	{
 		if (!RootSrc.AnimTracks.Num() || !Dst.AnimTracks.Num())
@@ -1409,10 +1933,11 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 	int PendingRootKeyCount = 1;
 	int PendingRootFrameSpan = 1;
 	bool bHasPendingRootCompanion = false;
+	bool bDemoSawPrimaryMotion = false;
 	int TotalTracks = 0;
 	int MotionSearchPos = PayloadStart;
 	int MotionDataEnd = SeqCandidates.Num() ? SeqCandidates[0].Pos : Ar.GetStopper();
-	int MaxRawMoves = SeqCount + min(64, SeqCount / 8 + 16);
+	int MaxRawMoves = bScdaPcV1Demo ? (SeqCount * 3 + 256) : (SeqCount + min(64, SeqCount / 8 + 16));
 	auto IsPlausibleInlineSCCTTracks = [&](int Pos, int SeqIndex, int *OutCompressType, bool AllowEmpty) -> bool
 	{
 		if (OutCompressType)
@@ -1537,6 +2062,237 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		Ar.Seek(SavePos);
 		return true;
 	};
+	auto IsPlausibleSCDADemoTrackRun = [&](int Pos, int *OutTrackCount, int *OutEnd) -> bool
+	{
+		if (OutTrackCount)
+			*OutTrackCount = 0;
+		if (OutEnd)
+			*OutEnd = 0;
+		if (!bScdaPcV1Demo || Pos < 0 || Pos + 8 >= Ar.GetStopper())
+			return false;
+		int SavePos = Ar.Tell();
+		int TrackPos = Pos;
+		int TrackCount = 0;
+		int EndPos = TrackPos;
+		for (; TrackCount < 256; TrackCount++)
+		{
+			Ar.Seek(TrackPos);
+			uint16 NumKeys, RotSize, PosSize, ScaleSize;
+			Ar << NumKeys << RotSize << PosSize << ScaleSize;
+			if (NumKeys < 1 || NumKeys > 10000 ||
+				(RotSize != 4 && RotSize != NumKeys * 4 && RotSize != 6 && RotSize != NumKeys * 6) ||
+				(PosSize != 6 && PosSize != NumKeys * 6) ||
+				(ScaleSize != 0 && ScaleSize != 12 && ScaleSize != NumKeys * 12))
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			EndPos = TrackPos + 8 + NumKeys + RotSize + PosSize + ScaleSize;
+			if (EndPos > Ar.GetStopper())
+			{
+				Ar.Seek(SavePos);
+				return false;
+			}
+			int NextTrackPos = EndPos;
+			if (NextTrackPos + 6 > Ar.GetStopper())
+				break;
+			Ar.Seek(NextTrackPos);
+			uint16 NextNumKeys, NextRotSize, NextPosSize, NextScaleSize;
+			Ar << NextNumKeys << NextRotSize << NextPosSize << NextScaleSize;
+			if (NextNumKeys < 1 || NextNumKeys > 10000 ||
+				(NextRotSize != 4 && NextRotSize != NextNumKeys * 4 && NextRotSize != 6 && NextRotSize != NextNumKeys * 6) ||
+				(NextPosSize != 6 && NextPosSize != NextNumKeys * 6) ||
+				(NextScaleSize != 0 && NextScaleSize != 12 && NextScaleSize != NextNumKeys * 12))
+				break;
+			TrackPos = NextTrackPos;
+		}
+		TrackCount++;
+		if (TrackCount < 2)
+		{
+			Ar.Seek(SavePos);
+			return false;
+		}
+		if (OutTrackCount)
+			*OutTrackCount = TrackCount;
+		if (OutEnd)
+			*OutEnd = EndPos;
+		Ar.Seek(SavePos);
+		return true;
+	};
+	auto BuildSCDADemoTrackBoneMap = [&](int TrackPos, int TrackCount, TArray<int> &OutBoneIndices) -> bool
+	{
+		OutBoneIndices.Empty();
+		if (!bScdaPcV1Demo || TrackCount <= 0 || !RefBones.Num())
+			return false;
+
+		auto IsDescendantOfBone = [&](int BoneIndex, int AncestorIndex) -> bool
+		{
+			for (int ParentIndex = RefBones[BoneIndex].ParentIndex; ParentIndex > 0 && ParentIndex < RefBones.Num(); ParentIndex = RefBones[ParentIndex].ParentIndex)
+			{
+				if (ParentIndex == AncestorIndex)
+					return true;
+			}
+			return false;
+		};
+		TArray<int> ChildCounts;
+		ChildCounts.AddZeroed(RefBones.Num());
+		for (int BoneIndex = 1; BoneIndex < RefBones.Num(); BoneIndex++)
+		{
+			int ParentIndex = RefBones[BoneIndex].ParentIndex;
+			if (ParentIndex >= 0 && ParentIndex < RefBones.Num())
+				ChildCounts[ParentIndex]++;
+		}
+		int DenseHeadBranch = -1;
+		int DenseHeadChildren = 0;
+		for (int BoneIndex = 1; BoneIndex < RefBones.Num(); BoneIndex++)
+		{
+			if (ChildCounts[BoneIndex] > DenseHeadChildren)
+			{
+				DenseHeadChildren = ChildCounts[BoneIndex];
+				DenseHeadBranch = BoneIndex;
+			}
+		}
+		TArray<int> PrimaryBodyBones;
+		for (int BoneIndex = 0; BoneIndex < RefBones.Num(); BoneIndex++)
+		{
+			if (DenseHeadBranch >= 0 && BoneIndex != DenseHeadBranch && IsDescendantOfBone(BoneIndex, DenseHeadBranch))
+				continue;
+			bool bOptionalLeaf = ChildCounts[BoneIndex] == 0;
+			int ParentIndex = RefBones[BoneIndex].ParentIndex;
+			if (bOptionalLeaf && ParentIndex >= 0 && ParentIndex < RefBones.Num() && ChildCounts[ParentIndex] > 1)
+			{
+				bool bParentHasNonLeafSibling = false;
+				for (int SiblingIndex = 1; SiblingIndex < RefBones.Num(); SiblingIndex++)
+				{
+					if (SiblingIndex != BoneIndex && RefBones[SiblingIndex].ParentIndex == ParentIndex && ChildCounts[SiblingIndex] > 0)
+					{
+						bParentHasNonLeafSibling = true;
+						break;
+					}
+				}
+				if (bParentHasNonLeafSibling)
+					continue;
+			}
+			PrimaryBodyBones.Add(BoneIndex);
+		}
+		TArray<int> DemoCompact39Bones;
+		auto AddUniqueBone = [&](TArray<int> &List, int BoneIndex)
+		{
+			if (BoneIndex < 0 || BoneIndex >= RefBones.Num())
+				return;
+			for (int i = 0; i < List.Num(); i++)
+				if (List[i] == BoneIndex)
+					return;
+			List.Add(BoneIndex);
+		};
+		auto AddCompactBranch = [&](TArray<int> &List, int BranchRoot)
+		{
+			if (BranchRoot < 0 || BranchRoot >= RefBones.Num())
+				return;
+			TArray<int> Stack;
+			Stack.Add(BranchRoot);
+			while (Stack.Num())
+			{
+				int BoneIndex = Stack.Last();
+				Stack.RemoveAt(Stack.Num() - 1);
+				AddUniqueBone(List, BoneIndex);
+				for (int ChildIndex = RefBones.Num() - 1; ChildIndex >= 1; ChildIndex--)
+				{
+					if (RefBones[ChildIndex].ParentIndex != BoneIndex)
+						continue;
+					if (ChildCounts[ChildIndex] == 0 && ChildCounts[BoneIndex] > 1)
+					{
+						bool bHasNonLeafSibling = false;
+						for (int SiblingIndex = 1; SiblingIndex < RefBones.Num(); SiblingIndex++)
+						{
+							if (SiblingIndex != ChildIndex && RefBones[SiblingIndex].ParentIndex == BoneIndex && ChildCounts[SiblingIndex] > 0)
+							{
+								bHasNonLeafSibling = true;
+								break;
+							}
+						}
+						if (bHasNonLeafSibling)
+							continue;
+					}
+					Stack.Add(ChildIndex);
+				}
+			}
+		};
+		if (TrackCount == 39 && DenseHeadBranch >= 0)
+		{
+			int NeckIndex = RefBones[DenseHeadBranch].ParentIndex;
+			int Spine2Index = (NeckIndex >= 0 && NeckIndex < RefBones.Num()) ? RefBones[NeckIndex].ParentIndex : -1;
+			int Spine1Index = (Spine2Index >= 0 && Spine2Index < RefBones.Num()) ? RefBones[Spine2Index].ParentIndex : -1;
+			int SpineIndex = (Spine1Index >= 0 && Spine1Index < RefBones.Num()) ? RefBones[Spine1Index].ParentIndex : -1;
+			int PelvisIndex = (SpineIndex >= 0 && SpineIndex < RefBones.Num()) ? RefBones[SpineIndex].ParentIndex : -1;
+			int RootIndex = (PelvisIndex >= 0 && PelvisIndex < RefBones.Num()) ? RefBones[PelvisIndex].ParentIndex : 0;
+			TArray<int> UpperBranches;
+			if (NeckIndex >= 0 && NeckIndex < RefBones.Num())
+			{
+				for (int ChildIndex = 1; ChildIndex < RefBones.Num(); ChildIndex++)
+				{
+					if (RefBones[ChildIndex].ParentIndex == NeckIndex && ChildIndex != DenseHeadBranch && ChildCounts[ChildIndex] > 0)
+						UpperBranches.Add(ChildIndex);
+				}
+			}
+			TArray<int> LowerBranches;
+			if (PelvisIndex >= 0 && PelvisIndex < RefBones.Num())
+			{
+				for (int ChildIndex = 1; ChildIndex < RefBones.Num(); ChildIndex++)
+				{
+					if (RefBones[ChildIndex].ParentIndex == PelvisIndex && ChildIndex != SpineIndex && ChildCounts[ChildIndex] > 0)
+						LowerBranches.Add(ChildIndex);
+				}
+			}
+			if (UpperBranches.Num() >= 2 && LowerBranches.Num() >= 2)
+			{
+				AddCompactBranch(DemoCompact39Bones, UpperBranches[0]);
+				AddUniqueBone(DemoCompact39Bones, PelvisIndex);
+				AddUniqueBone(DemoCompact39Bones, SpineIndex);
+				AddCompactBranch(DemoCompact39Bones, UpperBranches[1]);
+				AddUniqueBone(DemoCompact39Bones, RootIndex);
+				AddUniqueBone(DemoCompact39Bones, DenseHeadBranch);
+				AddCompactBranch(DemoCompact39Bones, LowerBranches[0]);
+				AddUniqueBone(DemoCompact39Bones, Spine1Index);
+				AddCompactBranch(DemoCompact39Bones, LowerBranches[1]);
+				AddUniqueBone(DemoCompact39Bones, Spine2Index);
+				AddUniqueBone(DemoCompact39Bones, NeckIndex);
+			}
+			if (DemoCompact39Bones.Num() != TrackCount)
+				DemoCompact39Bones.Empty();
+		}
+
+		if (TrackPos >= 4)
+		{
+			int StartBone = 0;
+			int SavePos = Ar.Tell();
+			Ar.Seek(TrackPos - 4);
+			Ar << StartBone;
+			Ar.Seek(SavePos);
+			if (StartBone > 0 && StartBone < RefBones.Num())
+			{
+				const int NumMappedTracks = min(TrackCount, RefBones.Num() - StartBone);
+				OutBoneIndices.AddZeroed(RefBones.Num());
+				for (int BoneIndex = 0; BoneIndex < RefBones.Num(); BoneIndex++)
+					OutBoneIndices[BoneIndex] = -1;
+				for (int TrackIndex = 0; TrackIndex < NumMappedTracks; TrackIndex++)
+					OutBoneIndices[StartBone + TrackIndex] = TrackIndex;
+				return NumMappedTracks > 0;
+			}
+		}
+		const TArray<int> *MapBones = DemoCompact39Bones.Num() == TrackCount ? &DemoCompact39Bones :
+			(PrimaryBodyBones.Num() >= TrackCount && TrackCount < RefBones.Num()) ? &PrimaryBodyBones : NULL;
+		const int NumMappedTracks = MapBones ? TrackCount : min(TrackCount, RefBones.Num());
+		OutBoneIndices.AddZeroed(RefBones.Num());
+		for (int BoneIndex = 0; BoneIndex < RefBones.Num(); BoneIndex++)
+			OutBoneIndices[BoneIndex] = -1;
+		for (int TrackIndex = 0; TrackIndex < NumMappedTracks; TrackIndex++)
+		{
+			int BoneIndex = MapBones ? (*MapBones)[TrackIndex] : TrackIndex;
+			OutBoneIndices[BoneIndex] = TrackIndex;
+		}
+		return NumMappedTracks > 0;
+	};
 	auto PeekSCCTTrackMaxKeys = [&](int Pos) -> int
 	{
 		int SavePos = Ar.Tell();
@@ -1580,8 +2336,14 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		int TrackPos = 0;
 		int CompressType = 0;
 		int TrackCount = 0;
+		int DemoTrackRunEnd = 0;
 		int RangeStart = MotionSearchPos;
-		if (IsPlausibleInlineSCCTTracks(RangeStart, SeqIndex, &CompressType, true))
+		if (IsPlausibleSCDADemoTrackRun(RangeStart, &TrackCount, &DemoTrackRunEnd))
+		{
+			TrackPos = RangeStart;
+			CompressType = -1;
+		}
+		else if (IsPlausibleInlineSCCTTracks(RangeStart, SeqIndex, &CompressType, true))
 		{
 			TrackPos = RangeStart;
 		}
@@ -1592,6 +2354,12 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		}
 		for (int Pos = RangeStart; !TrackPos && Pos < RangeEnd - 8; Pos++)
 		{
+			if (IsPlausibleSCDADemoTrackRun(Pos, &TrackCount, &DemoTrackRunEnd))
+			{
+				TrackPos = Pos;
+				CompressType = -1;
+				break;
+			}
 			if (IsPlausibleInlineSCCTTracks(Pos, SeqIndex, &CompressType, false))
 			{
 				TrackPos = Pos;
@@ -1608,12 +2376,13 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		{
 			int SavePos = Ar.Tell();
 			Ar.Seek(TrackPos);
-			if (CompressType)
+			if (CompressType > 0)
 			{
 				int StoredCompressType;
 				Ar << StoredCompressType;
 			}
-			Ar << AR_INDEX(TrackCount);
+			if (CompressType >= 0)
+				Ar << AR_INDEX(TrackCount);
 			Ar.Seek(SavePos);
 		}
 		if (getenv("SCCT_DEBUG_SEQMAP"))
@@ -1623,13 +2392,31 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		Dst->TrackTime = 1.0f;
 		Dst->StartBone = 0;
 		Dst->Flags = 0;
-		int NumOutTracks = max(RefBones.Num(), TrackCount);
+		int NumOutTracks = (CompressType < 0) ? TrackCount : max(RefBones.Num(), TrackCount);
 		Dst->BoneIndices.Empty(NumOutTracks);
 		Dst->BoneIndices.AddZeroed(NumOutTracks);
 		Dst->AnimTracks.Empty(NumOutTracks);
 		Dst->AnimTracks.AddZeroed(NumOutTracks);
 		for (int BoneIndex = 0; BoneIndex < NumOutTracks; BoneIndex++)
 			Dst->BoneIndices[BoneIndex] = BoneIndex;
+		if (CompressType < 0)
+		{
+			TArray<int> DemoBoneMap;
+			if (BuildSCDADemoTrackBoneMap(TrackPos, TrackCount, DemoBoneMap))
+			{
+				Dst->BoneIndices.Empty(DemoBoneMap.Num());
+				Dst->BoneIndices.AddZeroed(DemoBoneMap.Num());
+				CopyArray(Dst->BoneIndices, DemoBoneMap);
+				if (getenv("SCCT_DEBUG_TRACKS"))
+				{
+					appPrintf("SCDA demo track map count=%d:", Dst->BoneIndices.Num());
+					for (int MapIndex = 0; MapIndex < Dst->BoneIndices.Num(); MapIndex++)
+						if (Dst->BoneIndices[MapIndex] >= 0)
+							appPrintf(" bone%d=%s->track%d", MapIndex, *RefBones[MapIndex].Name, Dst->BoneIndices[MapIndex]);
+					appPrintf("\n");
+				}
+			}
+		}
 
 		if (!TrackPos)
 		{
@@ -1641,13 +2428,18 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			appPrintf("SCCT MeshAnimation %s: no compressed tracks for sequence %d/%d\n", Name, SeqIndex, SeqCount);
 			MoveRawKeyCounts.Add(1);
 			MoveRawFrameSpans.Add(1);
+			MoveRawTrackCounts.Add(0);
+			MoveRawPositions.Add(TrackPos);
 			continue;
 		}
 
 		Ar.Seek(TrackPos);
-		if (CompressType)
+		if (CompressType > 0)
 			Ar << CompressType;
-		Ar << AR_INDEX(TrackCount);
+		if (CompressType >= 0)
+			Ar << AR_INDEX(TrackCount);
+		else
+			Ar.Seek(TrackPos);
 
 		int MaxTrackKeys = 1;
 		int MaxTrackFrameSpan = 1;
@@ -1673,11 +2465,14 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 				MaxTrackKeys = NumKeys;
 
 			AnalogTrack TempTrack;
-			float PosScale = 1.0f / 64.0f;
-			bool KeepPositionKeys = (TrackIndex == 0);
+			float PosScale = bScdaPcV1Demo ? (1.0f / 512.0f) : (1.0f / 64.0f);
+			int TimePrefixBytes = (CompressType < 0) ? 2 : 0;
+			bool KeepPositionKeys = (CompressType < 0) ? (TrackIndex == 0) : (bScdaPcV1Demo || (TrackIndex == 0));
 			bool MirrorPositionY = (TrackIndex == 0);
-			if (!SerializeSCCTRawTrack(TempTrack, MaxTrackKeys, CompressType, KeepPositionKeys, true, MirrorPositionY, PosScale))
+			if (!SerializeSCCTRawTrack(TempTrack, MaxTrackKeys, max(0, CompressType), TimePrefixBytes, KeepPositionKeys, true, MirrorPositionY, PosScale))
 				appError("Bad SCCT track %d/%d in sequence %d", TrackIndex, TrackCount, SeqIndex);
+			if (bScdaPcV1Demo && TrackIndex > 0 && TempTrack.KeyPos.Num() > 1)
+				TempTrack.KeyPos.RemoveAt(1, TempTrack.KeyPos.Num() - 1);
 			for (int KeyIndex = 0; KeyIndex < TempTrack.KeyTime.Num(); KeyIndex++)
 				MaxTrackFrameSpan = max(MaxTrackFrameSpan, appRound(TempTrack.KeyTime[KeyIndex]) + 1);
 			if (Dst->AnimTracks.IsValidIndex(TrackIndex))
@@ -1694,12 +2489,58 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			}
 			TotalTracks++;
 		}
+		if (bScdaPcV1Demo && TrackCount == 39 && Dst->BoneIndices.Num() == RefBones.Num())
+		{
+			FQuat IdentityQuat;
+			IdentityQuat.Set(0, 0, 0, 1);
+			auto UseBindRotationForBone = [&](int BoneIndex)
+			{
+				int TrackIndex = Dst->BoneIndices.IsValidIndex(BoneIndex) ? Dst->BoneIndices[BoneIndex] : -1;
+				if (Dst->AnimTracks.IsValidIndex(TrackIndex))
+				{
+					Dst->AnimTracks[TrackIndex].KeyQuat.Empty(1);
+					Dst->AnimTracks[TrackIndex].KeyQuat.Add(IdentityQuat);
+				}
+			};
+			TArray<int> ChildCounts;
+			ChildCounts.AddZeroed(RefBones.Num());
+			for (int BoneIndex = 1; BoneIndex < RefBones.Num(); BoneIndex++)
+			{
+				int ParentIndex = RefBones[BoneIndex].ParentIndex;
+				if (ParentIndex >= 0 && ParentIndex < RefBones.Num())
+					ChildCounts[ParentIndex]++;
+			}
+			int DenseHeadBranch = -1;
+			int DenseHeadChildren = 0;
+			for (int BoneIndex = 1; BoneIndex < RefBones.Num(); BoneIndex++)
+			{
+				if (ChildCounts[BoneIndex] > DenseHeadChildren)
+				{
+					DenseHeadChildren = ChildCounts[BoneIndex];
+					DenseHeadBranch = BoneIndex;
+				}
+			}
+			int NeckIndex = (DenseHeadBranch >= 0 && DenseHeadBranch < RefBones.Num()) ? RefBones[DenseHeadBranch].ParentIndex : -1;
+			int RootIndex = 0;
+			int PelvisIndex = -1;
+			for (int BoneIndex = 1; BoneIndex < RefBones.Num(); BoneIndex++)
+			{
+				if (RefBones[BoneIndex].ParentIndex == RootIndex)
+				{
+					PelvisIndex = BoneIndex;
+					break;
+				}
+			}
+			UseBindRotationForBone(RootIndex);
+			UseBindRotationForBone(PelvisIndex);
+			UseBindRotationForBone(NeckIndex);
+		}
 		Dst->TrackTime = MaxTrackKeys;
 		if (getenv("SCCT_DEBUG_SEQMAP"))
 			appPrintf("SCCT raw move %d: end=%X keys=%d span=%d\n", SeqIndex, Ar.Tell(), MaxTrackKeys, MaxTrackFrameSpan);
 		MotionSearchPos = Ar.Tell();
 
-		if (CompressType == 0 && TrackCount <= 2 && NonEmptyTrackCount == 0)
+		if (CompressType == 0 && NonEmptyTrackCount == 0 && (TrackCount <= 2 || bScdaPcV1Demo))
 		{
 			if (getenv("SCCT_DEBUG_SEQMAP"))
 				appPrintf("SCCT raw move %d: ignored empty bare block\n", SeqIndex);
@@ -1717,6 +2558,14 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			(Dst->AnimTracks[0].KeyQuat.Num() || Dst->AnimTracks[0].KeyPos.Num());
 		if (bRootOnlyBareCompanion)
 		{
+			if (bScdaPcV1Demo && !bDemoSawPrimaryMotion)
+			{
+				MoveRawKeyCounts.Add(MaxTrackKeys);
+				MoveRawFrameSpans.Add(MaxTrackFrameSpan);
+				MoveRawTrackCounts.Add(NonEmptyTrackCount);
+				MoveRawPositions.Add(TrackPos);
+				continue;
+			}
 			bool bMerged = false;
 			if (Moves.Num() >= 2)
 			{
@@ -1743,6 +2592,7 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			Moves.RemoveAt(Moves.Num() - 1);
 			continue;
 		}
+		bDemoSawPrimaryMotion = true;
 
 		if (bHasPendingRootCompanion)
 		{
@@ -1756,6 +2606,8 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 
 		MoveRawKeyCounts.Add(MaxTrackKeys);
 		MoveRawFrameSpans.Add(MaxTrackFrameSpan);
+		MoveRawTrackCounts.Add(NonEmptyTrackCount);
+		MoveRawPositions.Add(TrackPos);
 	}
 
 	TArray<MotionChunk> PairedMoves;
@@ -1794,6 +2646,19 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		}
 		return Cost;
 	};
+	auto SCCTTrackCountCost = [&](const FSCCTSeqInfo &Info, int RawMoveIndex) -> int
+	{
+		if (!MoveRawTrackCounts.IsValidIndex(RawMoveIndex))
+			return 12;
+		if (IsSCCTFaceSequenceName(Package->GetName(Info.NameIndex)))
+			return 0;
+		int RawTrackCount = MoveRawTrackCounts[RawMoveIndex];
+		if (RawTrackCount >= min(16, RefBones.Num()))
+			return 0;
+		if (RawTrackCount >= 8)
+			return 4;
+		return 8;
+	};
 	if (!SeqCandidates.Num() && Moves.Num())
 	{
 		for (int RawMoveIndex = 0; RawMoveIndex < Moves.Num(); RawMoveIndex++)
@@ -1807,7 +2672,124 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			CopySCCTMotionChunk(*PairedMove, Moves[RawMoveIndex]);
 		}
 	}
-	for (int CandidateIndex = 0; SeqCandidates.Num() && CandidateIndex < SeqCandidates.Num() && MoveIndex < Moves.Num(); CandidateIndex++)
+	bool bUsedDemoDpPairing = false;
+	if (bScdaPcV1Demo && SeqCandidates.Num() && Moves.Num())
+	{
+		bUsedDemoDpPairing = true;
+		const int N = SeqCandidates.Num();
+		const int M = Moves.Num();
+		const int INF = 0x3FFFFFFF;
+		TArray<int> Cost;
+		TArray<byte> Prev;
+		Cost.AddZeroed((N + 1) * (M + 1));
+		Prev.AddZeroed((N + 1) * (M + 1));
+		auto DPIndex = [&](int I, int J) -> int
+		{
+			return I * (M + 1) + J;
+		};
+		for (int I = 0; I <= N; I++)
+			for (int J = 0; J <= M; J++)
+				Cost[DPIndex(I, J)] = INF;
+		Cost[DPIndex(0, 0)] = 0;
+		for (int J = 1; J <= M; J++)
+		{
+			Cost[DPIndex(0, J)] = Cost[DPIndex(0, J - 1)] + 6;
+			Prev[DPIndex(0, J)] = 1;
+		}
+		for (int I = 1; I <= N; I++)
+		{
+			Cost[DPIndex(I, 0)] = Cost[DPIndex(I - 1, 0)] + 30;
+			Prev[DPIndex(I, 0)] = 3;
+		}
+		for (int I = 1; I <= N; I++)
+		{
+			for (int J = 0; J <= M; J++)
+			{
+				int SkipCandidateCost = Cost[DPIndex(I - 1, J)] + 30;
+				if (SkipCandidateCost < Cost[DPIndex(I, J)])
+				{
+					Cost[DPIndex(I, J)] = SkipCandidateCost;
+					Prev[DPIndex(I, J)] = 3;
+				}
+				if (J > 0)
+				{
+					int SkipRawCost = Cost[DPIndex(I, J - 1)] + 6;
+					if (SkipRawCost < Cost[DPIndex(I, J)])
+					{
+						Cost[DPIndex(I, J)] = SkipRawCost;
+						Prev[DPIndex(I, J)] = 1;
+					}
+					int PairCost = Cost[DPIndex(I - 1, J - 1)] +
+						SCCTFrameCost(SeqCandidates[I - 1].NumFrames, MoveRawFrameSpans[J - 1]) +
+						SCCTTrackCountCost(SeqCandidates[I - 1], J - 1);
+					if (PairCost < Cost[DPIndex(I, J)])
+					{
+						Cost[DPIndex(I, J)] = PairCost;
+						Prev[DPIndex(I, J)] = 2;
+					}
+				}
+			}
+		}
+		int BestJ = 0;
+		int BestCost = INF;
+		for (int J = 0; J <= M; J++)
+		{
+			int C = Cost[DPIndex(N, J)];
+			if (C < BestCost)
+			{
+				BestCost = C;
+				BestJ = J;
+			}
+		}
+		TArray<int> PairRaw;
+		PairRaw.AddZeroed(N);
+		for (int I = 0; I < N; I++)
+			PairRaw[I] = -1;
+		for (int I = N, J = BestJ; I > 0; )
+		{
+			byte P = Prev[DPIndex(I, J)];
+			if (P == 2)
+			{
+				PairRaw[I - 1] = J - 1;
+				I--;
+				J--;
+			}
+			else
+			{
+				if (P == 1 && J > 0)
+					J--;
+				else
+					I--;
+			}
+		}
+		for (int CandidateIndex = 0; CandidateIndex < N; CandidateIndex++)
+		{
+			int RawMoveIndex = PairRaw[CandidateIndex];
+			const FSCCTSeqInfo &Info = SeqCandidates[CandidateIndex];
+			if (getenv("SCCT_DEBUG_SEQMAP"))
+			{
+				appPrintf("SCCT dp pair candidate %d (%s frames=%d pos=%X) -> raw move %d rawPos=%X tracks=%d keys=%d span=%d\n",
+					CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos, RawMoveIndex,
+					MoveRawPositions.IsValidIndex(RawMoveIndex) ? MoveRawPositions[RawMoveIndex] : 0,
+					MoveRawTrackCounts.IsValidIndex(RawMoveIndex) ? MoveRawTrackCounts[RawMoveIndex] : -1,
+					MoveRawKeyCounts.IsValidIndex(RawMoveIndex) ? MoveRawKeyCounts[RawMoveIndex] : -1,
+					MoveRawFrameSpans.IsValidIndex(RawMoveIndex) ? MoveRawFrameSpans[RawMoveIndex] : -1);
+			}
+			new (SeqInfos) FSCCTSeqInfo(Info);
+			MotionChunk *PairedMove = new (PairedMoves) MotionChunk;
+			if (Moves.IsValidIndex(RawMoveIndex))
+				CopySCCTMotionChunk(*PairedMove, Moves[RawMoveIndex]);
+			else
+			{
+				MakeSCCTIdentityMotionChunk(*PairedMove, Info.NumFrames);
+				if (getenv("SCCT_DEBUG_SEQMAP"))
+					appPrintf("SCCT dp candidate %d (%s) has no raw move; using identity pose\n",
+						CandidateIndex, Package->GetName(Info.NameIndex));
+			}
+		}
+	}
+	int CandidateIndex = 0;
+	for (; !bUsedDemoDpPairing && SeqCandidates.Num() && CandidateIndex < SeqCandidates.Num() && MoveIndex < Moves.Num(); CandidateIndex++)
 	{
 		const FSCCTSeqInfo &Info = SeqCandidates[CandidateIndex];
 		int RawSpan = MoveRawFrameSpans.IsValidIndex(MoveIndex) ? MoveRawFrameSpans[MoveIndex] : -1;
@@ -1819,7 +2801,7 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			int KeepCost = SCCTFrameCost(Info.NumFrames, RawSpan) + SCCTWindowCost(CandidateIndex + 1, MoveIndex + 1, LookaheadCount);
 			int SkipCost = SCCTWindowCost(CandidateIndex + 1, MoveIndex, LookaheadCount);
 			int SkipPenalty = (Info.ExtraSize == 0 || Info.NumFrames <= 2) ? 4 : 18;
-			if (!CurrentExact && SCCTFramesMatch(NextInfo.NumFrames, RawSpan) && SkipCost + SkipPenalty + 20 < KeepCost)
+			if (!bScdaPcV1Demo && !CurrentExact && SCCTFramesMatch(NextInfo.NumFrames, RawSpan) && SkipCost + SkipPenalty + 20 < KeepCost)
 			{
 				if (getenv("SCCT_DEBUG_SEQMAP"))
 					appPrintf("SCCT skip unpaired candidate %d (%s frames=%d pos=%X), raw move %d span=%d matches next %s (keepCost=%d skipCost=%d penalty=%d)\n",
@@ -1849,8 +2831,10 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		}
 		if (getenv("SCCT_DEBUG_SEQMAP"))
 		{
-			appPrintf("SCCT pair candidate %d (%s frames=%d pos=%X) -> raw move %d keys=%d span=%d\n",
+			appPrintf("SCCT pair candidate %d (%s frames=%d pos=%X) -> raw move %d rawPos=%X tracks=%d keys=%d span=%d\n",
 				CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos, MoveIndex,
+				MoveRawPositions.IsValidIndex(MoveIndex) ? MoveRawPositions[MoveIndex] : 0,
+				MoveRawTrackCounts.IsValidIndex(MoveIndex) ? MoveRawTrackCounts[MoveIndex] : -1,
 				MoveRawKeyCounts.IsValidIndex(MoveIndex) ? MoveRawKeyCounts[MoveIndex] : -1,
 				MoveRawFrameSpans.IsValidIndex(MoveIndex) ? MoveRawFrameSpans[MoveIndex] : -1);
 		}
@@ -1858,6 +2842,21 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 		MotionChunk *PairedMove = new (PairedMoves) MotionChunk;
 		CopySCCTMotionChunk(*PairedMove, Moves[MoveIndex]);
 		MoveIndex++;
+	}
+	if (!bUsedDemoDpPairing && !SeqInfos.Num() && bScdaPcV1Demo && SeqCandidates.Num() && CandidateIndex < SeqCandidates.Num() && PairedMoves.Num())
+	{
+		for (; CandidateIndex < SeqCandidates.Num(); CandidateIndex++)
+		{
+			const FSCCTSeqInfo &Info = SeqCandidates[CandidateIndex];
+			if (getenv("SCCT_DEBUG_SEQMAP"))
+			{
+				appPrintf("SCCT keep unpaired candidate %d (%s frames=%d pos=%X) using previous raw move\n",
+					CandidateIndex, Package->GetName(Info.NameIndex), Info.NumFrames, Info.Pos);
+			}
+			new (SeqInfos) FSCCTSeqInfo(Info);
+			MotionChunk *PairedMove = new (PairedMoves) MotionChunk;
+			MakeSCCTIdentityMotionChunk(*PairedMove, Info.NumFrames);
+		}
 	}
 	Moves.Empty(PairedMoves.Num());
 	Moves.AddZeroed(PairedMoves.Num());
@@ -1870,6 +2869,8 @@ void UMeshAnimation::SerializeSCCT(FArchive &Ar)
 			continue;
 		AnalogTrack &RootTrack = Moves[i].AnimTracks[0];
 		if (!RootTrack.KeyPos.Num())
+			continue;
+		if (bScdaPcV1Demo)
 			continue;
 		FVector RootBase = RootTrack.KeyPos[0];
 		FVector RootMotionScale = GetSCCTRootMotionScale();

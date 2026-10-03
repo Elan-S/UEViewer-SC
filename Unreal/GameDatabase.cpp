@@ -655,6 +655,7 @@ void FArchive::DetectGame()
 	if ( (ArVer == 100 && (ArLicenseeVer >= 9 && ArLicenseeVer <= 17)) ||		// Splinter Cell 1
 		 (ArVer == 100 && (ArLicenseeVer >= 22 && ArLicenseeVer <= 77)) ||		// Splinter Cell 3 texture packages
 		 (ArVer == 100 && (ArLicenseeVer >= 83 && ArLicenseeVer <= 127 && ArLicenseeVer != 89 && ArLicenseeVer != 90)) ||	// Splinter Cell 3/4
+		 (ArVer == 100 && (ArLicenseeVer >= 130 && ArLicenseeVer <= 167)) ||		// Splinter Cell Double Agent PC v1 packages
 		 ((ArVer >= 248 && ArVer <= 483) && (ArLicenseeVer >= 74 && ArLicenseeVer <= 120)) || // Splinter Cell 3 texture packages
 		 (ArVer == 102 && (ArLicenseeVer >= 29 && ArLicenseeVer <= 28)) )		// Splinter Cell 2
 		SET(GAME_SplinterCell);

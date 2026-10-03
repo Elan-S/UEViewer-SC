@@ -251,6 +251,7 @@ public:
 	FObjectImport*			ImportTable;
 	FObjectExport*			ExportTable;
 	bool					PairFNameIndex;			// Pandora Tomorrow online package tables store FName as index + extra compact value
+	bool					ImportTableHasPackageName; // Some UE3 packages add PackageName FName before PackageIndex
 #if UNREAL4
 	struct FPackageObjectIndex* ExportIndices_IOS;
 #endif
